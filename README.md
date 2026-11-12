@@ -1,6 +1,6 @@
 # Lit3Mail
 
-**Free for commercial and personal use.** 
+**Free for commercial and personal use. Currently in BETA.** 
 
 Lit3Mail's original code and documentation
 are dedicated to the public domain under [CC0 1.0 Universal](LICENCE.md).
