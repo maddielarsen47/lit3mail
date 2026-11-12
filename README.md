@@ -1,0 +1,93 @@
+# Lit3Mail
+
+**Free for commercial and personal use.** 
+
+Lit3Mail's original code and documentation
+are dedicated to the public domain under [CC0 1.0 Universal](LICENCE.md).
+The software is provided as-is, without warranty.
+
+Lit3Mail is a **lightweight** Windows desktop email client AI-coded as a hobby project. 
+It was designed and tested with Gmail and can also connect to
+other IMAP and SMTP servers that accept passwords.
+
+- **Password login only.** Lit3Mail supports passwords and provider-issued app
+  passwords. It does not support OAuth or OAuth2, so accounts such 
+  as Outlook.com cannot connect.
+- **No conversation view.** Messages appear individually in each folder. 
+  This is by design.
+
+## Using Lit3Mail
+
+### Connect an account
+
+1. Ensure `.NET 10 Desktop Runtime` and `Microsoft Edge WebView2 Evergreen Runtime` are installed.
+1. Download the portable ZIP release, extract to the location of your choice (e.g. Program Files/Lit3Mail).
+2. Create shortcuts as desired to Lit3Mail.exe, and run it.
+3. Configure your account details in **Settings**.
+
+For Gmail, enable **2-Step Verification** in your Google Account and generate
+an [App Password](https://support.google.com/accounts/answer/185833) for
+Lit3Mail. Use that App Password in both password fields. New accounts default to
+`imap.gmail.com` on port 993 and `smtp.gmail.com` on port 465 with implicit TLS.
+
+### Read and manage mail
+
+- Lit3Mail refreshes mail every 10 minutes while it is open.
+- Gmail labels exposed over IMAP appear after the standard folders, marked
+  with an asterisk. Lit3Mail skips **All Mail**, **Important**, and **Starred**.
+  To make another label available, enable **Show in IMAP** for it
+  in Gmail's Labels settings. [Show or hide Gmail labels over IMAP](https://support.microsoft.com/en-us/outlook/how-to-show-or-hide-folders-for-imap-in-google-settings).
+- Use **Ctrl** to select individual messages or **Shift** to select a range.
+  Drag the selection onto another folder in the same account to move it.
+- **Del** asks for confirmation before moving messages to Trash or permanently
+  deleting them from Trash. Once confirmed, messages disappear from the list
+  immediately and return if the server operation fails.
+- Drag account tabs in **Settings** to change their order in the mail sidebar.
+- Use **Export** in the sidebar to save selected messages or the entire
+  current folder as a ZIP of EML files. Folder export includes every message
+  in the folder, even when a search filter is active. You can cancel an
+  export while it runs.
+- While Lit3Mail is open in the background, a red dot on its Windows taskbar
+  icon indicates newly arrived unread mail. Returning to Lit3Mail clears the dot.
+
+### Offline drafts
+
+If the mail server is unavailable, **Save Draft** saves the message and its
+attachments locally. Open or delete these drafts under **Local Drafts**
+in the sidebar. They survive an app restart. When you're back online, open the
+draft and choose **Save Draft** to save it to the server or **Send Mail** to send
+it. Lit3Mail does not queue messages for sending.
+
+### Limits
+
+The composer allows up to **25 MiB per file** and **50 MiB total** in file
+attachments. If a selected file exceeds either limit, Lit3Mail skips it and
+lists it in the composer status. Files already attached and other selected
+files that fit are kept. If a server draft exceeds either attachment limit or
+its full message exceeds **80 MiB**, Lit3Mail shows an error and leaves the
+draft on the server.
+
+## Technical details
+
+### Build
+
+Build on Windows with the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
+The [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
+provides HTML previews. Lit3Mail can display the plain-text version if the
+runtime is unavailable.
+
+### Architecture and storage
+
+- **WinForms** provides the desktop interface. 
+- **MailKit** and **MimeKit** handle TLS, IMAP and SMTP 
+  connections, message parsing, and delivery.
+- **WebView2** renders received HTML. 
+- **RtfPipe** converts rich-text drafts to
+  HTML for sending with a plain-text alternative.
+- **SQLite** stores app data including account settings, cached messages, 
+  known addresses, and local drafts. The database location is configurable in **Settings**, default: 
+  `%LOCALAPPDATA%\Lit3Mail\lit3mail.db`
+- **Windows Credential Manager** stores mail-server passwords for the current
+  Windows user. Use **Forget saved sign-in** in Settings to remove them.
+- **Other** Lit3Mail stores window layout and WebView2 profile data in:
+  `%LOCALAPPDATA%\Lit3Mail`.
