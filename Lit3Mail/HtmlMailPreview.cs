@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Diagnostics;
 using System.Text;
 using Microsoft.Web.WebView2.Core;
@@ -20,6 +21,7 @@ internal sealed class HtmlMailPreview : WebView2
     private byte[]? navigationDocument;
     private int displayVersion;
     private bool allowRemoteImages;
+    private ContextMenuStrip? imageMenu;
 
     public byte[]? GetQuoteImage(string source) =>
         allowRemoteImages && Uri.TryCreate(source, UriKind.Absolute, out var uri) &&
@@ -28,6 +30,7 @@ internal sealed class HtmlMailPreview : WebView2
     public void ClearDisplay()
     {
         ++displayVersion;
+        imageMenu?.Close();
         allowRemoteImages = false;
         quoteImages.Clear();
         quoteImageBytes = 0;
@@ -99,11 +102,33 @@ internal sealed class HtmlMailPreview : WebView2
         await EnsureCoreWebView2Async(environment, options);
         var core = CoreWebView2;
         var settings = core.Settings;
-        settings.IsScriptEnabled = false;
+        settings.IsScriptEnabled = true; // The document CSP blocks sender scripts.
         settings.AreHostObjectsAllowed = false;
-        settings.IsWebMessageEnabled = false;
+        settings.IsWebMessageEnabled = true;
         settings.AreDefaultScriptDialogsEnabled = false;
         settings.AreDefaultContextMenusEnabled = false;
+        core.WebMessageReceived += (_, e) =>
+        {
+            if (e.Source != core.Source || !Uri.TryCreate(e.Source, UriKind.Absolute, out var page) ||
+                page.Host != PreviewHost || !allowRemoteImages)
+                return;
+
+            if (JsonSerializer.Deserialize<string>(e.WebMessageAsJson) is not { } message)
+                return;
+
+            int version = displayVersion;
+            const string menuPrefix = "image-menu:";
+            if (message == "dismiss-image-menu")
+                BeginInvoke(() => imageMenu?.Close());
+            else if (message.StartsWith(menuPrefix, StringComparison.Ordinal))
+            {
+                string source = message[menuPrefix.Length..];
+                Point location = Cursor.Position;
+                BeginInvoke(() => ShowImageMenu(source, version, location));
+            }
+            else
+                UseImage(message, version, save: false);
+        };
         settings.AreDevToolsEnabled = false;
         settings.AreBrowserAcceleratorKeysEnabled = false;
         settings.IsStatusBarEnabled = false;
@@ -121,10 +146,48 @@ internal sealed class HtmlMailPreview : WebView2
                 OpenClickedLink(e.Uri, e.IsUserInitiated && !e.IsRedirected);
             }
         };
-        core.DOMContentLoaded += (_, e) =>
+        core.DOMContentLoaded += async (_, e) =>
         {
-            if (e.NavigationId == navigationId)
-                documentReady?.TrySetResult(true);
+            if (e.NavigationId != navigationId || documentReady is not { } ready)
+                return;
+
+            try
+            {
+                await core.ExecuteScriptAsync("""
+                    document.addEventListener('keydown', event => {
+                        if (event.ctrlKey && !event.altKey && !event.shiftKey &&
+                            event.key.toLowerCase() === 'c' && globalThis.lit3mailSelectedImage &&
+                            !getSelection()?.toString()) {
+                            event.preventDefault();
+                            chrome.webview.postMessage(globalThis.lit3mailSelectedImage);
+                        }
+                    });
+                    document.addEventListener('pointerdown', event => {
+                        if (event.button === 0)
+                            chrome.webview.postMessage('dismiss-image-menu');
+                    }, true);
+                    document.addEventListener('contextmenu', event => {
+                        const image = event.target.closest?.('img');
+                        if (image?.naturalWidth) {
+                            event.preventDefault();
+                            chrome.webview.postMessage('image-menu:' + image.currentSrc);
+                        }
+                    }, true);
+                    document.addEventListener('click', event => {
+                        const image = event.target.closest?.('img');
+                        globalThis.lit3mailSelectedImage = image?.naturalWidth ? image.currentSrc : null;
+                        if (globalThis.lit3mailSelectedImage) {
+                            getSelection()?.removeAllRanges();
+                            event.preventDefault();
+                        }
+                    });
+                    """);
+            }
+            catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException)
+            {
+                // Continue showing the message if the shortcut cannot be installed.
+            }
+            ready.TrySetResult(true);
         };
         core.NavigationCompleted += (_, e) =>
         {
@@ -146,8 +209,8 @@ internal sealed class HtmlMailPreview : WebView2
             if (e.ResourceContext == CoreWebView2WebResourceContext.Document &&
                 e.Request.Uri == navigationTarget && navigationDocument is { } document)
             {
-                string imageSources = allowRemoteImages ? "data: https: http:" : "data:";
-                string policy = $"default-src 'none'; style-src 'unsafe-inline'; img-src {imageSources}; " +
+                string imageSources = allowRemoteImages ? "data: https: http:" : "'none'";
+                string policy = $"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src {imageSources}; " +
                     "base-uri 'none'; form-action 'none'; frame-src 'none'";
                 e.Response = environment.CreateWebResourceResponse(new MemoryStream(document, writable: false), 200, "OK",
                     $"Content-Type: text/html; charset=utf-8\r\nContent-Security-Policy: {policy}\r\n" +
@@ -214,6 +277,67 @@ internal sealed class HtmlMailPreview : WebView2
         });
     }
 
+    private void ShowImageMenu(string source, int version, Point location)
+    {
+        if (IsDisposed || !allowRemoteImages || version != displayVersion)
+            return;
+
+        imageMenu?.Close();
+        var menu = imageMenu = new ContextMenuStrip();
+        menu.Items.Add("Copy image", null, (_, _) => BeginInvoke(() => UseImage(source, version, save: false)));
+        menu.Items.Add("Save image as...", null, (_, _) => BeginInvoke(() => UseImage(source, version, save: true)));
+        menu.Closed += (_, _) =>
+        {
+            imageMenu = null;
+            BeginInvoke(() => menu.Dispose());
+        };
+        menu.Show(this, PointToClient(location));
+    }
+
+    private void UseImage(string source, int version, bool save)
+    {
+        if (IsDisposed || !allowRemoteImages || version != displayVersion)
+            return;
+
+        try
+        {
+            byte[]? bytes = GetQuoteImage(source);
+            if (bytes is null && source.StartsWith("data:image/", StringComparison.OrdinalIgnoreCase))
+            {
+                int separator = source.IndexOf(',');
+                if (separator > 0 && source[..separator].EndsWith(";base64", StringComparison.OrdinalIgnoreCase) &&
+                    source.Length - separator <= MaxQuoteImageBytes * 4L / 3 + 4)
+                    bytes = Convert.FromBase64String(source[(separator + 1)..]);
+            }
+
+            if (bytes is null)
+                throw new InvalidOperationException("The image data is unavailable.");
+
+            using var stream = new MemoryStream(bytes, writable: false);
+            using var image = Image.FromStream(stream);
+            if (save)
+            {
+                using var dialog = new SaveFileDialog
+                {
+                    Title = "Save image", FileName = "image.png", Filter = "PNG image (*.png)|*.png",
+                    RestoreDirectory = true
+                };
+                if (dialog.ShowDialog(this) == DialogResult.OK)
+                    image.Save(dialog.FileName, System.Drawing.Imaging.ImageFormat.Png);
+            }
+            else
+            {
+                using var bitmap = new Bitmap(image);
+                Clipboard.SetImage(bitmap);
+            }
+        }
+        catch (Exception error) when (error is ArgumentException or FormatException or InvalidOperationException or
+            IOException or UnauthorizedAccessException or System.Runtime.InteropServices.ExternalException)
+        {
+            ThemedPopup.Show(FindForm(), save ? "Could not save the image." : "Could not copy the image.", "Lit3Mail");
+        }
+    }
+
     internal static bool CanLoadResource(string address, CoreWebView2WebResourceContext context, bool allowRemoteImages)
     {
         if (address == "about:blank")
@@ -222,7 +346,7 @@ internal sealed class HtmlMailPreview : WebView2
             !Uri.TryCreate(address, UriKind.Absolute, out var uri))
             return false;
 
-        return uri.Scheme == "data" || (allowRemoteImages && RemoteMailImages.IsWebImageUrl(uri));
+        return allowRemoteImages && (uri.Scheme == "data" || RemoteMailImages.IsWebImageUrl(uri));
     }
 
     internal static string BuildDocument(string html)

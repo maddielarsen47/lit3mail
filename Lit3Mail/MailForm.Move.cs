@@ -3,7 +3,7 @@ namespace Lit3Mail;
 public partial class MailForm
 {
     private const string MessageMoveFormat = "Lit3Mail.MessageMove";
-    private readonly Button moveMail = new() { Text = "Move", AutoSize = true, Enabled = false };
+    private readonly Button moveMail = new() { Text = "Move...", AutoSize = true, FlatStyle = FlatStyle.Flat, Enabled = false };
     private bool updatingMessageFolders;
     private MessageDrag? pendingMessageDrag;
     private MessageDrag? activeMessageDrag;

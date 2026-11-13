@@ -12,7 +12,8 @@ internal static class MailDefaults
 internal sealed record AccountSettings(
     Guid Id, string Name, string Email, string ReplyTo, string Organisation, string Signature,
     string IncomingHost, int IncomingPort, string IncomingUser, bool IncomingStartTls,
-    string OutgoingHost, int OutgoingPort, string OutgoingUser, bool OutgoingStartTls, bool Expanded, int Position);
+    string OutgoingHost, int OutgoingPort, string OutgoingUser, bool OutgoingStartTls, bool Expanded, int Position,
+    string ProfileName, bool ProfileUsesAccountName, bool IncomingUsesEmail, bool OutgoingUsesEmail);
 
 internal sealed record DraftEditorState(string To, string Cc, string Bcc, string ReplyTo, string Subject,
     bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature);
@@ -29,7 +30,7 @@ internal sealed record LocalDraftEntry(Guid Id, string Subject, string Sender, D
 internal sealed class LocalDatabase(string path)
 {
     internal const int FolderCacheLimit = 1000;
-    private const int SchemaVersion = 10;
+    private const int SchemaVersion = 12;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
@@ -263,10 +264,37 @@ internal sealed class LocalDatabase(string path)
             command.ExecuteNonQuery();
         }
 
+        if (version < 11)
+        {
+            command.CommandText = """
+                ALTER TABLE accounts ADD COLUMN profile_name TEXT NOT NULL DEFAULT '';
+                ALTER TABLE accounts ADD COLUMN profile_uses_account_name INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE accounts ADD COLUMN incoming_uses_email INTEGER NOT NULL DEFAULT 1;
+                ALTER TABLE accounts ADD COLUMN outgoing_uses_email INTEGER NOT NULL DEFAULT 1;
+                UPDATE accounts SET profile_name = name;
+                PRAGMA user_version = 11;
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        if (version < 12)
+        {
+            command.CommandText = """
+                CREATE TABLE folder_counts_cache (
+                    account_id TEXT PRIMARY KEY NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                    connection_key TEXT NOT NULL,
+                    counts TEXT NOT NULL
+                );
+                PRAGMA user_version = 12;
+                """;
+            command.ExecuteNonQuery();
+        }
+
         command.CommandText = """
             SELECT id, name, email, reply_to, organisation, signature,
                    incoming_host, incoming_port, incoming_user, incoming_starttls,
-                   outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position
+                   outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
+                   profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email
             FROM accounts ORDER BY position, rowid
             """;
         var accounts = new List<AccountSettings>();
@@ -277,7 +305,8 @@ internal sealed class LocalDatabase(string path)
                     reader.GetString(3), reader.GetString(4), reader.GetString(5), reader.GetString(6),
                     reader.GetInt32(7), reader.GetString(8), reader.GetBoolean(9), reader.GetString(10),
                     reader.GetInt32(11), reader.GetString(12), reader.GetBoolean(13), reader.GetBoolean(14),
-                    reader.GetInt32(15)));
+                    reader.GetInt32(15), reader.GetString(16), reader.GetBoolean(17),
+                    reader.GetBoolean(18), reader.GetBoolean(19)));
         }
         transaction.Commit();
         return accounts;
@@ -304,11 +333,13 @@ internal sealed class LocalDatabase(string path)
                 INSERT INTO accounts (
                     id, name, email, reply_to, organisation, signature,
                     incoming_host, incoming_port, incoming_user, incoming_starttls,
-                    outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position
+                    outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
+                    profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email
                 ) VALUES (
                     $id, $name, $email, $replyTo, $organisation, $signature,
                     $incomingHost, $incomingPort, $incomingUser, $incomingStartTls,
-                    $outgoingHost, $outgoingPort, $outgoingUser, $outgoingStartTls, $expanded, $position
+                    $outgoingHost, $outgoingPort, $outgoingUser, $outgoingStartTls, $expanded, $position,
+                    $profileName, $profileUsesAccountName, $incomingUsesEmail, $outgoingUsesEmail
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, email = excluded.email, reply_to = excluded.reply_to,
@@ -317,7 +348,9 @@ internal sealed class LocalDatabase(string path)
                     incoming_user = excluded.incoming_user, incoming_starttls = excluded.incoming_starttls,
                     outgoing_host = excluded.outgoing_host, outgoing_port = excluded.outgoing_port,
                     outgoing_user = excluded.outgoing_user, outgoing_starttls = excluded.outgoing_starttls,
-                    expanded = excluded.expanded, position = excluded.position
+                    expanded = excluded.expanded, position = excluded.position,
+                    profile_name = excluded.profile_name, profile_uses_account_name = excluded.profile_uses_account_name,
+                    incoming_uses_email = excluded.incoming_uses_email, outgoing_uses_email = excluded.outgoing_uses_email
                 """;
             command.Parameters.Clear();
             command.Parameters.AddWithValue("$id", account.Id.ToString());
@@ -336,6 +369,10 @@ internal sealed class LocalDatabase(string path)
             command.Parameters.AddWithValue("$outgoingStartTls", account.OutgoingStartTls);
             command.Parameters.AddWithValue("$expanded", account.Expanded);
             command.Parameters.AddWithValue("$position", account.Position);
+            command.Parameters.AddWithValue("$profileName", account.ProfileName);
+            command.Parameters.AddWithValue("$profileUsesAccountName", account.ProfileUsesAccountName);
+            command.Parameters.AddWithValue("$incomingUsesEmail", account.IncomingUsesEmail);
+            command.Parameters.AddWithValue("$outgoingUsesEmail", account.OutgoingUsesEmail);
             command.ExecuteNonQuery();
         }
         transaction.Commit();
@@ -472,7 +509,40 @@ internal sealed class LocalDatabase(string path)
         return command.ExecuteScalar() as string;
     }
 
-    public IReadOnlyDictionary<string, FolderCount> LoadCachedGmailLabels(Guid account, string connectionKey)
+    public IReadOnlyDictionary<string, FolderCount> LoadCachedFolderCounts(Guid account, string connectionKey)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandTimeout = 1;
+        command.CommandText = """
+            SELECT counts FROM folder_counts_cache WHERE account_id = $account AND connection_key = $connection
+            """;
+        command.Parameters.AddWithValue("$account", account.ToString());
+        command.Parameters.AddWithValue("$connection", connectionKey);
+        if (command.ExecuteScalar() is string json &&
+            JsonSerializer.Deserialize<Dictionary<string, FolderCount>>(json) is { } counts)
+            return counts;
+
+        return LoadCachedGmailLabels(account, connectionKey);
+    }
+
+    public void SaveCachedFolderCounts(Guid account, string connectionKey, IReadOnlyDictionary<string, FolderCount> counts)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandTimeout = 1;
+        command.CommandText = """
+            INSERT INTO folder_counts_cache (account_id, connection_key, counts)
+            VALUES ($account, $connection, $counts)
+            ON CONFLICT(account_id) DO UPDATE SET connection_key = excluded.connection_key, counts = excluded.counts
+            """;
+        command.Parameters.AddWithValue("$account", account.ToString());
+        command.Parameters.AddWithValue("$connection", connectionKey);
+        command.Parameters.AddWithValue("$counts", JsonSerializer.Serialize(counts));
+        command.ExecuteNonQuery();
+    }
+
+    private IReadOnlyDictionary<string, FolderCount> LoadCachedGmailLabels(Guid account, string connectionKey)
     {
         using var connection = Open();
         using var command = connection.CreateCommand();

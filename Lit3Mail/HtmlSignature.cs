@@ -11,7 +11,8 @@ internal static class HtmlSignature
     private sealed record Style(bool Bold = false, bool Italic = false, bool Underline = false,
         bool Strike = false, Color? Color = null, int? HalfPoints = null, string? Link = null);
 
-    public static string? ToRtf(string html, Func<string, byte[]?>? getPreviewImage = null)
+    public static string? ToRtf(string html, Func<string, byte[]?>? getPreviewImage = null,
+        bool includeImages = true)
     {
         using var reader = new StringReader(html);
         var tokenizer = new HtmlTokenizer(reader) { DecodeCharacterReferences = true };
@@ -72,7 +73,7 @@ internal static class HtmlSignature
             }
             if (name == "img")
             {
-                string? picture = ReadEmbeddedPicture(tag, style, getPreviewImage);
+                string? picture = includeImages ? ReadEmbeddedPicture(tag, style, getPreviewImage) : null;
                 if (picture is not null)
                 {
                     if (picture.Length > 0)

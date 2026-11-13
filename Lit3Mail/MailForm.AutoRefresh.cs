@@ -7,19 +7,28 @@ public partial class MailForm
 
     private void InitializeAutoRefresh()
     {
-        var timer = new System.Windows.Forms.Timer(components!) { Interval = 10 * 60 * 1000 };
-        timer.Tick += async (_, _) => await RefreshAutomaticallyAsync();
+        var timer = new System.Windows.Forms.Timer(components!) { Interval = 60_000 };
+        int minutesUntilFullRefresh = 10;
+        timer.Tick += async (_, _) =>
+        {
+            bool fullRefresh = --minutesUntilFullRefresh <= 0;
+            if (fullRefresh && refreshingAutomatically)
+                return;
+            if (fullRefresh)
+                minutesUntilFullRefresh = 10;
+            await RefreshAutomaticallyAsync(fullRefresh);
+        };
         Shown += (_, _) => timer.Start();
     }
 
-    private async Task RefreshAutomaticallyAsync()
+    private async Task RefreshAutomaticallyAsync(bool fullRefresh)
     {
         if (refreshingAutomatically || updatingMessageFolders || exportCancellation is not null || IsDisposed || Disposing ||
             !accounts.Any(account => account.Mailbox is not null))
             return;
 
         refreshingAutomatically = true;
-        var activity = BeginBatchActivity(CheckingForMailStatus);
+        var activity = fullRefresh ? BeginBatchActivity(CheckingForMailStatus) : null;
         var token = mailboxLifetime.Token;
         try
         {
@@ -29,8 +38,15 @@ public partial class MailForm
             var activeInbox = refreshList && current?.Folder == "Inbox" && string.IsNullOrWhiteSpace(search.Text)
                 ? current.Account : null;
             QueueInboxRefresh(activeInbox);
-            if (refreshList)
-                await ShowFolder(SelectedMessage, refreshCounts: true, backgroundRefresh: true);
+            if (refreshList && (fullRefresh || activeInbox is not null))
+                await ShowFolder(SelectedMessage, refreshCounts: fullRefresh, backgroundRefresh: true);
+
+            if (!fullRefresh)
+            {
+                await Task.WhenAll(accounts.Where(account => account != activeInbox)
+                    .Select(account => RefreshInboxCountAsync(account, token)).ToArray());
+                return;
+            }
 
             foreach (var account in accounts.ToArray())
             {
@@ -43,7 +59,30 @@ public partial class MailForm
         finally
         {
             refreshingAutomatically = false;
-            EndBatchActivity(activity);
+            if (activity is not null)
+                EndBatchActivity(activity);
+        }
+    }
+
+    private async Task RefreshInboxCountAsync(MailAccount account, CancellationToken token)
+    {
+        if (account.Mailbox is not ServerMailbox mailbox)
+            return;
+
+        var previous = account.Counts.GetValueOrDefault("Inbox");
+        using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
+        timeout.CancelAfter(TimeSpan.FromSeconds(8));
+        try
+        {
+            var count = await mailbox.GetInboxCountAsync(timeout.Token);
+            if (!IsDisposed && !timeout.IsCancellationRequested && !updatingMessageFolders &&
+                accounts.Contains(account) && ReferenceEquals(account.Mailbox, mailbox) &&
+                ReferenceEquals(previous, account.Counts.GetValueOrDefault("Inbox")))
+                SetFolderCount(account, "Inbox", count.Unread, count.Total);
+        }
+        catch (Exception)
+        {
+            // Keep the last count until the server responds.
         }
     }
 }

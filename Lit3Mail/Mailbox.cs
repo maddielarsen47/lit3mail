@@ -7,16 +7,16 @@ internal sealed record MailSummary(Guid Id, string Folder, bool Read, bool Star,
     string FromAddress, string ToAddresses, string CcAddresses, string ReplyToAddress,
     bool HasPreviewHeaders = true)
 {
-    public string CorrespondentAddresses => Folder switch
-    {
-        "Sent" when ToAddresses.Length == 0 => CcAddresses,
-        "Sent" when CcAddresses.Length > 0 => $"{ToAddresses}; {CcAddresses}",
-        "Sent" or "Drafts" => ToAddresses,
-        _ => FromAddress
-    };
+    public string CorrespondentAddresses => GetCorrespondentAddresses();
+
+    public string GetCorrespondentAddresses(string? excludedAddress = null) => string.Join("; ",
+        new[] { FromAddress, ToAddresses, CcAddresses }
+            .SelectMany(addresses => addresses.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            .Where(address => !address.Equals(excludedAddress, StringComparison.OrdinalIgnoreCase))
+            .Distinct(StringComparer.OrdinalIgnoreCase));
 }
 
-internal sealed record InlineMailImage(string ContentId, string MediaType, byte[] Bytes);
+internal sealed record InlineMailImage(string ContentId, string MediaType, byte[] Bytes, string? ContentLocation = null);
 internal sealed record MailFileAttachment(string FileName, string MediaType, byte[] Bytes);
 internal sealed record MailAttachmentInfo(string PartId, string FileName, string MediaType);
 
@@ -24,6 +24,15 @@ internal sealed record MailContent(string Body, bool HasInlineImage = false, str
     IReadOnlyList<InlineMailImage>? InlineImages = null, IReadOnlyList<MailAttachmentInfo>? AttachmentList = null)
 {
     private static readonly Regex ContentIdReference = new("""\bcid:([^"'<>\s)]+)""", RegexOptions.IgnoreCase);
+
+    private static readonly Regex ImageSource = new(
+        """(<img\b[^<>]*?\s+src\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", RegexOptions.IgnoreCase);
+
+    private static string ImageSourceValue(Match match) =>
+        System.Net.WebUtility.HtmlDecode(match.Groups.Cast<Group>().Skip(2).First(group => group.Success).Value);
+
+    internal static HashSet<string> ReferencedImageSources(string html) =>
+        ImageSource.Matches(html).Select(ImageSourceValue).ToHashSet(StringComparer.Ordinal);
 
     internal static HashSet<string> ReferencedContentIds(string html) =>
         ContentIdReference.Matches(html).Select(match => Uri.UnescapeDataString(match.Groups[1].Value))
@@ -34,12 +43,25 @@ internal sealed record MailContent(string Body, bool HasInlineImage = false, str
         if (Html is null || InlineImages is not { Count: > 0 } images)
             return Html;
 
-        var byId = images.ToDictionary(image => image.ContentId, StringComparer.OrdinalIgnoreCase);
-        return ContentIdReference.Replace(Html, match =>
+        var byLocation = new Dictionary<string, InlineMailImage>(StringComparer.Ordinal);
+        var byId = new Dictionary<string, InlineMailImage>(StringComparer.OrdinalIgnoreCase);
+        foreach (var image in images)
+        {
+            if (image.ContentLocation is { } location)
+                byLocation.TryAdd(location, image);
+            byId.TryAdd(image.ContentId, image);
+        }
+
+        string html = ImageSource.Replace(Html, match => byLocation.TryGetValue(ImageSourceValue(match), out var image)
+            ? match.Groups[1].Value + "\"" + ImageData(image) + "\""
+            : match.Value);
+        return ContentIdReference.Replace(html, match =>
             byId.TryGetValue(Uri.UnescapeDataString(match.Groups[1].Value), out var image)
-                ? $"data:{image.MediaType};base64,{Convert.ToBase64String(image.Bytes)}"
+                ? ImageData(image)
                 : match.Value);
     }
+    private static string ImageData(InlineMailImage image) =>
+        $"data:{image.MediaType};base64,{Convert.ToBase64String(image.Bytes)}";
 }
 internal sealed record OutgoingMail(string From, string ReplyTo, string To, string Cc, string Subject, string Body, string? Html = null,
     IReadOnlyList<InlineMailImage>? InlineImages = null, string Bcc = "", IReadOnlyList<MailFileAttachment>? Files = null);
@@ -193,7 +215,7 @@ internal sealed class SampleMailbox : IMailbox
             {
                 var item = mail[index];
                 if (item.Summary.Folder == folder && ids.Contains(item.Summary.Id))
-                    mail[index] = (item.Summary with { Folder = "Trash" }, item.Content);
+                    mail[index] = (item.Summary with { Folder = "Trash", Read = true }, item.Content);
             }
         return Task.CompletedTask;
     }

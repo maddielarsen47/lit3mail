@@ -4,7 +4,7 @@ namespace Lit3Mail;
 
 public partial class MailForm
 {
-    private readonly Button exportMail = new() { Text = "Export…", AutoSize = true, Dock = DockStyle.Bottom };
+    private readonly Button exportMail = new() { Text = "Export...", AutoSize = true, Dock = DockStyle.Bottom };
     private readonly Label batchStatus = new() { AutoSize = true, Margin = new Padding(0, 6, 8, 0) };
     private readonly Button cancelExport = new() { Text = "Cancel", AutoSize = true };
     private readonly FlowLayoutPanel batchBar = new()
@@ -28,8 +28,8 @@ public partial class MailForm
         batchBar.Controls.Add(cancelExport);
         cancelExport.Click += (_, _) => exportCancellation?.Cancel();
         exportMenu = new ContextMenuStrip(components!) { ShowImageMargin = false };
-        var selection = new ToolStripMenuItem("Export selected messages…");
-        var folder = new ToolStripMenuItem("Export entire folder…");
+        var selection = new ToolStripMenuItem("Export selected messages...");
+        var folder = new ToolStripMenuItem("Export entire folder...");
         selection.Click += async (_, _) => await ExportMessagesAsync(selectionOnly: true);
         folder.Click += async (_, _) => await ExportMessagesAsync(selectionOnly: false);
         exportMenu.Items.AddRange([selection, folder]);
@@ -37,7 +37,7 @@ public partial class MailForm
         exportMail.Click += (_, _) =>
         {
             bool available = SelectedFolder?.Account.Mailbox is not null && !updatingMessageFolders && exportCancellation is null;
-            selection.Enabled = available && !showingCachedFolder && selectionMade && messages.SelectedRows.Count > 0;
+            selection.Enabled = available && selectionMade && messages.SelectedRows.Count > 0;
             folder.Enabled = available;
             exportMenu.Show(exportMail, new Point(0, exportMail.Height));
         };
@@ -72,7 +72,7 @@ public partial class MailForm
             SelectedFolder is not { Account.Mailbox: { } mailbox, Folder: { } folder } entry)
             return;
         var ids = selectionOnly ? SelectedMessageIds() : null;
-        if (selectionOnly && (showingCachedFolder || !selectionMade || ids?.Count == 0))
+        if (selectionOnly && (!selectionMade || ids?.Count == 0))
             return;
 
         using var picker = new SaveFileDialog
@@ -90,9 +90,9 @@ public partial class MailForm
         var progress = new Progress<(int Done, int Total)>(state =>
         {
             if (!IsDisposed && ReferenceEquals(exportCancellation, cancellation))
-                batchStatus.Text = $"Exporting {state.Done:N0} of {state.Total:N0} messages…";
+                batchStatus.Text = $"Exporting {state.Done:N0} of {state.Total:N0} messages...";
         });
-        ShowBatchStatus("Preparing export…", cancellable: true);
+        ShowBatchStatus("Preparing export...", cancellable: true);
         try
         {
             await Task.Run(async () =>

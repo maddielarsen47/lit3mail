@@ -8,7 +8,7 @@ public partial class MailForm
     private readonly List<string> openedAttachmentFiles = [];
     private CancellationTokenSource? previewAttachmentLoad;
 
-    private readonly Button attachFiles = new() { Text = "Attach Files…", AutoSize = true };
+    private readonly Button attachFiles = new() { Text = "Attach Files...", AutoSize = true };
     private readonly Button removeAttachment = new() { Text = "Remove", AutoSize = true };
     private readonly ComboBox composeAttachmentPicker = new()
     {
@@ -21,12 +21,19 @@ public partial class MailForm
     };
 
     private readonly Button openAttachment = new() { Text = "Open", AutoSize = true };
-    private readonly Button saveAttachment = new() { Text = "Save As…", AutoSize = true };
+    private readonly ToolTip attachmentNameTip = new() { AutoPopDelay = 15000 };
+    private readonly Button saveAllAttachments = new() { Text = "Save All...", AutoSize = true };
+    private readonly Button saveAttachment = new() { Text = "Save As...", AutoSize = true };
     private readonly ComboBox previewAttachmentPicker = new()
     {
         AccessibleName = "Received attachments", DropDownStyle = ComboBoxStyle.DropDownList,
         FlatStyle = FlatStyle.Flat, Width = 225, DisplayMember = nameof(MailAttachmentInfo.FileName)
     };
+    private readonly Label previewAttachmentsLoading = new()
+    {
+        Text = "Attachments loading...", AutoSize = true, Visible = false
+    };
+    private Label previewAttachmentLabel = null!;
     private readonly Label previewAttachmentStatus = new() { AutoSize = true, Visible = false };
     private readonly FlowLayoutPanel previewAttachmentPanel = new()
     {
@@ -43,10 +50,16 @@ public partial class MailForm
         composeAttachmentPanel.Controls.Add(composeAttachmentLabel);
         composeAttachmentPanel.Controls.Add(composeAttachmentPicker);
         composeAttachmentPanel.Controls.Add(removeAttachment);
-        previewAttachmentPanel.Controls.Add(AttachmentLabel());
+        var loadingFont = new Font(Font, FontStyle.Italic);
+        previewAttachmentsLoading.Font = loadingFont;
+        previewAttachmentsLoading.Disposed += (_, _) => loadingFont.Dispose();
+        previewAttachmentPanel.Controls.Add(previewAttachmentsLoading);
+        previewAttachmentLabel = AttachmentLabel();
+        previewAttachmentPanel.Controls.Add(previewAttachmentLabel);
         previewAttachmentPanel.Controls.Add(previewAttachmentPicker);
         previewAttachmentPanel.Controls.Add(openAttachment);
         previewAttachmentPanel.Controls.Add(saveAttachment);
+        previewAttachmentPanel.Controls.Add(saveAllAttachments);
         previewAttachmentPanel.Controls.Add(previewAttachmentStatus);
 
         attachFiles.Click += async (_, _) => await ChooseComposeFilesAsync();
@@ -60,8 +73,24 @@ public partial class MailForm
         };
         openAttachment.Click += async (_, _) => await SaveReceivedAttachmentAsync(open: true);
         saveAttachment.Click += async (_, _) => await SaveReceivedAttachmentAsync(open: false);
+        saveAllAttachments.Click += async (_, _) => await SaveAllReceivedAttachmentsAsync();
+        previewAttachmentPicker.SelectedIndexChanged += (_, _) =>
+        {
+            string? name = (previewAttachmentPicker.SelectedItem as MailAttachmentInfo)?.FileName;
+            attachmentNameTip.SetToolTip(previewAttachmentPicker, name);
+        };
+        previewAttachmentPicker.DropDown += (_, _) =>
+        {
+            int width = previewAttachmentPicker.Items.Cast<MailAttachmentInfo>()
+                .Select(file => TextRenderer.MeasureText(file.FileName, previewAttachmentPicker.Font).Width)
+                .DefaultIfEmpty(0).Max();
+            int screenWidth = Screen.FromControl(previewAttachmentPicker).WorkingArea.Width;
+            previewAttachmentPicker.DropDownWidth = Math.Max(previewAttachmentPicker.Width,
+                Math.Min(screenWidth, width + SystemInformation.VerticalScrollBarWidth + 8));
+        };
         Disposed += (_, _) =>
         {
+            attachmentNameTip.Dispose();
             foreach (string file in openedAttachmentFiles)
                 DeleteOpenedAttachment(file);
         };
@@ -129,7 +158,7 @@ public partial class MailForm
         IReadOnlyList<MailAttachmentInfo>? knownAttachments)
     {
         composePage.Enabled = false;
-        composeStatus.Text = "Loading original attachments…";
+        composeStatus.Text = "Loading original attachments...";
         var token = mailboxLifetime.Token;
         var failed = new List<string>();
         var oversized = new List<string>();
@@ -207,6 +236,18 @@ public partial class MailForm
         previewAttachmentPanel.Hide();
         previewAttachmentPicker.Items.Clear();
         previewAttachmentStatus.Hide();
+        previewAttachmentsLoading.Hide();
+    }
+
+    private void ShowPreviewAttachmentsLoading()
+    {
+        previewAttachmentLabel.Hide();
+        previewAttachmentPicker.Hide();
+        openAttachment.Hide();
+        saveAttachment.Hide();
+        saveAllAttachments.Hide();
+        previewAttachmentsLoading.Show();
+        previewAttachmentPanel.Show();
     }
 
     private async Task LoadPreviewAttachmentsAsync(IMailbox mailbox, Guid messageId, int request)
@@ -229,6 +270,8 @@ public partial class MailForm
                 previewAttachmentPicker.Hide();
                 openAttachment.Hide();
                 saveAttachment.Hide();
+                saveAllAttachments.Hide();
+                previewAttachmentsLoading.Hide();
                 previewAttachmentStatus.Text = MailOperationError(error, "Could not load attachments.");
                 previewAttachmentStatus.Show();
                 previewAttachmentPanel.Show();
@@ -243,14 +286,20 @@ public partial class MailForm
 
     private void DisplayPreviewAttachments(IReadOnlyList<MailAttachmentInfo> files)
     {
+        previewAttachmentsLoading.Hide();
         if (files.Count == 0)
+        {
+            previewAttachmentPanel.Hide();
             return;
+        }
+        previewAttachmentLabel.Show();
         previewAttachmentPicker.Items.Clear();
         previewAttachmentPicker.Items.AddRange(files.Cast<object>().ToArray());
         previewAttachmentPicker.SelectedIndex = 0;
         previewAttachmentPicker.Show();
         openAttachment.Show();
         saveAttachment.Show();
+        saveAllAttachments.Show();
         previewAttachmentStatus.Hide();
         previewAttachmentPanel.Show();
     }
@@ -276,7 +325,7 @@ public partial class MailForm
             path = picker.FileName;
         }
 
-        openAttachment.Enabled = saveAttachment.Enabled = false;
+        openAttachment.Enabled = saveAttachment.Enabled = saveAllAttachments.Enabled = false;
         bool opened = false;
         try
         {
@@ -302,7 +351,58 @@ public partial class MailForm
             if (open && !opened)
                 DeleteOpenedAttachment(path);
             if (!IsDisposed)
-                openAttachment.Enabled = saveAttachment.Enabled = true;
+                openAttachment.Enabled = saveAttachment.Enabled = saveAllAttachments.Enabled = true;
+        }
+    }
+
+    private async Task SaveAllReceivedAttachmentsAsync()
+    {
+        if (SelectedFolder?.Account.Mailbox is not { } mailbox || SelectedMessage is not { } message)
+            return;
+
+        var attachments = previewAttachmentPicker.Items.Cast<MailAttachmentInfo>().ToArray();
+        using var picker = new FolderBrowserDialog
+        {
+            Description = "Choose a folder to save all attachments",
+            UseDescriptionForTitle = true
+        };
+        if (attachments.Length == 0 || picker.ShowDialog(this) != DialogResult.OK)
+            return;
+
+        openAttachment.Enabled = saveAttachment.Enabled = saveAllAttachments.Enabled = false;
+        var failed = new List<string>();
+        var token = mailboxLifetime.Token;
+        try
+        {
+            foreach (var attachment in attachments)
+            {
+                token.ThrowIfCancellationRequested();
+                try
+                {
+                    string name = SafeAttachmentName(attachment.FileName);
+                    string target = Path.Combine(picker.SelectedPath, name);
+                    string stem = Path.GetFileNameWithoutExtension(name);
+                    string extension = Path.GetExtension(name);
+                    for (int suffix = 2; File.Exists(target) || Directory.Exists(target); suffix++)
+                        target = Path.Combine(picker.SelectedPath, $"{stem} ({suffix}){extension}");
+
+                    await DownloadAttachmentToFileAsync(mailbox, message.Id, attachment.PartId, target,
+                        requireInternetZone: false, token, overwrite: false);
+                }
+                catch (Exception error) when (error is not OperationCanceledException)
+                {
+                    failed.Add(attachment.FileName);
+                }
+            }
+
+            if (failed.Count > 0 && !IsDisposed)
+                ThemedPopup.Show(this, $"Could not save {string.Join(", ", failed)}.", Text);
+        }
+        catch (OperationCanceledException) { }
+        finally
+        {
+            if (!IsDisposed)
+                openAttachment.Enabled = saveAttachment.Enabled = saveAllAttachments.Enabled = true;
         }
     }
 
@@ -319,7 +419,7 @@ public partial class MailForm
     }
 
     internal static async Task DownloadAttachmentToFileAsync(IMailbox mailbox, Guid id, string partId, string target,
-        bool requireInternetZone, CancellationToken token)
+        bool requireInternetZone, CancellationToken token, bool overwrite = true)
     {
         string partial = Path.Combine(Path.GetDirectoryName(target)!, $".{Guid.NewGuid():N}.part");
         try
@@ -338,7 +438,7 @@ public partial class MailForm
                 // The destination volume can lack support for alternate streams.
             }
             token.ThrowIfCancellationRequested();
-            File.Move(partial, target, overwrite: true);
+            File.Move(partial, target, overwrite);
         }
         finally
         {
@@ -366,7 +466,7 @@ public partial class MailForm
         }
         composeAttachmentPanel.ForeColor = previewAttachmentPanel.ForeColor = ink;
         previewAttachmentPanel.BackColor = surface;
-        foreach (var button in new[] { attachFiles, removeAttachment, openAttachment, saveAttachment })
+        foreach (var button in new[] { attachFiles, removeAttachment, openAttachment, saveAttachment, saveAllAttachments })
             StyleButton(button, chrome, ink, border, selected);
     }
 }

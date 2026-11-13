@@ -1,4 +1,5 @@
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text.Json;
 using static Lit3Mail.MailAccountValidation;
@@ -11,6 +12,10 @@ public partial class MailForm
     {
         public Guid Id { get; init; } = Guid.NewGuid();
         public string Name { get; set; } = name;
+        public string ProfileName { get; set; } = name;
+        public bool ProfileUsesAccountName { get; set; } = true;
+        public bool IncomingUsesEmail { get; set; } = true;
+        public bool OutgoingUsesEmail { get; set; } = true;
         public string Email { get; set; } = email;
         public string ReplyTo { get; set; } = "";
         public string Organisation { get; set; } = "";
@@ -29,31 +34,35 @@ public partial class MailForm
         private static string Username(string user, string email) =>
             string.IsNullOrWhiteSpace(user) ? email.Trim() : user.Trim();
 
+        public string EffectiveIncomingUser => Username(IncomingUsesEmail ? Email : IncomingUser, Email);
+        public string EffectiveOutgoingUser => Username(OutgoingUsesEmail ? Email : OutgoingUser, Email);
+
         public bool RequiresOutlookSignIn =>
-            MailAccountValidation.RequiresOutlookSignIn(Email, IncomingHost, IncomingUser, OutgoingHost, OutgoingUser);
+            MailAccountValidation.RequiresOutlookSignIn(Email, IncomingHost, EffectiveIncomingUser, OutgoingHost, EffectiveOutgoingUser);
 
         public (Field Field, string Message)? ValidateConnection() =>
-            MailAccountValidation.Validate(Email, IncomingHost, IncomingPort, IncomingUser, OutgoingHost, OutgoingPort, OutgoingUser);
+            MailAccountValidation.Validate(Email, IncomingHost, IncomingPort, EffectiveIncomingUser, OutgoingHost, OutgoingPort, EffectiveOutgoingUser);
 
         public string ConnectionKey() => Convert.ToHexString(SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(new
         {
             Email = Email.Trim(),
             IncomingHost = IncomingHost.Trim(),
             IncomingPort,
-            IncomingUser = Username(IncomingUser, Email),
+            IncomingUser = EffectiveIncomingUser,
             IncomingStartTls,
             OutgoingHost = OutgoingHost.Trim(),
             OutgoingPort,
-            OutgoingUser = Username(OutgoingUser, Email),
+            OutgoingUser = EffectiveOutgoingUser,
             OutgoingStartTls
         })));
 
         public ServerMailbox CreateMailbox(SavedSignIn signIn) =>
             new ServerMailbox(
-                new(IncomingHost.Trim(), IncomingPort, Username(IncomingUser, Email), signIn.IncomingPassword, IncomingStartTls),
-                new(OutgoingHost.Trim(), OutgoingPort, Username(OutgoingUser, Email), signIn.OutgoingPassword, OutgoingStartTls));
+                new(IncomingHost.Trim(), IncomingPort, EffectiveIncomingUser, signIn.IncomingPassword, IncomingStartTls),
+                new(OutgoingHost.Trim(), OutgoingPort, EffectiveOutgoingUser, signIn.OutgoingPassword, OutgoingStartTls));
         public bool Expanded { get; set; } = true;
-        public string DisplayName => string.IsNullOrWhiteSpace(Name) ? "Unnamed account" : Name.Trim();
+        private string EffectiveProfileName => ProfileUsesAccountName ? Name : ProfileName;
+        public string DisplayName => string.IsNullOrWhiteSpace(EffectiveProfileName) ? "Unnamed account" : EffectiveProfileName.Trim();
         public DateTimeOffset CountsUpdatedAt { get; set; }
         public IReadOnlyDictionary<string, FolderCount> Counts { get; set; } = new Dictionary<string, FolderCount>();
     }
@@ -82,6 +91,10 @@ public partial class MailForm
             var restored = new MailAccount(account.Name, account.Email, null)
             {
                 Id = account.Id,
+                ProfileName = account.ProfileName,
+                ProfileUsesAccountName = account.ProfileUsesAccountName,
+                IncomingUsesEmail = account.IncomingUsesEmail,
+                OutgoingUsesEmail = account.OutgoingUsesEmail,
                 ReplyTo = account.ReplyTo,
                 Organisation = account.Organisation,
                 Signature = account.Signature,
@@ -107,13 +120,13 @@ public partial class MailForm
             {
                 restored.HasSavedSignIn = true;
             }
-            if (restored.Mailbox is ServerMailbox { IsGmail: true })
+            if (restored.Mailbox is ServerMailbox)
             {
                 try
                 {
-                    restored.Counts = database.LoadCachedGmailLabels(restored.Id, restored.ConnectionKey());
+                    restored.Counts = database.LoadCachedFolderCounts(restored.Id, restored.ConnectionKey());
                 }
-                catch (Microsoft.Data.Sqlite.SqliteException) { }
+                catch (Exception error) when (error is Microsoft.Data.Sqlite.SqliteException or JsonException) { }
             }
             accounts.Add(restored);
         }
@@ -128,7 +141,7 @@ public partial class MailForm
             account.Id, account.Name, account.Email, account.ReplyTo, account.Organisation, account.Signature,
             account.IncomingHost, account.IncomingPort, account.IncomingUser, account.IncomingStartTls,
             account.OutgoingHost, account.OutgoingPort, account.OutgoingUser, account.OutgoingStartTls, account.Expanded,
-            position))
+            position, account.ProfileName, account.ProfileUsesAccountName, account.IncomingUsesEmail, account.OutgoingUsesEmail))
             .ToDictionary(account => account.Id);
         var updated = current.Values.Where(account =>
             !savedAccounts.TryGetValue(account.Id, out var previous) || previous != account).ToArray();
@@ -160,10 +173,17 @@ public partial class MailForm
     private readonly Button addAccount = new() { Text = "Add Account", Height = 36, FlatStyle = FlatStyle.Flat, };
     private bool rebuildingFolders;
 
-    private FolderEntry? SelectedFolder => folders.SelectedItem is FolderEntry { Folder: not null } entry ? entry : null;
+    private FolderEntry? selectedFolder;
+    private FolderEntry? SelectedFolder => selectedFolder;
 
     private void RebuildFolders(MailAccount? preferred, string? folder, bool preserveMessageList = false)
     {
+        if (!preserveMessageList && folder is not null && accounts.Count > 0)
+        {
+            preferred ??= accounts.FirstOrDefault(item => item.Expanded) ?? accounts[0];
+            preferred.Expanded = true;
+        }
+
         rebuildingFolders = true;
         folders.BeginUpdate();
         folders.Items.Clear();
@@ -185,16 +205,16 @@ public partial class MailForm
         if (preserveMessageList)
             return;
 
-        newEmail.Enabled = false;
         if (accounts.Count > 0)
         {
             var account = preferred ?? accounts.FirstOrDefault(item => item.Expanded) ?? accounts[0];
-            folders.SelectedItem = new FolderEntry(account, account.Expanded ? folder : null);
+            folders.SelectedItem = new FolderEntry(account, folder);
         }
         else
         {
+            selectedFolder = null;
+            newEmail.Enabled = false;
             folderLoad?.Cancel();
-            folderLoading.Hide();
             searchStatus.Hide();
             selectionMade = false;
             selectedMessageId = null;
@@ -207,7 +227,7 @@ public partial class MailForm
     private void ToggleAccountFolders(MailAccount account)
     {
         account.Expanded = !account.Expanded;
-        RebuildFolders(account, null);
+        RebuildFolders(SelectedFolder?.Account ?? account, SelectedFolder?.Folder, preserveMessageList: true);
         if (account.Expanded && account.Mailbox is ServerMailbox { IsGmail: true } mailbox)
             _ = RefreshFolderCounts(account, mailbox, false, mailboxLifetime.Token);
     }
@@ -224,7 +244,7 @@ public partial class MailForm
         account.Counts = counts;
         if (account.Expanded && labelsChanged)
         {
-            var selection = folders.SelectedItem as FolderEntry;
+            var selection = SelectedFolder;
             if (selection is { Folder: { } current } && selection.Account == account &&
                 !DefaultFolders.Contains(current) && !counts.ContainsKey(current))
                 RebuildFolders(account, "Inbox");
@@ -358,7 +378,7 @@ public partial class MailForm
         {
             var location = new TextBox { ReadOnly = true, AccessibleName = "Local data folder" };
             AddSettingsRow(fields, "Local data folder", CreateTextField(location));
-            var changeFolder = new Button { Text = "Choose folder…", AutoSize = true };
+            var changeFolder = new Button { Text = "Choose folder...", AutoSize = true };
             AddSettingsRow(fields, "", changeFolder);
             var locationStatus = new Label { AutoSize = true };
             AddSettingsRow(fields, "", locationStatus);
@@ -402,6 +422,24 @@ public partial class MailForm
                 }
             };
         }
+
+        string version = typeof(MailForm).Assembly.GetName().Version?.ToString(3) ?? Application.ProductVersion;
+        AddSettingsRow(fields, "App version", new Label { AutoSize = true, Text = version });
+
+        const string repositoryUrl = "https://github.com/maddielarsen47/lit3mail/";
+        var repository = new LinkLabel { AutoSize = true, Text = repositoryUrl };
+        repository.LinkClicked += (_, _) =>
+        {
+            try
+            {
+                using var browser = Process.Start(new ProcessStartInfo(repositoryUrl) { UseShellExecute = true });
+            }
+            catch (Exception credentialError) when (credentialError is Win32Exception or InvalidOperationException)
+            {
+                ThemedPopup.Show(this, "Could not open the link in your default browser.", "Lit3Mail");
+            }
+        };
+        AddSettingsRow(fields, "Repository", repository);
     }
 
     private void AddAccountTab(MailAccount account)
@@ -464,6 +502,37 @@ public partial class MailForm
             return input;
         }
 
+        TextBox AddLinkedText(string label, TextBox source, string checkboxLabel, bool linked,
+            Func<string> getValue, Action<string> save, Action<bool> saveLinked)
+        {
+            var input = AddText(label, linked ? source.Text : getValue(), value =>
+            {
+                if (!linked)
+                    save(value);
+            });
+            var checkbox = new CheckBox { Text = checkboxLabel, AutoSize = true, Checked = linked };
+            var readOnlyFont = new Font(input.Font, input.Font.Style | FontStyle.Italic);
+            input.Disposed += (_, _) => readOnlyFont.Dispose();
+            input.ReadOnly = linked;
+            input.Font = linked ? readOnlyFont : null;
+            checkbox.CheckedChanged += (_, _) =>
+            {
+                linked = checkbox.Checked;
+                saveLinked(linked);
+                input.ReadOnly = linked;
+                input.Font = linked ? readOnlyFont : null;
+                ApplyTheme();
+                input.Text = linked ? source.Text : getValue();
+            };
+            source.TextChanged += (_, _) =>
+            {
+                if (linked)
+                    input.Text = source.Text;
+            };
+            AddRow("", checkbox);
+            return input;
+        }
+
         NumericUpDown AddPort(string label, int value, Action<int> save)
         {
             var port = new NumericUpDown
@@ -483,19 +552,38 @@ public partial class MailForm
             return port;
         }
 
-        AddSection("Account");
-        AddText("Account Name", account.Name, value =>
+        void RefreshProfileName()
         {
-            account.Name = value;
             tab.Text = account.DisplayName;
             folders.Invalidate();
+        }
+
+        AddSection("Account");
+        var accountName = AddText("Account Name", account.Name, value =>
+        {
+            account.Name = value;
+            RefreshProfileName();
         });
+        AddLinkedText("Profile Name", accountName, "Same as Account Name", account.ProfileUsesAccountName,
+            () => account.ProfileName, value =>
+            {
+                account.ProfileName = value;
+                RefreshProfileName();
+            }, linked =>
+            {
+                account.ProfileUsesAccountName = linked;
+                RefreshProfileName();
+            });
         var email = AddText("Email Address", account.Email, value => account.Email = value);
         AddText("Reply-To Address", account.ReplyTo, value => account.ReplyTo = value);
         AddText("Organisation", account.Organisation, value => account.Organisation = value);
         AddText("Signature Text/HTML", account.Signature, value => account.Signature = value, multiline: true);
 
         AddSection("Connection");
+        var connectionStateFont = new Font(Font, FontStyle.Bold);
+        var connectionState = new Label { AutoSize = true, Font = connectionStateFont };
+        connectionState.Disposed += (_, _) => connectionStateFont.Dispose();
+        AddRow("Connection status", connectionState);
         var status = new Label
         {
             AutoSize = true,
@@ -523,17 +611,30 @@ public partial class MailForm
 
         var imapServer = AddText("IMAP Server", account.IncomingHost, value => account.IncomingHost = value);
         var imapPort = AddPort("IMAP Port", account.IncomingPort, value => account.IncomingPort = value);
-        var imapUser = AddText("IMAP Username", account.IncomingUser, value => account.IncomingUser = value);
+        var imapUser = AddLinkedText("IMAP Username", email, "Same as Email Address", account.IncomingUsesEmail,
+            () => account.IncomingUser, value => account.IncomingUser = value, linked => account.IncomingUsesEmail = linked);
 
-        var imapPassword = AddText("IMAP Password", "", _ => { }, password: true);
+        const string passwordMask = "••••••••";
+        var imapPassword = AddText("IMAP Password", account.Mailbox is null ? "" : passwordMask, _ => { }, password: true);
         var imapStartTls = new CheckBox { Text = "Use STARTTLS", AutoSize = true, Checked = account.IncomingStartTls };
         imapStartTls.CheckedChanged += (_, _) => account.IncomingStartTls = imapStartTls.Checked;
         AddRow("IMAP Security", imapStartTls);
         var smtpServer = AddText("SMTP Server", account.OutgoingHost, value => account.OutgoingHost = value);
         var smtpPort = AddPort("SMTP Port", account.OutgoingPort, value => account.OutgoingPort = value);
-        var smtpUser = AddText("SMTP Username", account.OutgoingUser, value => account.OutgoingUser = value);
+        var smtpUser = AddLinkedText("SMTP Username", email, "Same as Email Address", account.OutgoingUsesEmail,
+            () => account.OutgoingUser, value => account.OutgoingUser = value, linked => account.OutgoingUsesEmail = linked);
 
-        var smtpPassword = AddText("SMTP Password", "", _ => { }, password: true);
+        var smtpPassword = AddText("SMTP Password", account.Mailbox is null ? "" : passwordMask, _ => { }, password: true);
+        var samePassword = new CheckBox { Text = "Same as IMAP Password", AutoSize = true, Checked = true };
+        AddRow("", samePassword);
+        smtpPassword.Enabled = !samePassword.Checked;
+        samePassword.CheckedChanged += (_, _) => smtpPassword.Enabled = !samePassword.Checked;
+        foreach (var input in new[] { imapPassword, smtpPassword })
+            input.Enter += (_, _) =>
+            {
+                if (input.Text == passwordMask)
+                    input.SelectAll();
+            };
         var smtpStartTls = new CheckBox { Text = "Use STARTTLS", AutoSize = true, Checked = account.OutgoingStartTls };
         smtpStartTls.CheckedChanged += (_, _) => account.OutgoingStartTls = smtpStartTls.Checked;
         AddRow("SMTP Security", smtpStartTls);
@@ -549,11 +650,25 @@ public partial class MailForm
 
         string? activeKey = account.Mailbox is null ? null : account.ConnectionKey();
 
+        SavedSignIn? sessionSignIn = null;
+
+        void UpdateConnectionState()
+        {
+            connectionState.Text = account.Mailbox is null ? "Not connected" : $"Connected as {account.Email.Trim()}";
+            connect.Text = account.Mailbox is null ? "Connect to mail servers" : "Reconnect to mail servers";
+        }
+
+        UpdateConnectionState();
+
         void ClearConnection()
         {
             CancelBackgroundCache(account);
             activeKey = null;
             account.Mailbox = null;
+            sessionSignIn = null;
+            if (imapPassword.Text == passwordMask) imapPassword.Clear();
+            if (smtpPassword.Text == passwordMask) smtpPassword.Clear();
+            UpdateConnectionState();
             account.Counts = new Dictionary<string, FolderCount>();
             account.CountsUpdatedAt = default;
             var selected = SelectedFolder;
@@ -610,7 +725,7 @@ public partial class MailForm
         async Task ConnectAccountAsync(SavedSignIn signIn, CancellationToken token)
         {
             var mailbox = account.CreateMailbox(signIn);
-            status.Text = "Checking IMAP and SMTP sign-in…";
+            status.Text = "Checking IMAP and SMTP sign-in...";
             await mailbox.TestAsync(token);
             token.ThrowIfCancellationRequested();
             if (IsDisposed)
@@ -624,6 +739,9 @@ public partial class MailForm
             activeKey = signIn.ConnectionKey;
             CancelBackgroundCache(account);
             account.Mailbox = mailbox;
+            sessionSignIn = signIn;
+            imapPassword.Text = smtpPassword.Text = passwordMask;
+            UpdateConnectionState();
             account.Counts = new Dictionary<string, FolderCount>();
             account.CountsUpdatedAt = default;
             account.Expanded = true;
@@ -634,11 +752,9 @@ public partial class MailForm
                 {
                     WindowsCredentialStore.Write(account.Id, signIn);
                     account.HasSavedSignIn = true;
-                    imapPassword.Clear();
-                    smtpPassword.Clear();
                     status.Text = "Connected. Sign-in saved in Windows Credential Manager.";
                 }
-                catch (Exception error) when (error is Win32Exception or InvalidOperationException)
+                catch (Exception credentialError) when (credentialError is Win32Exception or InvalidOperationException)
                 {
                     status.Text = "Connected for this session. Windows could not save the new sign-in.";
                 }
@@ -663,14 +779,35 @@ public partial class MailForm
                 invalidInput?.Focus();
                 return;
             }
-            if (imapPassword.Text.Length == 0 || smtpPassword.Text.Length == 0)
+            string key = account.ConnectionKey();
+            SavedSignIn? existing = sessionSignIn;
+            if (existing is null && (imapPassword.Text == passwordMask ||
+                !samePassword.Checked && smtpPassword.Text == passwordMask))
+            {
+                try
+                {
+                    existing = WindowsCredentialStore.Read(account.Id);
+                }
+                catch (Exception credentialError) when (credentialError is Win32Exception or InvalidOperationException)
+                {
+                    status.Text = "Windows could not read the saved sign-in. Enter the passwords again.";
+                    return;
+                }
+            }
+            if (existing?.ConnectionKey != key)
+                existing = null;
+
+            string? incomingPassword = imapPassword.Text == passwordMask ? existing?.IncomingPassword : imapPassword.Text;
+            string? outgoingPassword = samePassword.Checked ? incomingPassword :
+                smtpPassword.Text == passwordMask ? existing?.OutgoingPassword : smtpPassword.Text;
+            if (string.IsNullOrEmpty(incomingPassword) || string.IsNullOrEmpty(outgoingPassword))
             {
                 status.Text = "Enter both IMAP and SMTP passwords.";
-                (imapPassword.Text.Length == 0 ? imapPassword : smtpPassword).Focus();
+                (string.IsNullOrEmpty(incomingPassword) ? imapPassword : smtpPassword).Focus();
                 return;
             }
 
-            var signIn = new SavedSignIn(account.ConnectionKey(), imapPassword.Text, smtpPassword.Text);
+            var signIn = new SavedSignIn(key, incomingPassword, outgoingPassword);
             connect.Enabled = remove.Enabled = forget.Enabled = false;
             try
             {
@@ -720,7 +857,7 @@ public partial class MailForm
         _ => "Could not connect to the mail servers. Check the server settings and network connection."
     };
 
-    private void ApplyAccountTheme(Color surface, Color chrome, Color ink, Color border, Color hover)
+    private void ApplyAccountTheme(Color surface, Color chrome, Color ink, Color muted, Color border, Color hover)
     {
         accountPages.BackColor = accountTabs.Controls.Count > 0 ? border : surface;
         foreach (RadioButton tab in accountTabs.Controls)
@@ -738,12 +875,17 @@ public partial class MailForm
                 if (field is Panel { Controls.Count: 1 } frame && frame.Controls[0] is TextBox input)
                 {
                     frame.BackColor = input.BackColor = surface;
-                    input.ForeColor = ink;
+                    input.ForeColor = input.ReadOnly ? muted : ink;
                 }
                 else if (field is NumericUpDown port)
                 {
                     port.BackColor = surface;
                     port.ForeColor = ink;
+                }
+                else if (field is LinkLabel link)
+                {
+                    link.LinkColor = link.VisitedLinkColor = ink;
+                    link.ActiveLinkColor = muted;
                 }
                 else if (field is Button button)
                     StyleButton(button, chrome, ink, border, hover);

@@ -7,6 +7,7 @@ namespace Lit3Mail;
 
 internal static class RemoteMailImages
 {
+    private static ReadOnlySpan<byte> PngSignature => [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     private const int MaxImageBytes = 10 * 1024 * 1024;
     private static readonly SemaphoreSlim DownloadSlots = new(4);
     private static readonly HttpClient Client = new(new SocketsHttpHandler
@@ -23,12 +24,12 @@ internal static class RemoteMailImages
 
     internal static async Task<(MemoryStream Body, string MediaType)?> DownloadAsync(Uri uri)
     {
-        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-        var token = timeout.Token;
-        await DownloadSlots.WaitAsync(token).ConfigureAwait(false);
+        using var queueTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+        await DownloadSlots.WaitAsync(queueTimeout.Token).ConfigureAwait(false);
         try
         {
-            return await DownloadCoreAsync(uri, token).ConfigureAwait(false);
+            using var downloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            return await DownloadCoreAsync(uri, downloadTimeout.Token).ConfigureAwait(false);
         }
         finally
         {
@@ -50,8 +51,8 @@ internal static class RemoteMailImages
             }
 
             var mediaType = response.Content.Headers.ContentType?.MediaType;
-            if (!response.IsSuccessStatusCode || mediaType is null ||
-                !mediaType.StartsWith("image/", StringComparison.OrdinalIgnoreCase) ||
+            if (!response.IsSuccessStatusCode || (mediaType is not null &&
+                !mediaType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)) ||
                 response.Content.Headers.ContentLength > MaxImageBytes)
                 return null;
 
@@ -70,6 +71,16 @@ internal static class RemoteMailImages
                     }
                     body.Write(buffer, 0, count);
                 }
+                if (mediaType is null)
+                {
+                    if (!body.GetBuffer().AsSpan(0, (int)body.Length).StartsWith(PngSignature))
+                    {
+                        body.Dispose();
+                        return null;
+                    }
+                    mediaType = "image/png";
+                }
+
                 body.Position = 0;
                 return (body, mediaType);
             }

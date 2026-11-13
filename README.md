@@ -6,15 +6,18 @@ Lit3Mail's original code and documentation
 are dedicated to the public domain under [CC0 1.0 Universal](LICENCE.md).
 The software is provided as-is, without warranty.
 
-Lit3Mail is a **lightweight** Windows desktop email client AI-coded as a hobby project. 
+Lit3Mail is a **simple** Windows desktop email client AI-coded as a hobby project. 
 It was designed and tested with Gmail and can also connect to
 other IMAP and SMTP servers that accept passwords.
 
 - **Password login only.** Lit3Mail supports passwords and provider-issued app
-  passwords. It does not support OAuth or OAuth2, so accounts such 
+  passwords. It does not support OAuth, so accounts such 
   as Outlook.com cannot connect.
-- **No conversation view.** Messages appear individually in each folder. 
-  This is by design.
+- **No conversation view.** Messages appear individually in each folder, by design.
+- **Explicit read status.** Messages must be ticked as read explicitly, by design.
+- **Images hidden by default.** Images must be explicitly enabled in messages, by design, 
+  for security/privacy.
+- **No calendar/non-email integration.** Excluded to keep scope small, by design.
 
 ## Using Lit3Mail
 
@@ -22,6 +25,7 @@ other IMAP and SMTP servers that accept passwords.
 
 1. Ensure `.NET 10 Desktop Runtime` and `Microsoft Edge WebView2 Evergreen Runtime` are installed.
 1. Download the portable ZIP release, extract to the location of your choice (e.g. Program Files/Lit3Mail).
+   For app updates, delete all files in the program folder, then extract.
 2. Create shortcuts as desired to Lit3Mail.exe, and run it.
 3. Configure your account details in **Settings**.
 

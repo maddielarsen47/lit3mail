@@ -149,6 +149,15 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         return counts;
     }
 
+    public async Task<FolderCount> GetInboxCountAsync(CancellationToken token)
+    {
+        using var client = new ImapClient();
+        await ConnectAsync(client, incoming, token);
+        var inbox = client.Inbox;
+        await inbox.StatusAsync(StatusItems.Count | StatusItems.Unread, token);
+        return new FolderCount(inbox.Unread, inbox.Count);
+    }
+
     public async Task<bool> HasUnreadArrivalsAsync(DateTimeOffset since, CancellationToken token)
     {
         using var client = new ImapClient();
@@ -305,7 +314,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     private PreviewStructure RememberPreviewStructure(Guid id, IMessageSummary summary)
     {
         var structure = new PreviewStructure(summary.TextBody, summary.HtmlBody,
-            summary.BodyParts.Where(part => part.ContentId is not null).ToArray(), DescribeAttachments(summary));
+            summary.BodyParts.Where(part => part.ContentId is not null || part.ContentLocation is not null).ToArray(), DescribeAttachments(summary));
         lock (previewStructures)
         {
             if (previewStructures.TryAdd(id, structure))
@@ -364,18 +373,21 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         if (html is not null)
         {
             var pending = MailContent.ReferencedContentIds(html);
+            var sources = MailContent.ReferencedImageSources(html);
             foreach (var part in structure.InlineParts)
             {
                 string mediaType = part.ContentType.MimeType.ToLowerInvariant();
-                if (mediaType is not ("image/png" or "image/jpeg" or "image/gif" or "image/webp") ||
-                    part.ContentId?.Trim('<', '>') is not { } contentId || !pending.Remove(contentId))
+                string? contentId = part.ContentId?.Trim('<', '>');
+                string? location = part.ContentLocation?.OriginalString;
+                if (mediaType is not ("image/png" or "image/jpeg" or "image/gif" or "image/webp" or "image/bmp" or "image/avif" or "image/svg+xml") ||
+                    !(contentId is not null && pending.Contains(contentId) || location is not null && sources.Contains(location)))
                     continue;
                 using var image = await folder.GetBodyPartAsync(uid, part, token);
                 if (image is MimePart { Content: { } content })
                 {
                     using var bytes = new MemoryStream();
                     await content.DecodeToAsync(bytes, token);
-                    inlineImages.Add(new(contentId, mediaType, bytes.ToArray()));
+                    inlineImages.Add(new(contentId ?? MimeKit.Utils.MimeUtils.GenerateMessageId(), mediaType, bytes.ToArray(), location));
                 }
             }
         }
@@ -526,7 +538,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     {
         if (folder != "Trash")
         {
-            await MoveAsync(folder, "Trash", ids, token);
+            await MoveMessagesAsync(folder, "Trash", ids, token, markRead: true);
             return;
         }
         if (ids.Count == 0)
@@ -538,14 +550,18 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             throw new InvalidOperationException("This server cannot permanently delete only the selected messages.");
 
         var uids = GetMessageUids(source, ids);
-        await source.AddFlagsAsync(uids, MessageFlags.Deleted, true, token);
+        await source.AddFlagsAsync(uids, MessageFlags.Deleted | MessageFlags.Seen, true, token);
         await source.ExpungeAsync(uids, token);
         foreach (Guid id in ids)
             messages.TryRemove(id, out _);
     }
 
-    public async Task MoveAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
-        CancellationToken token)
+    public Task MoveAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
+        CancellationToken token) =>
+        MoveMessagesAsync(sourceFolder, destinationFolder, ids, token, markRead: false);
+
+    private async Task MoveMessagesAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
+        CancellationToken token, bool markRead)
     {
         if (ids.Count == 0)
             return;
@@ -563,13 +579,20 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             throw new InvalidOperationException("This server cannot move only the selected messages.");
 
         await source.OpenAsync(FolderAccess.ReadWrite, token);
-        var uids = await ResolveMoveUidsAsync(source, ids, token);
-        await source.MoveToAsync(uids, destination, token);
+        var uids = await ResolveMessageUidsAsync(source, ids, token);
+        if (markRead)
+            await source.AddFlagsAsync(uids, MessageFlags.Seen, true, token);
+        var moved = await source.MoveToAsync(uids, destination, token);
+        if (markRead && moved.Count > 0)
+        {
+            await destination.OpenAsync(FolderAccess.ReadWrite, token);
+            await destination.AddFlagsAsync(moved.Destination.ToList(), MessageFlags.Seen, true, token);
+        }
         foreach (Guid id in ids)
             messages.TryRemove(id, out _);
     }
 
-    private async Task<IList<UniqueId>> ResolveMoveUidsAsync(IMailFolder source, IReadOnlyCollection<Guid> ids,
+    private async Task<IList<UniqueId>> ResolveMessageUidsAsync(IMailFolder source, IReadOnlyCollection<Guid> ids,
         CancellationToken token)
     {
         var uids = new List<UniqueId>(ids.Count);
@@ -608,7 +631,9 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         var source = await ResolveFolderAsync(client, folder, token)
             ?? throw new InvalidOperationException("The folder is unavailable on the server.");
         await source.OpenAsync(FolderAccess.ReadOnly, token);
-        var uids = ids is null ? await source.SearchAsync(SearchQuery.All, token) : GetMessageUids(source, ids);
+        var uids = ids is null
+            ? await source.SearchAsync(SearchQuery.All, token)
+            : await ResolveMessageUidsAsync(source, ids, token);
         var names = new ExportFileNames();
         progress.Report((0, uids.Count));
         for (int i = 0; i < uids.Count; i++)
