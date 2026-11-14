@@ -379,7 +379,10 @@ public partial class MailForm
             var location = new TextBox { ReadOnly = true, AccessibleName = "Local data folder" };
             AddSettingsRow(fields, "Local data folder", CreateTextField(location));
             var changeFolder = new Button { Text = "Choose folder...", AutoSize = true };
-            AddSettingsRow(fields, "", changeFolder);
+            var resetFolder = new Button { Text = "Reset to default", AutoSize = true };
+            var folderActions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+            folderActions.Controls.AddRange([changeFolder, resetFolder]);
+            AddSettingsRow(fields, "", folderActions);
             var locationStatus = new Label { AutoSize = true };
             AddSettingsRow(fields, "", locationStatus);
 
@@ -387,6 +390,8 @@ public partial class MailForm
             {
                 string? pending = store.PendingDataFolder;
                 location.Text = pending ?? store.DataFolder;
+                resetFolder.Enabled = !string.Equals(location.Text, LocalDatabase.DefaultFolder,
+                    StringComparison.OrdinalIgnoreCase);
                 locationStatus.Text = pending is null
                     ? "Shared by all accounts."
                     : "Shared by all accounts. Changes apply the next time Lit3Mail opens.";
@@ -401,13 +406,17 @@ public partial class MailForm
                     UseDescriptionForTitle = true,
                     SelectedPath = location.Text
                 };
-                if (picker.ShowDialog(this) != DialogResult.OK)
-                    return;
+                if (picker.ShowDialog(this) == DialogResult.OK)
+                    SetDataFolder(picker.SelectedPath);
+            };
+            resetFolder.Click += (_, _) => SetDataFolder(LocalDatabase.DefaultFolder);
 
+            void SetDataFolder(string folder)
+            {
                 try
                 {
                     string? previousFolder = store.PendingDataFolder;
-                    store.SetDataFolder(picker.SelectedPath);
+                    store.SetDataFolder(folder);
                     RefreshDataFolder();
                     if (store.PendingDataFolder is { } pending &&
                         !string.Equals(pending, previousFolder, StringComparison.OrdinalIgnoreCase))
@@ -420,7 +429,7 @@ public partial class MailForm
                 {
                     ThemedPopup.Show(this, error.Message, "Local data folder", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
-            };
+            }
         }
 
         string version = typeof(MailForm).Assembly.GetName().Version?.ToString(3) ?? Application.ProductVersion;
