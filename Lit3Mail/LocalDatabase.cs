@@ -16,7 +16,8 @@ internal sealed record AccountSettings(
     string ProfileName, bool ProfileUsesAccountName, bool IncomingUsesEmail, bool OutgoingUsesEmail);
 
 internal sealed record DraftEditorState(string To, string Cc, string Bcc, string ReplyTo, string Subject,
-    bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature, ComposeHtmlQuote? HtmlQuote = null);
+    bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature, ComposeHtmlQuote? HtmlQuote = null,
+    ResponseOrigin? Response = null);
 
 internal sealed record LocalDraft(Guid? SenderId, DraftEditorState Editor, MailFileAttachment[] Files,
     Guid? ServerDraftId, string? ServerConnectionKey);
@@ -35,23 +36,30 @@ internal sealed class LocalDatabase(string path)
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
-        string? From = null, string? To = null, string? Cc = null)
+        string? From = null, string? To = null, string? Cc = null, string? Bcc = null,
+        string? ReplyTarget = null, string? ExplicitReplyTo = null, bool Replied = false, bool Forwarded = false)
     {
         public static CachedMessage FromSummary(MailSummary summary) =>
             new(summary.Id, summary.Read, summary.Star, summary.Attachments,
                 summary.Subject, summary.CorrespondentAddresses, summary.Date,
                 summary.HasPreviewHeaders ? summary.FromAddress : null,
                 summary.HasPreviewHeaders ? summary.ToAddresses : null,
-                summary.HasPreviewHeaders ? summary.CcAddresses : null);
+                summary.HasPreviewHeaders ? summary.CcAddresses : null,
+                summary.HasPreviewHeaders ? summary.BccAddresses : null,
+                summary.HasPreviewHeaders ? summary.ReplyToAddress : null,
+                summary.HasPreviewHeaders ? summary.ExplicitReplyToAddresses : null, summary.Replied, summary.Forwarded);
 
         public MailSummary ToSummary(string folder)
         {
             if (From is not null && To is not null && Cc is not null)
-                return new(Id, folder, Read, Star, Attachments, Subject, "", Date, From, To, Cc, "");
+                return new(Id, folder, Read, Star, Attachments, Subject, "", Date, From, To, Cc, ReplyTarget ?? From,
+                    BccAddresses: Bcc ?? "", ExplicitReplyToAddresses: ExplicitReplyTo ?? "",
+                    Replied: Replied, Forwarded: Forwarded);
 
             bool outgoing = folder is "Sent" or "Drafts";
             return new(Id, folder, Read, Star, Attachments, Subject, "", Date,
-                outgoing ? "" : Correspondents, outgoing ? Correspondents : "", "", "", HasPreviewHeaders: false);
+                outgoing ? "" : Correspondents, outgoing ? Correspondents : "", "", "", HasPreviewHeaders: false,
+                Replied: Replied, Forwarded: Forwarded);
         }
     }
 
@@ -615,7 +623,14 @@ internal sealed class LocalDatabase(string path)
         transaction.Commit();
     }
 
-    public void UpdateCachedMessageFlag(Guid account, string folder, string connectionKey, Guid id, bool readFlag, bool value)
+    public void UpdateCachedMessageFlag(Guid account, string folder, string connectionKey, Guid id, bool readFlag, bool value) =>
+        UpdateCachedMessageFlag(account, folder, connectionKey, id, readFlag ? "Read" : "Star", value);
+
+    public void UpdateCachedResponseFlag(ResponseOrigin response) =>
+        UpdateCachedMessageFlag(response.AccountId, response.Folder, response.ConnectionKey, response.MessageId,
+            response.IsReply ? "Replied" : "Forwarded", value: true);
+
+    private void UpdateCachedMessageFlag(Guid account, string folder, string connectionKey, Guid id, string flag, bool value)
     {
         using var connection = Open();
         using var command = connection.CreateCommand();
@@ -634,7 +649,7 @@ internal sealed class LocalDatabase(string path)
             """;
         AddFolderParameters(command, account, folder, connectionKey);
         command.Parameters.AddWithValue("$message", id.ToString());
-        command.Parameters.AddWithValue("$flag", readFlag ? "Read" : "Star");
+        command.Parameters.AddWithValue("$flag", flag);
         command.Parameters.AddWithValue("$value", value ? "true" : "false");
         command.Parameters.AddWithValue("$revision", Guid.NewGuid().ToString());
         command.ExecuteNonQuery();

@@ -10,11 +10,13 @@ internal static class MailFolders
 }
 
 internal sealed record MessageMoveResult(bool MarkedRead, IReadOnlyDictionary<Guid, Guid>? DestinationIds = null);
+internal sealed record ResponseOrigin(Guid AccountId, string ConnectionKey, string Folder, Guid MessageId, bool IsReply);
 
 internal sealed record MailSummary(Guid Id, string Folder, bool Read, bool Star, bool Attachments,
     string Subject, string CorrespondentName, DateTime Date,
     string FromAddress, string ToAddresses, string CcAddresses, string ReplyToAddress,
-    bool HasPreviewHeaders = true)
+    bool HasPreviewHeaders = true, string BccAddresses = "", string ExplicitReplyToAddresses = "",
+    bool Replied = false, bool Forwarded = false)
 {
     public string CorrespondentAddresses => GetCorrespondentAddresses();
 

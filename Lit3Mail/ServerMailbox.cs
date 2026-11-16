@@ -19,6 +19,7 @@ internal sealed record MailEndpoint(string Host, int Port, string User, string P
 internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing) : IMailbox
 {
     internal const string GmailLabelPrefix = "gmail-label:";
+    private const string ForwardedKeyword = "$Forwarded";
     private const int MaxPreviewTextBytes = 1024 * 1024;
     private const int MaxInlineImageBytes = 5 * 1024 * 1024;
     private const int MaxInlinePreviewBytes = 12 * 1024 * 1024;
@@ -208,10 +209,11 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
 
         const MessageSummaryItems items = MessageSummaryItems.UniqueId | MessageSummaryItems.Envelope |
             MessageSummaryItems.Flags | MessageSummaryItems.InternalDate | MessageSummaryItems.BodyStructure;
+        var request = new FetchRequest(items, [HeaderId.ReplyTo]);
         const int FirstBatchSize = 50;
         if (terms.Length == 0 && publishBatch is not null && remote.Count > FirstBatchSize)
         {
-            var newest = await remote.FetchAsync(remote.Count - FirstBatchSize, -1, items, token);
+            var newest = await remote.FetchAsync(remote.Count - FirstBatchSize, -1, request, token);
             var results = ConvertSummaries(remote, folder, newest, newest.Count).ToList();
             if (results.Count > 0)
                 publishBatch(results.ToArray());
@@ -225,7 +227,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             var older = await remote.SearchAsync(SearchQuery.Uids(range), token);
             foreach (var uids in older.OrderByDescending(uid => uid.Id).Chunk(200))
             {
-                var fetched = await remote.FetchAsync(uids, items, token);
+                var fetched = await remote.FetchAsync(uids, request, token);
                 var batch = ConvertSummaries(remote, folder, fetched, Math.Max(0, LocalDatabase.FolderCacheLimit - results.Count));
                 results.AddRange(batch);
                 if (batch.Length > 0)
@@ -238,7 +240,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         if (terms.Length == 0)
         {
             int start = limit is { } max ? Math.Max(0, remote.Count - max) : 0;
-            summaries = await remote.FetchAsync(start, -1, items, token);
+            summaries = await remote.FetchAsync(start, -1, request, token);
         }
         else
         {
@@ -253,7 +255,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 for (int offset = 0; offset < ordered.Length;)
                 {
                     int count = Math.Min(offset == 0 ? FirstBatchSize : 200, ordered.Length - offset);
-                    var fetched = await remote.FetchAsync(new ArraySegment<UniqueId>(ordered, offset, count), items, token);
+                    var fetched = await remote.FetchAsync(new ArraySegment<UniqueId>(ordered, offset, count), request, token);
                     var batch = ConvertSummaries(remote, folder, fetched, Math.Max(0, LocalDatabase.FolderCacheLimit - offset));
                     results.AddRange(batch);
                     if (batch.Length > 0)
@@ -262,7 +264,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 }
                 return results;
             }
-            summaries = await remote.FetchAsync(uids, items, token);
+            summaries = await remote.FetchAsync(uids, request, token);
         }
         return ConvertSummaries(remote, folder, summaries, LocalDatabase.FolderCacheLimit);
     }
@@ -304,13 +306,19 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 !TryGetPreviewStructure(id, out _))
                 RememberPreviewStructure(id, item);
             var envelope = item.Envelope ?? new Envelope();
+            // IMAP may substitute the sender in the envelope when the Reply-To header is absent.
+            string explicitReplyTo = item.Headers?[HeaderId.ReplyTo] is { } replyToHeader &&
+                InternetAddressList.TryParse(replyToHeader, out var replyTo) ? Addresses(replyTo) : "";
             var correspondent = (folder is "Sent" or "Drafts" ? envelope.To : envelope.From).Mailboxes.FirstOrDefault();
             return new MailSummary(id, folder, item.Flags?.HasFlag(MessageFlags.Seen) == true,
                 item.Flags?.HasFlag(MessageFlags.Flagged) == true, item.Attachments.Any(),
                 envelope.Subject ?? "(No subject)", correspondent?.Name ?? correspondent?.Address ?? "",
                 (envelope.Date ?? item.InternalDate)?.LocalDateTime ?? DateTime.MinValue,
                 Addresses(envelope.From), Addresses(envelope.To), Addresses(envelope.Cc),
-                envelope.ReplyTo.Mailboxes.FirstOrDefault()?.Address ?? envelope.From.Mailboxes.FirstOrDefault()?.Address ?? "");
+                envelope.ReplyTo.Mailboxes.FirstOrDefault()?.Address ?? envelope.From.Mailboxes.FirstOrDefault()?.Address ?? "",
+                BccAddresses: Addresses(envelope.Bcc), ExplicitReplyToAddresses: explicitReplyTo,
+                Replied: item.Flags?.HasFlag(MessageFlags.Answered) == true,
+                Forwarded: item.Keywords?.Contains(ForwardedKeyword, StringComparer.OrdinalIgnoreCase) == true);
         }).ToArray();
     }
 
@@ -564,6 +572,27 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         return text.ToString().Trim();
     }
 
+    public async Task<bool> MarkResponseAsync(ResponseOrigin response, CancellationToken token)
+    {
+        using var client = new ImapClient();
+        await ConnectAsync(client, incoming, token);
+        var folder = await ResolveFolderAsync(client, response.Folder, token);
+        if (folder is null)
+            return false;
+        await folder.OpenAsync(FolderAccess.ReadWrite, token);
+        if (response.IsReply ? !folder.PermanentFlags.HasFlag(MessageFlags.Answered) :
+            !folder.PermanentFlags.HasFlag(MessageFlags.UserDefined) &&
+            !folder.PermanentKeywords.Contains(ForwardedKeyword, StringComparer.OrdinalIgnoreCase))
+            return false;
+
+        var uids = await ResolveMessageUidsAsync(folder, [response.MessageId], token);
+        if (response.IsReply)
+            await folder.AddFlagsAsync(uids, MessageFlags.Answered, true, token);
+        else
+            await folder.AddFlagsAsync(uids, MessageFlags.None, [ForwardedKeyword], true, token);
+        return true;
+    }
+
     public async Task UpdateFlagsAsync(Guid id, bool? read, bool? star, CancellationToken token)
     {
         using var client = new ImapClient();
@@ -783,7 +812,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
 
         var summary = uid is { } id
             ? new MailSummary(RegisterMessage(drafts, id), "Drafts", true, false, mail.Files is { Count: > 0 }, mail.Subject, mail.To,
-                message.Date.LocalDateTime, mail.From, Addresses(message.To), Addresses(message.Cc), mail.ReplyTo)
+                message.Date.LocalDateTime, mail.From, Addresses(message.To), Addresses(message.Cc), mail.ReplyTo,
+                BccAddresses: Addresses(message.Bcc), ExplicitReplyToAddresses: Addresses(message.ReplyTo))
             : null;
         return new(summary, replaced, warning);
     }
@@ -918,7 +948,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         return uid is { } id
             ? new(new MailSummary(RegisterMessage(sent, id), "Sent", true, false, mail.Files is { Count: > 0 }, mail.Subject,
                 mail.To, message.Date.LocalDateTime, mail.From, Addresses(message.To), Addresses(message.Cc),
-                string.IsNullOrWhiteSpace(mail.ReplyTo) ? mail.From : mail.ReplyTo))
+                string.IsNullOrWhiteSpace(mail.ReplyTo) ? mail.From : mail.ReplyTo,
+                BccAddresses: Addresses(message.Bcc), ExplicitReplyToAddresses: Addresses(message.ReplyTo)))
             : new(null);
     }
 
