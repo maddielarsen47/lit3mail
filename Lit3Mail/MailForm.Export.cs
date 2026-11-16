@@ -5,29 +5,12 @@ namespace Lit3Mail;
 public partial class MailForm
 {
     private readonly Button exportMail = new() { Text = "Export...", AutoSize = true, Dock = DockStyle.Bottom };
-    private readonly Label batchStatus = new() { AutoSize = true, Margin = new Padding(0, 6, 8, 0) };
-    private readonly Button cancelExport = new() { Text = "Cancel", AutoSize = true };
-    private readonly FlowLayoutPanel batchBar = new()
-    {
-        Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(12, 2, 12, 2), Visible = false
-    };
     private CancellationTokenSource? exportCancellation;
     private Task exportCompletion = Task.CompletedTask;
-    private object? batchActivity;
-    private System.Windows.Forms.Timer batchStatusTimer = null!;
     private ContextMenuStrip exportMenu = null!;
 
     private void InitializeExport()
     {
-        batchStatusTimer = new System.Windows.Forms.Timer(components!) { Interval = 10_000 };
-        batchStatusTimer.Tick += (_, _) =>
-        {
-            batchStatusTimer.Stop();
-            batchBar.Hide();
-        };
-        batchBar.Controls.Add(batchStatus);
-        batchBar.Controls.Add(cancelExport);
-        cancelExport.Click += (_, _) => exportCancellation?.Cancel();
         exportMenu = new ContextMenuStrip(components!) { ShowImageMargin = false };
         var selection = new ToolStripMenuItem("Export selected messages...");
         var folder = new ToolStripMenuItem("Export entire folder...");
@@ -131,36 +114,4 @@ public partial class MailForm
             completion.TrySetResult();
         }
     }
-
-    private object? BeginBatchActivity(string message)
-    {
-        if (batchActivity is not null || updatingMessageFolders || exportCancellation is not null)
-            return null;
-
-        ShowBatchStatus(message, inProgress: true);
-        batchActivity = new object();
-        return batchActivity;
-    }
-
-    private void EndBatchActivity(object? activity)
-    {
-        if (activity is null || !ReferenceEquals(batchActivity, activity))
-            return;
-
-        batchActivity = null;
-        if (!IsDisposed && !Disposing)
-            batchBar.Hide();
-    }
-
-    private void ShowBatchStatus(string message, bool cancellable = false, bool inProgress = false)
-    {
-        batchStatusTimer.Stop();
-        batchActivity = null;
-        batchStatus.Text = message;
-        cancelExport.Visible = cancellable;
-        batchBar.Show();
-        if (!cancellable && !inProgress)
-            batchStatusTimer.Start();
-    }
 }
-

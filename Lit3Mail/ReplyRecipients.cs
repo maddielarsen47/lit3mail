@@ -4,11 +4,14 @@ namespace Lit3Mail;
 
 internal static class ReplyRecipients
 {
+    public static string ReplyTarget(MailSummary original) =>
+        !string.IsNullOrWhiteSpace(original.ExplicitReplyToAddresses) ? original.ExplicitReplyToAddresses :
+        !string.IsNullOrWhiteSpace(original.ReplyToAddress) ? original.ReplyToAddress : original.FromAddress;
+
     public static (string To, string Cc) ReplyAll(MailSummary original, IEnumerable<string> ownAddresses)
     {
         var seen = ReadAddresses(ownAddresses).ToHashSet(StringComparer.OrdinalIgnoreCase);
-        string author = string.IsNullOrWhiteSpace(original.ReplyToAddress) ? original.FromAddress : original.ReplyToAddress;
-        var to = ReadAddresses([author, original.ToAddresses]).Where(seen.Add).ToArray();
+        var to = ReadAddresses([ReplyTarget(original), original.ToAddresses]).Where(seen.Add).ToArray();
         var cc = ReadAddresses([original.CcAddresses]).Where(seen.Add).ToArray();
         return (string.Join("; ", to), string.Join("; ", cc));
     }

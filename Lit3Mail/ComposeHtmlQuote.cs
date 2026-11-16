@@ -1,4 +1,5 @@
 using System.Net;
+using System.Globalization;
 using System.Text;
 using System.Text.RegularExpressions;
 using MimeKit.Text;
@@ -7,6 +8,12 @@ namespace Lit3Mail;
 
 internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImage[] Images)
 {
+    private const string DocumentStart = "<!doctype html><html><body>";
+    private const string QuoteClass = "lit3mail-original-message";
+    private const string QuoteStart = "<div class=\"" + QuoteClass + "\">";
+    private const string DocumentEnd = "</div></body></html>";
+    private const string DraftMarker = "<!--lit3mail-quote:";
+    private const string OriginalHeader = "--- Original Message ---";
     private static readonly HashSet<string> LayoutTags = new(StringComparer.Ordinal)
     {
         "a", "abbr", "address", "b", "blockquote", "br", "caption", "center", "cite", "code", "col",
@@ -114,20 +121,65 @@ internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImag
 
         string label = WebUtility.HtmlEncode(header.TrimEnd()).Replace("\r", "").Replace("\n", "<br>");
         return new(header + original.Body,
-            $"<div><p>{label}</p>{html}</div>", images.ToArray());
+            header.Length == 0 ? html.ToString() : $"<div><p>{label}</p>{html}</div>", images.ToArray());
     }
 
-    public MailContent WithReply(MailContent reply)
+    public MailContent WithReply(MailContent reply, bool forDraft = false)
     {
-        const string scope = "lit3mail-original-message";
-        string scopedQuote = Regex.Replace(Html, @"<style(?:\s[^>]*)?>(.*?)</style>", match =>
+        string quoteHtml = Regex.Replace(Html, @"\A<div><p>--- Original Message ---<br>.*?</p>", match =>
+            Regex.Replace(match.Value, "<br>BCC: [^<]*", "", RegexOptions.IgnoreCase),
+            RegexOptions.Singleline);
+        string scopedQuote = Regex.Replace(quoteHtml, @"<style(?:\s[^>]*)?>(.*?)</style>", match =>
         {
             string css = match.Groups[1].Value;
-            return HasBalancedCss(css) ? $"<style>@scope (.{scope}) {{ {css} }}</style>" : "";
+            return HasBalancedCss(css) ? $"<style>@scope (.{QuoteClass}) {{ {css} }}</style>" : "";
         }, RegexOptions.IgnoreCase | RegexOptions.Singleline);
-        return new(reply.Body + "\n\n" + Body,
-            Html: $"<!doctype html><html><body>{reply.Html}<div class=\"{scope}\">{scopedQuote}</div></body></html>",
+        string marker = forDraft ? $"{DraftMarker}{reply.Body.ReplaceLineEndings("\n").Length.ToString(CultureInfo.InvariantCulture)}-->" : "";
+        string body = FindQuotedBcc(Body) is { } bcc ? Body.Remove(bcc.Index, bcc.Length) : Body;
+        return new(reply.Body + "\n\n" + body,
+            Html: DocumentStart + reply.Html + marker + QuoteStart + scopedQuote + DocumentEnd,
             InlineImages: (reply.InlineImages ?? []).Concat(Images).ToArray());
+    }
+
+    public static ComposeHtmlQuote? RestoreDraftQuote(MailContent draft, out MailContent editableBody)
+    {
+        editableBody = draft;
+        if (draft.Html is not { } html || !html.StartsWith(DocumentStart, StringComparison.Ordinal) ||
+            !html.TrimEnd().EndsWith(DocumentEnd, StringComparison.Ordinal))
+            return null;
+        html = html.TrimEnd();
+        int quoteStart = html.IndexOf(QuoteStart, DocumentStart.Length, StringComparison.Ordinal);
+        if (quoteStart < 0)
+            return null;
+
+        string replyHtml = html[DocumentStart.Length..quoteStart];
+        string body = draft.Body.ReplaceLineEndings("\n");
+        int bodySplit = body.IndexOf("\n\n" + OriginalHeader, StringComparison.Ordinal);
+        int markerStart = replyHtml.LastIndexOf(DraftMarker, StringComparison.Ordinal);
+        if (markerStart >= 0 && replyHtml.EndsWith("-->", StringComparison.Ordinal) &&
+            int.TryParse(replyHtml.AsSpan(markerStart + DraftMarker.Length, replyHtml.Length - markerStart - DraftMarker.Length - 3),
+                NumberStyles.None, CultureInfo.InvariantCulture, out int replyLength))
+        {
+            replyHtml = replyHtml[..markerStart];
+            if (replyLength <= body.Length && body.AsSpan(replyLength).StartsWith("\n\n" + OriginalHeader, StringComparison.Ordinal))
+                bodySplit = replyLength;
+        }
+        if (bodySplit < 0)
+            return null;
+
+        string quoteHtml = html[(quoteStart + QuoteStart.Length)..^DocumentEnd.Length];
+        string scopeStart = $"<style>@scope (.{QuoteClass}) {{ ";
+        quoteHtml = Regex.Replace(quoteHtml, Regex.Escape(scopeStart) + "(.*?)" + Regex.Escape(" }</style>"),
+            "<style>$1</style>", RegexOptions.Singleline);
+        editableBody = draft with { Body = body[..bodySplit], Html = replyHtml };
+        return Create("", draft with { Body = body[(bodySplit + 2)..], Html = quoteHtml }, null);
+    }
+
+    internal static Group? FindQuotedBcc(string body)
+    {
+        var header = Regex.Match(body,
+            @"(?m)^--- Original Message ---\r?\n(?:^(?:From|To|CC|Reply-To): [^\r\n]*\r?\n)*(?<bcc>^BCC: [^\r\n]*\r?\n)(?:^(?:From|To|CC|Reply-To): [^\r\n]*\r?\n)*(?=^Date: [^\r\n]*\r?\n^Subject: )");
+        return header.Success ? header.Groups["bcc"] : null;
     }
 
     private static bool HasBalancedCss(string css)
