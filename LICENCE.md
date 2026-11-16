@@ -30,6 +30,7 @@ include the licences and notices required by their respective terms.
 | RtfPipe | MIT. [RtfPipe project and licence](https://github.com/erdomke/RtfPipe) |
 | Microsoft Edge WebView2 SDK | Microsoft Software License Terms. See `LICENSE.txt` and `NOTICE.txt` in the [Microsoft.Web.WebView2 NuGet package](https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.4314.35). |
 | Microsoft Edge WebView2 Runtime | Microsoft Software License Terms for the installed runtime distribution. [Microsoft's runtime distribution documentation](https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution) |
+| Microsoft Windows App SDK (Foundation, Base and InteractiveExperiences) | Microsoft Software License Terms for the bundled binaries. See `license.txt` in the [Foundation](https://www.nuget.org/packages/Microsoft.WindowsAppSDK.Foundation/2.6.4), [Base](https://www.nuget.org/packages/Microsoft.WindowsAppSDK.Base/2.6.4) and [InteractiveExperiences](https://www.nuget.org/packages/Microsoft.WindowsAppSDK.InteractiveExperiences/2.6.4) NuGet packages, and `NOTICE.txt` in Base. |
 | .NET and Windows Forms | MIT for upstream source. Microsoft documents additional terms for certain Windows SDK and runtime binaries. [WinForms licence](https://github.com/dotnet/winforms/blob/main/LICENSE.TXT) · [.NET licensing information](https://github.com/dotnet/core/blob/main/license-information.md) |
 
 ## Application icon

@@ -16,6 +16,7 @@ public partial class MailForm
         public bool ProfileUsesAccountName { get; set; } = true;
         public bool IncomingUsesEmail { get; set; } = true;
         public bool OutgoingUsesEmail { get; set; } = true;
+        public bool DesktopNotifications { get; set; } = true;
         public string Email { get; set; } = email;
         public string ReplyTo { get; set; } = "";
         public string Organisation { get; set; } = "";
@@ -95,6 +96,7 @@ public partial class MailForm
                 ProfileUsesAccountName = account.ProfileUsesAccountName,
                 IncomingUsesEmail = account.IncomingUsesEmail,
                 OutgoingUsesEmail = account.OutgoingUsesEmail,
+                DesktopNotifications = account.DesktopNotifications,
                 ReplyTo = account.ReplyTo,
                 Organisation = account.Organisation,
                 Signature = account.Signature,
@@ -141,7 +143,8 @@ public partial class MailForm
             account.Id, account.Name, account.Email, account.ReplyTo, account.Organisation, account.Signature,
             account.IncomingHost, account.IncomingPort, account.IncomingUser, account.IncomingStartTls,
             account.OutgoingHost, account.OutgoingPort, account.OutgoingUser, account.OutgoingStartTls, account.Expanded,
-            position, account.ProfileName, account.ProfileUsesAccountName, account.IncomingUsesEmail, account.OutgoingUsesEmail))
+            position, account.ProfileName, account.ProfileUsesAccountName, account.IncomingUsesEmail, account.OutgoingUsesEmail,
+            account.DesktopNotifications))
             .ToDictionary(account => account.Id);
         var updated = current.Values.Where(account =>
             !savedAccounts.TryGetValue(account.Id, out var previous) || previous != account).ToArray();
@@ -587,6 +590,16 @@ public partial class MailForm
         AddText("Reply-To Address", account.ReplyTo, value => account.ReplyTo = value);
         AddText("Organisation", account.Organisation, value => account.Organisation = value);
         AddText("Signature Text/HTML", account.Signature, value => account.Signature = value, multiline: true);
+        var notifications = new CheckBox
+        {
+            Text = "Notify me when new mail arrives", AutoSize = true, Checked = account.DesktopNotifications
+        };
+        notifications.CheckedChanged += (_, _) =>
+        {
+            account.DesktopNotifications = notifications.Checked;
+            ResetDesktopNotificationCursor(account);
+        };
+        AddRow("Desktop notifications", notifications);
 
         AddSection("Connection");
         var connectionStateFont = new Font(Font, FontStyle.Bold);

@@ -16,7 +16,7 @@ internal sealed record MailSummary(Guid Id, string Folder, bool Read, bool Star,
     string Subject, string CorrespondentName, DateTime Date,
     string FromAddress, string ToAddresses, string CcAddresses, string ReplyToAddress,
     bool HasPreviewHeaders = true, string BccAddresses = "", string ExplicitReplyToAddresses = "",
-    bool Replied = false, bool Forwarded = false)
+    bool Replied = false, bool Forwarded = false, bool HasStandaloneImages = false)
 {
     public string CorrespondentAddresses => GetCorrespondentAddresses();
 
@@ -90,7 +90,7 @@ internal interface IMailbox
     Task<MailContent> LoadContentAsync(Guid id, CancellationToken cancellationToken);
     Task<IReadOnlyList<MailAttachmentInfo>> GetAttachmentsAsync(Guid id, CancellationToken cancellationToken);
     Task DownloadAttachmentAsync(Guid id, string partId, Stream output, CancellationToken cancellationToken);
-    Task UpdateFlagsAsync(Guid id, bool? read, bool? star, CancellationToken cancellationToken);
+    Task UpdateFlagsAsync(string folder, Guid id, bool? read, bool? star, CancellationToken cancellationToken);
     Task<MessageMoveResult> DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
     Task<MessageMoveResult> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
     Task ExportAsync(string folder, IReadOnlySet<Guid>? ids, System.IO.Compression.ZipArchive archive,

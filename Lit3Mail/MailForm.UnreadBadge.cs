@@ -6,14 +6,20 @@ public partial class MailForm
     private CancellationTokenSource? badgeCheck;
     private readonly HashSet<MailAccount> accountsWithNewUnread = [];
     private bool unreadBadgeVisible;
+    private bool checkingMailIndicators;
+    private int mailFocusGeneration;
 
     private void InitializeUnreadBadge()
     {
-        var timer = new System.Windows.Forms.Timer(components!) { Interval = 30_000 };
-        timer.Tick += async (_, _) => await CheckUnreadBadgeAsync();
+        var timer = new System.Windows.Forms.Timer(components!) { Interval = 60_000 };
+        timer.Tick += async (_, _) => await CheckMailIndicatorsAsync();
         Activated += (_, _) =>
         {
-            timer.Stop();
+            if (unfocusedSince is not null && messages.Visible && messages.Rows.Count > 0)
+                messages.FirstDisplayedScrollingRowIndex = 0;
+            if (unfocusedSince is not null)
+                mailFocusGeneration++;
+            timer.Interval = 60_000;
             unfocusedSince = null;
             badgeCheck?.Cancel();
             accountsWithNewUnread.Clear();
@@ -24,12 +30,39 @@ public partial class MailForm
         {
             if (ActiveForm != this)
                 BeginUnfocused();
+            else
+                timer.Start();
         };
 
         void BeginUnfocused()
         {
             unfocusedSince ??= DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+            timer.Interval = 30_000;
             timer.Start();
+        }
+    }
+
+    private async Task CheckMailIndicatorsAsync()
+    {
+        if (checkingMailIndicators || IsDisposed || Disposing)
+            return;
+
+        checkingMailIndicators = true;
+        int generation = mailFocusGeneration;
+        try
+        {
+            var badge = CheckUnreadBadgeAsync();
+            var reminders = CheckDesktopNotificationsAsync();
+            await Task.WhenAll(badge, reminders);
+            if (IsDisposed || Disposing || generation != mailFocusGeneration)
+                return;
+
+            SetUnreadBadge(unfocusedSince is not null && accountsWithNewUnread.Count > 0);
+            ShowMailReminders(await reminders);
+        }
+        finally
+        {
+            checkingMailIndicators = false;
         }
     }
 
@@ -41,11 +74,15 @@ public partial class MailForm
         badgeCheck = check;
         try
         {
-            foreach (var account in accounts.ToArray())
+            await Task.WhenAll(accounts.ToArray().Select(CheckAccountAsync));
+            check.Token.ThrowIfCancellationRequested();
+            accountsWithNewUnread.RemoveWhere(account => !accounts.Contains(account) || account.Mailbox is null);
+
+            async Task CheckAccountAsync(MailAccount account)
             {
                 check.Token.ThrowIfCancellationRequested();
                 if (account.Mailbox is not { } mailbox)
-                    continue;
+                    return;
 
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(check.Token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(8));
@@ -67,9 +104,6 @@ public partial class MailForm
                 }
             }
 
-            check.Token.ThrowIfCancellationRequested();
-            accountsWithNewUnread.RemoveWhere(account => !accounts.Contains(account) || account.Mailbox is null);
-            SetUnreadBadge(accountsWithNewUnread.Count > 0);
         }
         catch (OperationCanceledException) when (check.IsCancellationRequested) { }
         finally

@@ -38,6 +38,9 @@ Lit3Mail. Use that App Password in both password fields. New accounts default to
 
 - Lit3Mail refreshes inboxes once per minute, and performs full refresh 
   every 10 minutes, while open.
+- When Windows allows banners, new mail notifications stay visible until you
+  dismiss them or return to Lit3Mail. Turn them off per account under
+  **Desktop notifications** in Settings.
 - Gmail labels exposed over IMAP appear after the standard folders, marked
   with an asterisk. Lit3Mail skips **All Mail**, **Important**, and **Starred**.
   To make another label available, enable **Show in IMAP** for it

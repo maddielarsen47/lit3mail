@@ -13,7 +13,8 @@ internal sealed record AccountSettings(
     Guid Id, string Name, string Email, string ReplyTo, string Organisation, string Signature,
     string IncomingHost, int IncomingPort, string IncomingUser, bool IncomingStartTls,
     string OutgoingHost, int OutgoingPort, string OutgoingUser, bool OutgoingStartTls, bool Expanded, int Position,
-    string ProfileName, bool ProfileUsesAccountName, bool IncomingUsesEmail, bool OutgoingUsesEmail);
+    string ProfileName, bool ProfileUsesAccountName, bool IncomingUsesEmail, bool OutgoingUsesEmail,
+    bool DesktopNotifications);
 
 internal sealed record DraftEditorState(string To, string Cc, string Bcc, string ReplyTo, string Subject,
     bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature, ComposeHtmlQuote? HtmlQuote = null,
@@ -32,12 +33,13 @@ internal sealed class LocalDatabase(string path)
 {
     internal const int FolderCacheLimit = 1000;
     private const int MaxCachedBodyPartBytes = 4 * 1024 * 1024;
-    private const int SchemaVersion = 12;
+    private const int SchemaVersion = 13;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
         string? From = null, string? To = null, string? Cc = null, string? Bcc = null,
-        string? ReplyTarget = null, string? ExplicitReplyTo = null, bool Replied = false, bool Forwarded = false)
+        string? ReplyTarget = null, string? ExplicitReplyTo = null, bool Replied = false, bool Forwarded = false,
+        bool HasStandaloneImages = false)
     {
         public static CachedMessage FromSummary(MailSummary summary) =>
             new(summary.Id, summary.Read, summary.Star, summary.Attachments,
@@ -47,19 +49,20 @@ internal sealed class LocalDatabase(string path)
                 summary.HasPreviewHeaders ? summary.CcAddresses : null,
                 summary.HasPreviewHeaders ? summary.BccAddresses : null,
                 summary.HasPreviewHeaders ? summary.ReplyToAddress : null,
-                summary.HasPreviewHeaders ? summary.ExplicitReplyToAddresses : null, summary.Replied, summary.Forwarded);
+                summary.HasPreviewHeaders ? summary.ExplicitReplyToAddresses : null, summary.Replied, summary.Forwarded,
+                summary.HasStandaloneImages);
 
         public MailSummary ToSummary(string folder)
         {
             if (From is not null && To is not null && Cc is not null)
                 return new(Id, folder, Read, Star, Attachments, Subject, "", Date, From, To, Cc, ReplyTarget ?? From,
                     BccAddresses: Bcc ?? "", ExplicitReplyToAddresses: ExplicitReplyTo ?? "",
-                    Replied: Replied, Forwarded: Forwarded);
+                    Replied: Replied, Forwarded: Forwarded, HasStandaloneImages: HasStandaloneImages);
 
             bool outgoing = folder is "Sent" or "Drafts";
             return new(Id, folder, Read, Star, Attachments, Subject, "", Date,
                 outgoing ? "" : Correspondents, outgoing ? Correspondents : "", "", "", HasPreviewHeaders: false,
-                Replied: Replied, Forwarded: Forwarded);
+                Replied: Replied, Forwarded: Forwarded, HasStandaloneImages: HasStandaloneImages);
         }
     }
 
@@ -306,11 +309,20 @@ internal sealed class LocalDatabase(string path)
             command.ExecuteNonQuery();
         }
 
+        if (version < 13)
+        {
+            command.CommandText = """
+                ALTER TABLE accounts ADD COLUMN desktop_notifications INTEGER NOT NULL DEFAULT 1;
+                PRAGMA user_version = 13;
+                """;
+            command.ExecuteNonQuery();
+        }
+
         command.CommandText = """
             SELECT id, name, email, reply_to, organisation, signature,
                    incoming_host, incoming_port, incoming_user, incoming_starttls,
                    outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
-                   profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email
+                   profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications
             FROM accounts ORDER BY position, rowid
             """;
         var accounts = new List<AccountSettings>();
@@ -322,7 +334,7 @@ internal sealed class LocalDatabase(string path)
                     reader.GetInt32(7), reader.GetString(8), reader.GetBoolean(9), reader.GetString(10),
                     reader.GetInt32(11), reader.GetString(12), reader.GetBoolean(13), reader.GetBoolean(14),
                     reader.GetInt32(15), reader.GetString(16), reader.GetBoolean(17),
-                    reader.GetBoolean(18), reader.GetBoolean(19)));
+                    reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20)));
         }
         transaction.Commit();
         return accounts;
@@ -350,12 +362,12 @@ internal sealed class LocalDatabase(string path)
                     id, name, email, reply_to, organisation, signature,
                     incoming_host, incoming_port, incoming_user, incoming_starttls,
                     outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
-                    profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email
+                    profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications
                 ) VALUES (
                     $id, $name, $email, $replyTo, $organisation, $signature,
                     $incomingHost, $incomingPort, $incomingUser, $incomingStartTls,
                     $outgoingHost, $outgoingPort, $outgoingUser, $outgoingStartTls, $expanded, $position,
-                    $profileName, $profileUsesAccountName, $incomingUsesEmail, $outgoingUsesEmail
+                    $profileName, $profileUsesAccountName, $incomingUsesEmail, $outgoingUsesEmail, $desktopNotifications
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, email = excluded.email, reply_to = excluded.reply_to,
@@ -366,7 +378,8 @@ internal sealed class LocalDatabase(string path)
                     outgoing_user = excluded.outgoing_user, outgoing_starttls = excluded.outgoing_starttls,
                     expanded = excluded.expanded, position = excluded.position,
                     profile_name = excluded.profile_name, profile_uses_account_name = excluded.profile_uses_account_name,
-                    incoming_uses_email = excluded.incoming_uses_email, outgoing_uses_email = excluded.outgoing_uses_email
+                    incoming_uses_email = excluded.incoming_uses_email, outgoing_uses_email = excluded.outgoing_uses_email,
+                    desktop_notifications = excluded.desktop_notifications
                 """;
             command.Parameters.Clear();
             command.Parameters.AddWithValue("$id", account.Id.ToString());
@@ -389,6 +402,7 @@ internal sealed class LocalDatabase(string path)
             command.Parameters.AddWithValue("$profileUsesAccountName", account.ProfileUsesAccountName);
             command.Parameters.AddWithValue("$incomingUsesEmail", account.IncomingUsesEmail);
             command.Parameters.AddWithValue("$outgoingUsesEmail", account.OutgoingUsesEmail);
+            command.Parameters.AddWithValue("$desktopNotifications", account.DesktopNotifications);
             command.ExecuteNonQuery();
         }
         transaction.Commit();

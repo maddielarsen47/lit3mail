@@ -602,6 +602,7 @@ public partial class MailForm : Form, IMessageFilter
         };
         InitializeWindowLayout(mailLayout);
         InitializeUnreadBadge();
+        InitializeDesktopNotifications();
         InitializeAutoRefresh();
         InitializeMessageMove();
         Application.AddMessageFilter(this);
@@ -1027,7 +1028,7 @@ public partial class MailForm : Form, IMessageFilter
                 if (cached.Count > 0)
                 {
                     SetCachedFolder(true);
-                    RenderFolder(cached.Where(IsVisibleDuringMove).ToArray(), selected);
+                    RenderFolder(cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
                     _ = ShowPreview();
                 }
             }
@@ -1063,7 +1064,7 @@ public partial class MailForm : Form, IMessageFilter
             var current = SelectedMessage;
             bool wasCached = showingCachedFolder;
             int firstRow = messages.FirstDisplayedScrollingRowIndex;
-            var scrollAnchor = backgroundRefresh && firstRow >= 0 ? messages.Rows[firstRow].Tag as MailSummary : null;
+            var scrollAnchor = backgroundRefresh && firstRow > 0 ? messages.Rows[firstRow].Tag as MailSummary : null;
             selected = current;
             if (mailbox is not null && string.IsNullOrWhiteSpace(query) && !IsPendingMoveSource())
                 SetFolderCount(entry.Account, folder, folderMail.Count(mail => !mail.Read), folderMail.Count);
@@ -1250,8 +1251,6 @@ public partial class MailForm : Form, IMessageFilter
     private void SetCachedFolder(bool cached)
     {
         showingCachedFolder = cached;
-        messages.Columns["Read"]!.ReadOnly = cached;
-        messages.Columns["Starred"]!.ReadOnly = cached;
     }
 
     private IReadOnlyList<MailSummary> ReadCachedFolder(FolderEntry entry, string folder, string connectionKey)
@@ -1424,11 +1423,17 @@ public partial class MailForm : Form, IMessageFilter
     private static string GridSubject(MailSummary mail) =>
         (mail.Replied ? "↩︎ " : "") + (mail.Forwarded ? "↪︎ " : "") + mail.Subject;
 
-    private readonly Dictionary<(IMailbox Mailbox, Guid Id, bool ReadFlag), (Task Save, bool Value)> flagUpdates = new();
+    private sealed class FlagUpdateBaseline(bool value)
+    {
+        public bool ConfirmedValue { get; set; } = value;
+    }
+
+    private readonly Dictionary<(IMailbox Mailbox, Guid Id, bool ReadFlag),
+        (Task Save, bool Value, FlagUpdateBaseline Baseline)> flagUpdates = new();
 
     private void UpdateFlag(DataGridViewCellEventArgs e)
     {
-        if (rebuildingRows || showingCachedFolder || e.RowIndex < 0 || e.ColumnIndex is not (0 or 1))
+        if (rebuildingRows || e.RowIndex < 0 || e.ColumnIndex is not (0 or 1))
             return;
 
         var row = messages.Rows[e.RowIndex];
@@ -1458,10 +1463,11 @@ public partial class MailForm : Form, IMessageFilter
             overrides[(mail.Id, readFlag)] = value;
         var key = (mailbox, mail.Id, readFlag);
         flagUpdates.TryGetValue(key, out var previous);
+        var baseline = previous.Baseline ?? new FlagUpdateBaseline(readFlag ? mail.Read : mail.Star);
         string? connectionKey = database is not null && mailbox is ServerMailbox ? entry.Account.ConnectionKey() : null;
         var token = mailboxLifetime.Token;
         var update = SaveFlagAsync(previous.Save);
-        flagUpdates[key] = (update, value);
+        flagUpdates[key] = (update, value, baseline);
         try
         {
             await update;
@@ -1474,7 +1480,23 @@ public partial class MailForm : Form, IMessageFilter
             if (!IsDisposed && IsLatestUpdate())
             {
                 flagUpdates.Remove(key);
-                folderLoadFlagOverrides?.Remove((mail.Id, readFlag));
+                bool originalFolderOpen = SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox);
+                if (originalFolderOpen)
+                {
+                    if (folderLoadFlagOverrides is { } pendingOverrides)
+                        pendingOverrides[(mail.Id, readFlag)] = baseline.ConfirmedValue;
+
+                    var visibleRow = messages.Rows.Cast<DataGridViewRow>()
+                        .FirstOrDefault(candidate => candidate.Tag is MailSummary summary && summary.Id == mail.Id);
+                    if (visibleRow?.Tag is MailSummary visibleMail)
+                    {
+                        var restored = readFlag ? visibleMail with { Read = baseline.ConfirmedValue } :
+                            visibleMail with { Star = baseline.ConfirmedValue };
+                        visibleRow.Tag = restored;
+                        visibleRow.Cells[readFlag ? 0 : 1].Value = baseline.ConfirmedValue;
+                        visibleRow.DefaultCellStyle.Font = restored.Read ? null : unreadFont;
+                    }
+                }
                 ThemedPopup.Show(this, MailOperationError(error, "Could not update the message flag."), Text);
                 if (SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox))
                     await ShowFolder(SelectedMessage, backgroundRefresh: true);
@@ -1498,7 +1520,8 @@ public partial class MailForm : Form, IMessageFilter
                 catch (Exception) { } // A later click still needs to send its own value.
             }
             token.ThrowIfCancellationRequested();
-            await mailbox.UpdateFlagsAsync(mail.Id, readFlag ? value : null, readFlag ? null : value, token);
+            await mailbox.UpdateFlagsAsync(mail.Folder, mail.Id, readFlag ? value : null, readFlag ? null : value, token);
+            baseline.ConfirmedValue = value;
             if (connectionKey is not null)
             {
                 try
@@ -1665,7 +1688,7 @@ public partial class MailForm : Form, IMessageFilter
                     displayedCachedBody = true;
                     // Empty HTML marks a known plain-text message. NULL belongs to older cache entries.
                     if (showingCachedFolder ||
-                        cached.Html is { } html && MailContent.ReferencedContentIds(html).Count == 0 &&
+                        !mail.HasStandaloneImages && cached.Html is { } html && MailContent.ReferencedContentIds(html).Count == 0 &&
                         MailContent.ReferencedImageSources(html).Count == 0)
                     {
                         if (mail.Attachments && !showingCachedFolder)
