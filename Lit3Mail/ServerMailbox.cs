@@ -162,7 +162,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         return new FolderCount(inbox.Unread, inbox.Count);
     }
 
-    internal readonly record struct InboxPosition(uint Validity, uint NextUid);
+    internal readonly record struct InboxPosition(uint Validity, uint NextUid, DateTimeOffset CheckedAt);
     internal sealed record InboxArrivalPreview(DateTimeOffset ArrivalTime, string? Subject, string? Text);
 
     public async Task<(InboxPosition? Position, int Arrivals, InboxArrivalPreview? Preview)> CheckInboxArrivalsAsync(
@@ -171,11 +171,12 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         using var client = new ImapClient();
         await ConnectAsync(client, incoming, token);
         var inbox = client.Inbox;
+        var checkedAt = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
         await inbox.StatusAsync(StatusItems.UidValidity | StatusItems.UidNext, token);
         if (inbox.UidNext is not { IsValid: true } next || inbox.UidValidity == 0)
             return (previous, 0, null);
 
-        var current = new InboxPosition(inbox.UidValidity, next.Id);
+        var current = new InboxPosition(inbox.UidValidity, next.Id, checkedAt);
         if (previous is not { } old || old.Validity != current.Validity || old.NextUid >= current.NextUid)
             return (current, 0, null);
 
@@ -183,7 +184,15 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         if (inbox.UidValidity != current.Validity)
             return (null, 0, null);
         var range = new UniqueIdRange(new UniqueId(old.NextUid), new UniqueId(current.NextUid - 1));
-        var arrivals = await inbox.SearchAsync(SearchQuery.Uids(range).And(SearchQuery.NotDraft), token);
+        var candidates = await inbox.SearchAsync(SearchQuery.Uids(range).And(SearchQuery.NotDraft)
+            .And(SearchQuery.DeliveredAfter(old.CheckedAt.UtcDateTime.Date.AddDays(-1))), token);
+        var arrivals = new List<UniqueId>();
+        foreach (var batch in candidates.Chunk(100))
+        {
+            var summaries = await inbox.FetchAsync(batch, MessageSummaryItems.UniqueId | MessageSummaryItems.InternalDate, token);
+            // A move can assign a new UID while retaining the original delivery time.
+            arrivals.AddRange(summaries.Where(item => item.InternalDate >= old.CheckedAt).Select(item => item.UniqueId));
+        }
         var preview = arrivals.Count == 0 ? null : await ReadArrivalPreviewAsync(inbox, arrivals.Max(), token);
         return (current, arrivals.Count, preview);
     }
@@ -553,10 +562,61 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
 
     public async Task DownloadAttachmentAsync(Guid id, string partId, Stream output, CancellationToken token)
     {
-        using var client = new ImapClient();
+        using var client = new AttachmentImapClient();
         var (folder, uid) = await OpenMessageFolderAsync(client, id, FolderAccess.ReadOnly, token);
-        using var part = await ((IImapFolder)folder).GetBodyPartAsync(uid, partId, token);
-        await WriteAttachmentDataAsync(part, output, token);
+        bool rootPart = partId.Length == 0;
+        using var headerStream = await folder.GetStreamAsync(uid, rootPart ? "HEADER" : partId + ".MIME", token);
+        using var body = await folder.GetStreamAsync(uid, rootPart ? "TEXT" : partId, token);
+        await WriteDownloadedAttachmentAsync(headerStream, body, output, rootPart, token);
+    }
+
+    private static async Task WriteDownloadedAttachmentAsync(Stream headerStream, Stream body, Stream output,
+        bool rootPart, CancellationToken token)
+    {
+        var headers = await HeaderList.LoadAsync(headerStream, token);
+        if (ContentType.TryParse(headers[HeaderId.ContentType], out var type) &&
+            type.MediaType.Equals("multipart", StringComparison.OrdinalIgnoreCase))
+        {
+            if (rootPart)
+            {
+                var mimeHeaders = new HeaderList();
+                foreach (var header in headers.Where(header => header.Field.StartsWith("Content-", StringComparison.OrdinalIgnoreCase)))
+                    mimeHeaders.Add(header);
+                var format = FormatOptions.Default.Clone();
+                format.NewLineFormat = NewLineFormat.Dos;
+                await mimeHeaders.WriteToAsync(format, output, token);
+                await output.WriteAsync("\r\n"u8.ToArray(), token);
+            }
+            else
+            {
+                headerStream.Position = 0;
+                await headerStream.CopyToAsync(output, token);
+            }
+            await body.CopyToAsync(output, token);
+            return;
+        }
+
+        var encoding = MimeKit.Utils.MimeUtils.TryParse(headers[HeaderId.ContentTransferEncoding], out ContentEncoding transferEncoding)
+            ? transferEncoding : ContentEncoding.Default;
+        using var content = new MimeContent(body, encoding);
+        await content.DecodeToAsync(output, token);
+    }
+
+    private sealed class AttachmentImapClient : ImapClient
+    {
+        protected override ImapFolder CreateImapFolder(ImapFolderConstructorArgs args) => new AttachmentImapFolder(args);
+    }
+
+    private sealed class AttachmentImapFolder(ImapFolderConstructorArgs args) : ImapFolder(args)
+    {
+        protected override Stream CreateStream(UniqueId? uid, string section, int offset, int length)
+        {
+            if (length <= 1024 * 1024)
+                return base.CreateStream(uid, section, offset, length);
+            return new FileStream(Path.Combine(Path.GetTempPath(), Path.GetRandomFileName()), FileMode.CreateNew,
+                FileAccess.ReadWrite, FileShare.None, 81920,
+                FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.DeleteOnClose);
+        }
     }
 
     private static Task WriteAttachmentDataAsync(MimeEntity entity, Stream output, CancellationToken token) =>
