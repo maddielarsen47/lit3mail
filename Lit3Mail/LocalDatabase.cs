@@ -36,6 +36,13 @@ internal sealed class LocalDatabase(string path)
         string Subject, string Correspondents, DateTime Date,
         string? From = null, string? To = null, string? Cc = null)
     {
+        public static CachedMessage FromSummary(MailSummary summary) =>
+            new(summary.Id, summary.Read, summary.Star, summary.Attachments,
+                summary.Subject, summary.CorrespondentAddresses, summary.Date,
+                summary.HasPreviewHeaders ? summary.FromAddress : null,
+                summary.HasPreviewHeaders ? summary.ToAddresses : null,
+                summary.HasPreviewHeaders ? summary.CcAddresses : null);
+
         public MailSummary ToSummary(string folder)
         {
             if (From is not null && To is not null && Cc is not null)
@@ -570,9 +577,7 @@ internal sealed class LocalDatabase(string path)
         bool onlyIfUnchanged = false, string? expectedRevision = null)
     {
         var newest = summaries.OrderByDescending(summary => summary.Date).Take(FolderCacheLimit)
-            .Select(summary => new CachedMessage(summary.Id, summary.Read, summary.Star, summary.Attachments,
-                summary.Subject, summary.CorrespondentAddresses, summary.Date,
-                summary.FromAddress, summary.ToAddresses, summary.CcAddresses)).ToArray();
+            .Select(CachedMessage.FromSummary).ToArray();
         using var connection = Open();
         using var command = connection.CreateCommand();
         command.CommandTimeout = 1;
@@ -633,13 +638,31 @@ internal sealed class LocalDatabase(string path)
     }
 
     public void RemoveMessageCaches(Guid account, string folder, string connectionKey, IReadOnlyCollection<Guid> ids,
-        string? destination = null)
+        string? destination = null, IReadOnlyList<MailSummary>? movedMessages = null,
+        IReadOnlyDictionary<Guid, Guid>? destinationIds = null)
     {
         using var connection = Open();
         using var transaction = connection.BeginTransaction();
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
+        command.CommandTimeout = 1;
         AddFolderParameters(command, account, folder, connectionKey);
+        command.Parameters.AddWithValue("$destination", (object?)destination ?? DBNull.Value);
+        if (destination is not null && destinationIds is { Count: > 0 })
+        {
+            command.CommandText = """
+                INSERT INTO message_body_cache (account_id, folder, connection_key, message_id, body, html)
+                SELECT source.account_id, $destination, source.connection_key, moved.value, source.body, source.html
+                FROM json_each($destinationIds) AS moved
+                JOIN message_body_cache AS source ON source.message_id = moved.key
+                WHERE source.account_id = $account AND source.folder = $folder AND source.connection_key = $connection
+                ON CONFLICT(account_id, folder, connection_key, message_id) DO UPDATE SET
+                    body = excluded.body, html = excluded.html
+                WHERE message_body_cache.html IS NULL AND excluded.html IS NOT NULL;
+                """;
+            command.Parameters.AddWithValue("$destinationIds", JsonSerializer.Serialize(destinationIds));
+            command.ExecuteNonQuery();
+        }
         command.CommandText = """
             UPDATE folder_cache
             SET revision = $revision,
@@ -656,10 +679,40 @@ internal sealed class LocalDatabase(string path)
             WHERE account_id = $account AND connection_key = $connection AND $folder = 'Drafts'
               AND draft_id IN (SELECT value FROM json_each($ids))
             """;
-        command.Parameters.AddWithValue("$destination", (object?)destination ?? DBNull.Value);
         command.Parameters.AddWithValue("$revision", Guid.NewGuid().ToString());
         command.Parameters.AddWithValue("$ids", JsonSerializer.Serialize(ids));
         command.ExecuteNonQuery();
+        if (destination is not null && movedMessages is { Count: > 0 })
+        {
+            command.CommandText = """
+                INSERT INTO folder_cache (account_id, folder, connection_key, summaries, revision)
+                VALUES ($account, $destination, $connection, $moved, $revision)
+                ON CONFLICT(account_id, folder) DO UPDATE SET
+                    connection_key = excluded.connection_key,
+                    revision = excluded.revision,
+                    summaries = (
+                        SELECT json_group_array(json(value)) FROM (
+                            SELECT value FROM (
+                                SELECT value FROM json_each($moved)
+                                UNION ALL
+                                SELECT value FROM json_each(CASE
+                                    WHEN folder_cache.connection_key = $connection AND json_valid(folder_cache.summaries)
+                                    THEN folder_cache.summaries ELSE '[]' END)
+                                WHERE json_extract(value, '$.Id') NOT IN (
+                                    SELECT json_extract(value, '$.Id') FROM json_each($moved)
+                                )
+                            )
+                            ORDER BY julianday(json_extract(value, '$.Date')) DESC
+                            LIMIT $limit
+                        )
+                    );
+                """;
+            var newest = movedMessages.OrderByDescending(mail => mail.Date).Take(FolderCacheLimit)
+                .Select(CachedMessage.FromSummary);
+            command.Parameters.AddWithValue("$moved", JsonSerializer.Serialize(newest));
+            command.Parameters.AddWithValue("$limit", FolderCacheLimit);
+            command.ExecuteNonQuery();
+        }
         transaction.Commit();
     }
 

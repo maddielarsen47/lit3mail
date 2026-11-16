@@ -1770,7 +1770,6 @@ public partial class MailForm : Form, IMessageFilter
     }
 
     private Dictionary<(Guid Id, bool ReadFlag), bool>? folderLoadFlagOverrides;
-    private (FolderEntry Source, IMailbox Mailbox, HashSet<Guid> Ids)? pendingMove;
 
     private async Task ShowFolder(MailSummary? selected = null, bool debounce = false,
         bool refreshCounts = false, bool showRefreshStatus = false, bool backgroundRefresh = false,
@@ -1956,10 +1955,10 @@ public partial class MailForm : Form, IMessageFilter
         }
 
         bool IsPendingMoveSource() =>
-            pendingMove is { } move && move.Source == entry && ReferenceEquals(move.Mailbox, mailbox);
+            mailbox is not null && pendingMoves.ContainsKey((entry, mailbox));
 
         bool IsVisibleDuringMove(MailSummary mail) =>
-            !IsPendingMoveSource() || !pendingMove!.Value.Ids.Contains(mail.Id);
+            mailbox is null || !pendingMoves.TryGetValue((entry, mailbox), out var ids) || !ids.Contains(mail.Id);
 
         void ShowFolderLoadError(string message)
         {
@@ -2465,7 +2464,7 @@ public partial class MailForm : Form, IMessageFilter
 
     private async Task DeleteSelectedMessages()
     {
-        if (updatingMessageFolders || showingCachedFolder || !selectionMade ||
+        if (!selectionMade ||
             SelectedFolder is not { Account.Mailbox: not null, Folder: { } folder } entry)
             return;
 
@@ -2484,37 +2483,55 @@ public partial class MailForm : Form, IMessageFilter
 
     private async Task ChangeMessageFolderAsync(FolderEntry entry, HashSet<Guid> ids, string? destination, bool deleting)
     {
-        if (updatingMessageFolders || exportCancellation is not null || (deleting && showingCachedFolder) || SelectedFolder != entry || ids.Count == 0 ||
+        if (SelectedFolder != entry || ids.Count == 0 ||
             entry is not { Account.Mailbox: { } mailbox, Folder: { } folder } ||
             (!deleting && (destination is null || !CanMoveTo(entry, new FolderEntry(entry.Account, destination)))))
             return;
 
-        string? key = database is not null && mailbox is ServerMailbox ? entry.Account.ConnectionKey() : null;
-        CancelBackgroundCache(entry.Account);
-        updatingMessageFolders = true;
-        string action = destination is null ? "Deleting" : "Moving";
-        ShowBatchStatus($"{action} {ids.Count:N0} {(ids.Count == 1 ? "message" : "messages")}...", inProgress: true);
-        moveMail.Enabled = deleteMail.Enabled = false;
-        var countsBeforeMove = entry.Account.Counts;
-        var removedRows = Array.Empty<MailSummary>();
-        var previousSelection = new HashSet<Guid>();
+        var moveKey = (entry, mailbox);
+        pendingMoves.TryGetValue(moveKey, out var pendingIds);
+        var rows = messages.Rows.Cast<DataGridViewRow>()
+            .Where(row => row.Tag is MailSummary mail && ids.Contains(mail.Id) && pendingIds?.Contains(mail.Id) != true)
+            .ToArray();
+        if (rows.Length == 0)
+            return;
+
+        var removedRows = rows.Select(row => (MailSummary)row.Tag!).ToArray();
+        ids = removedRows.Select(mail => mail.Id).ToHashSet();
+        var previousSelection = rows.Where(row => row.Selected).Select(row => ((MailSummary)row.Tag!).Id).ToHashSet();
         string originalQuery = search.Text;
+        string? key = database is not null && mailbox is ServerMailbox ? entry.Account.ConnectionKey() : null;
+        if (pendingIds is null)
+            pendingMoves.Add(moveKey, pendingIds = []);
+        pendingIds.UnionWith(ids);
+        var previousChange = messageFolderChange;
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        messageFolderChange = completion.Task;
         bool confirmed = false;
+        bool pendingCleared = false;
         try
         {
-            var rows = messages.Rows.Cast<DataGridViewRow>()
-                .Where(row => row.Tag is MailSummary mail && ids.Contains(mail.Id)).ToArray();
-            removedRows = rows.Select(row => (MailSummary)row.Tag!).ToArray();
-            previousSelection = rows.Where(row => row.Selected).Select(row => ((MailSummary)row.Tag!).Id).ToHashSet();
-            pendingMove = (entry, mailbox, ids);
             RemoveVisibleRows(rows);
             _ = ShowPreview();
+            await previousChange;
+            await exportCompletion;
+            if (IsDisposed || mailboxLifetime.IsCancellationRequested || !ReferenceEquals(entry.Account.Mailbox, mailbox))
+                return;
 
-            bool markedRead = deleting;
-            if (deleting)
-                await mailbox.DeleteAsync(folder, ids, mailboxLifetime.Token);
-            else
-                markedRead = await mailbox.MoveAsync(folder, destination!, ids, mailboxLifetime.Token);
+            CancelBackgroundCache(entry.Account);
+            var countsBeforeMove = entry.Account.Counts;
+            string action = destination is null ? "Deleting" : "Moving";
+            ShowMoveStatus($"{action} {ids.Count:N0} {(ids.Count == 1 ? "message" : "messages")}...", inProgress: true);
+            var pendingFlags = flagUpdates.Where(pair => ReferenceEquals(pair.Key.Mailbox, mailbox) && ids.Contains(pair.Key.Id))
+                .Select(pair => pair.Value.Save).ToArray();
+            try { await Task.WhenAll(pendingFlags); }
+            catch (Exception) { } // The flag update reports its own failure.
+            if (IsDisposed || mailboxLifetime.IsCancellationRequested || !ReferenceEquals(entry.Account.Mailbox, mailbox))
+                return;
+
+            var move = deleting
+                ? await mailbox.DeleteAsync(folder, ids, mailboxLifetime.Token)
+                : await mailbox.MoveAsync(folder, destination!, ids, mailboxLifetime.Token);
             confirmed = true;
             if (IsDisposed)
                 return;
@@ -2525,13 +2542,13 @@ public partial class MailForm : Form, IMessageFilter
                 int unread = removedRows.Count(mail => !mail.Read);
                 AdjustFolderCount(entry.Account, folder, -unread, -ids.Count);
                 if (destination is not null)
-                    AdjustFolderCount(entry.Account, destination, markedRead ? 0 : unread, ids.Count);
+                    AdjustFolderCount(entry.Account, destination, move.MarkedRead ? 0 : unread, ids.Count);
             }
             entry.Account.CountsUpdatedAt = default;
             string result = destination is null ? "deleted" : deleting ? "moved to Trash" : "moved";
             string completedStatus = $"{ids.Count:N0} {(ids.Count == 1 ? "message" : "messages")} {result}.";
             if (deleting && destination is null)
-                ShowBatchStatus(completedStatus);
+                ShowMoveStatus(completedStatus);
             bool finishLoad = false;
             CancellationTokenSource? interruptedLoad = null;
             if (SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox))
@@ -2540,11 +2557,19 @@ public partial class MailForm : Form, IMessageFilter
                 interruptedLoad = folderLoad;
                 interruptedLoad?.Cancel();
             }
+            var movedMessages = new List<MailSummary>();
+            if (destination is not null && move.DestinationIds is { } destinationIds)
+            {
+                foreach (var mail in removedRows)
+                    if (destinationIds.TryGetValue(mail.Id, out var id))
+                        movedMessages.Add(mail with { Id = id, Folder = destination, Read = move.MarkedRead || mail.Read });
+            }
             if (key is not null)
             {
                 try
                 {
-                    await Task.Run(() => database!.RemoveMessageCaches(entry.Account.Id, folder, key, ids, destination));
+                    await Task.Run(() => database!.RemoveMessageCaches(entry.Account.Id, folder, key, ids, destination,
+                        movedMessages, move.DestinationIds));
                 }
                 catch (Microsoft.Data.Sqlite.SqliteException)
                 {
@@ -2564,56 +2589,33 @@ public partial class MailForm : Form, IMessageFilter
                 currentLoad.Cancel();
                 finishLoad = true;
             }
-            pendingMove = null;
+            ClearPendingIds();
+            completion.TrySetResult();
             if (destination is not null && SelectedFolder == new FolderEntry(entry.Account, destination))
             {
-                ShowBatchStatus("Refreshing the destination folder...", inProgress: true);
+                if (movedMessages.Count > 0 && string.IsNullOrWhiteSpace(search.Text))
+                {
+                    var existing = messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!);
+                    RenderFolder(existing.Concat(movedMessages).DistinctBy(mail => mail.Id).ToArray(), SelectedMessage);
+                }
+                ShowMoveStatus("Refreshing the destination folder...", inProgress: true);
                 bool displayed = false;
                 await ShowFolder(SelectedMessage, refreshCounts: true, backgroundRefresh: true, onListDisplayed: () =>
                 {
                     displayed = true;
-                    ShowBatchStatus(string.IsNullOrWhiteSpace(search.Text)
+                    ShowMoveStatus(string.IsNullOrWhiteSpace(search.Text)
                         ? completedStatus : "Destination refreshed with the current search.");
                 });
                 if (!displayed && !IsDisposed)
-                    ShowBatchStatus("Refresh the destination to see the latest messages.");
+                    ShowMoveStatus("Refresh the destination to see the latest messages.");
             }
             else
             {
-                if (deleting && destination is not null)
+                if (destination is not null)
                 {
-                    ShowBatchStatus("Refreshing Trash...", inProgress: true);
-                    try
-                    {
-                        var trash = await mailbox.ListAsync(destination, "", mailboxLifetime.Token);
-                        if (key is not null)
-                        {
-                            var target = new FolderEntry(entry.Account, destination);
-                            await Task.Run(() => WriteCachedFolder(target, destination, key, trash));
-                        }
-
-                        await RefreshFolderCounts(entry.Account, mailbox, true, mailboxLifetime.Token);
-                        if (!IsDisposed && ReferenceEquals(entry.Account.Mailbox, mailbox))
-                        {
-                            if (SelectedFolder == new FolderEntry(entry.Account, destination))
-                            {
-                                bool displayed = false;
-                                await ShowFolder(SelectedMessage, refreshCounts: true, backgroundRefresh: true,
-                                    onListDisplayed: () => displayed = string.IsNullOrWhiteSpace(search.Text));
-                                ShowBatchStatus(displayed ? completedStatus : "Refresh Trash to see the latest messages.");
-                            }
-                            else
-                                ShowBatchStatus(completedStatus);
-                        }
-                    }
-                    catch (Exception error) when (error is not OperationCanceledException)
-                    {
-                        if (!IsDisposed)
-                            ShowBatchStatus("Could not refresh Trash.");
-                    }
+                    ShowMoveStatus(completedStatus);
+                    QueueBackgroundCache(new FolderEntry(entry.Account, destination));
                 }
-                else if (!deleting)
-                    ShowBatchStatus("Move confirmed by the server.");
                 if (finishLoad && SelectedFolder == entry && (folderLoad is null || ReferenceEquals(folderLoad, interruptedLoad)))
                     _ = ShowFolder(SelectedMessage, refreshCounts: true);
                 else
@@ -2623,7 +2625,7 @@ public partial class MailForm : Form, IMessageFilter
         catch (OperationCanceledException) when (mailboxLifetime.IsCancellationRequested) { }
         catch (Exception error) when (!confirmed)
         {
-            pendingMove = null;
+            ClearPendingIds();
             if (!IsDisposed)
             {
                 bool sourceIsOpen = SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox);
@@ -2653,7 +2655,7 @@ public partial class MailForm : Form, IMessageFilter
                     SortPublishedRows();
                     _ = ShowPreview();
                 }
-                ShowBatchStatus(deleting ? "Delete could not be confirmed." : "Move could not be confirmed.");
+                ShowMoveStatus(deleting ? "Delete could not be confirmed." : "Move could not be confirmed.");
                 ThemedPopup.Show(this, error is InvalidOperationException ? error.Message :
                     MailOperationError(error, deleting ? "Could not delete the selected messages." : "Could not move the selected messages."), Text);
                 if (sourceIsOpen && SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox))
@@ -2662,10 +2664,24 @@ public partial class MailForm : Form, IMessageFilter
         }
         finally
         {
-            pendingMove = null;
-            updatingMessageFolders = false;
-            if (!IsDisposed)
-                moveMail.Enabled = deleteMail.Enabled = SelectedMessage is not null && !showingCachedFolder;
+            ClearPendingIds();
+            completion.TrySetResult();
+        }
+
+        void ClearPendingIds()
+        {
+            if (pendingCleared)
+                return;
+            pendingCleared = true;
+            pendingIds.ExceptWith(ids);
+            if (pendingIds.Count == 0)
+                pendingMoves.Remove(moveKey);
+        }
+
+        void ShowMoveStatus(string message, bool inProgress = false)
+        {
+            if (exportCancellation is null && ReferenceEquals(messageFolderChange, completion.Task))
+                ShowBatchStatus(message, inProgress: inProgress);
         }
 
         void RemoveVisibleRows(DataGridViewRow[] rows)
@@ -2733,7 +2749,7 @@ public partial class MailForm : Form, IMessageFilter
         }
         mailPane.Panel2Collapsed = false;
         editDraft.Visible = entry.Folder == "Drafts" && !showingCachedFolder;
-        moveMail.Enabled = deleteMail.Enabled = !showingCachedFolder && !updatingMessageFolders;
+        moveMail.Enabled = deleteMail.Enabled = true;
 
         previewSubject.Text = mail.Subject;
         var details = new List<string>();

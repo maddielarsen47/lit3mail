@@ -315,6 +315,12 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     {
         var structure = new PreviewStructure(summary.TextBody, summary.HtmlBody,
             summary.BodyParts.Where(part => part.ContentId is not null || part.ContentLocation is not null).ToArray(), DescribeAttachments(summary));
+        RememberPreviewStructure(id, structure);
+        return structure;
+    }
+
+    private void RememberPreviewStructure(Guid id, PreviewStructure structure)
+    {
         lock (previewStructures)
         {
             if (previewStructures.TryAdd(id, structure))
@@ -323,7 +329,6 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 if (previewStructureOrder.Count > 2000)
                     previewStructures.Remove(previewStructureOrder.Dequeue());
             }
-            return structure;
         }
     }
 
@@ -340,9 +345,12 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         return id;
     }
 
-    private static Guid MessageIdFor(IMailFolder folder, UniqueId uid)
+    private static Guid MessageIdFor(IMailFolder folder, UniqueId uid) =>
+        MessageIdFor(folder.FullName, folder.UidValidity, uid);
+
+    private static Guid MessageIdFor(string fullName, uint validity, UniqueId uid)
     {
-        string identity = string.Create(CultureInfo.InvariantCulture, $"{folder.UidValidity}:{uid.Id}:{folder.FullName}");
+        string identity = string.Create(CultureInfo.InvariantCulture, $"{validity}:{uid.Id}:{fullName}");
         return new Guid(SHA256.HashData(Encoding.UTF8.GetBytes(identity)).AsSpan(0, 16));
     }
 
@@ -534,37 +542,40 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             await folder.RemoveFlagsAsync(uid, remove, true, token);
     }
 
-    public async Task DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken token)
+    public async Task<MessageMoveResult> DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken token)
     {
         if (folder != "Trash")
         {
-            await MoveMessagesAsync(folder, "Trash", ids, token);
-            return;
+            return await MoveMessagesAsync(folder, "Trash", ids, token);
         }
         if (ids.Count == 0)
-            return;
+            return new(true);
 
         using var client = new ImapClient();
-        var (source, _) = await OpenMessageFolderAsync(client, ids.First(), FolderAccess.ReadWrite, token);
+        await ConnectAsync(client, incoming, token);
+        var source = await ResolveFolderAsync(client, folder, token)
+            ?? throw new InvalidOperationException("The source folder is unavailable on this server.");
         if (!client.Capabilities.HasFlag(ImapCapabilities.UidPlus))
             throw new InvalidOperationException("This server cannot permanently delete only the selected messages.");
 
-        var uids = GetMessageUids(source, ids);
+        await source.OpenAsync(FolderAccess.ReadWrite, token);
+        var uids = await ResolveMessageUidsAsync(source, ids, token);
         await source.AddFlagsAsync(uids, MessageFlags.Deleted | MessageFlags.Seen, true, token);
         await source.ExpungeAsync(uids, token);
         foreach (Guid id in ids)
             messages.TryRemove(id, out _);
+        return new(true);
     }
 
-    public Task<bool> MoveAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
+    public Task<MessageMoveResult> MoveAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
         CancellationToken token) =>
         MoveMessagesAsync(sourceFolder, destinationFolder, ids, token);
 
-    private async Task<bool> MoveMessagesAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
+    private async Task<MessageMoveResult> MoveMessagesAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
         CancellationToken token)
     {
         if (ids.Count == 0)
-            return false;
+            return new(false);
         if (sourceFolder == destinationFolder)
             throw new InvalidOperationException("Choose a different destination folder.");
 
@@ -590,9 +601,23 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             await destination.OpenAsync(FolderAccess.ReadWrite, token);
             await destination.AddFlagsAsync(moved.Destination.ToList(), MessageFlags.Seen, true, token);
         }
+        var destinationIds = new Dictionary<Guid, Guid>();
+        foreach (var pair in moved)
+        {
+            var uid = pair.Value;
+            uint validity = uid.Validity == 0 ? destination.UidValidity : uid.Validity;
+            if (validity == 0)
+                continue;
+            var sourceId = MessageIdFor(source, pair.Key);
+            var id = MessageIdFor(destination.FullName, validity, uid);
+            destinationIds[sourceId] = id;
+            messages.TryAdd(id, (destination.FullName, validity, uid));
+            if (TryGetPreviewStructure(sourceId, out var structure) && structure is not null)
+                RememberPreviewStructure(id, structure);
+        }
         foreach (Guid id in ids)
             messages.TryRemove(id, out _);
-        return markRead;
+        return new(markRead, destinationIds);
     }
 
     private async Task<IList<UniqueId>> ResolveMessageUidsAsync(IMailFolder source, IReadOnlyCollection<Guid> ids,
@@ -666,19 +691,6 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             if (i == 0 || (i + 1) % 25 == 0 || i + 1 == uids.Count)
                 progress.Report((i + 1, uids.Count));
         }
-    }
-
-    private IList<UniqueId> GetMessageUids(IMailFolder folder, IReadOnlyCollection<Guid> ids)
-    {
-        var uids = new List<UniqueId>(ids.Count);
-        foreach (Guid id in ids)
-        {
-            if (!messages.TryGetValue(id, out var message) ||
-                message.Folder != folder.FullName || message.Validity != folder.UidValidity)
-                throw new InvalidOperationException("Refresh the folder and select the messages again.");
-            uids.Add(message.Uid);
-        }
-        return uids;
     }
 
     public async Task<DraftSaveResult> SaveDraftAsync(OutgoingMail mail, Guid? replacing, CancellationToken token)

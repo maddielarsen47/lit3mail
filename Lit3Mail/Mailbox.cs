@@ -9,6 +9,8 @@ internal static class MailFolders
         name.Equals("Bin", StringComparison.OrdinalIgnoreCase);
 }
 
+internal sealed record MessageMoveResult(bool MarkedRead, IReadOnlyDictionary<Guid, Guid>? DestinationIds = null);
+
 internal sealed record MailSummary(Guid Id, string Folder, bool Read, bool Star, bool Attachments,
     string Subject, string CorrespondentName, DateTime Date,
     string FromAddress, string ToAddresses, string CcAddresses, string ReplyToAddress,
@@ -85,8 +87,8 @@ internal interface IMailbox
     Task<IReadOnlyList<MailAttachmentInfo>> GetAttachmentsAsync(Guid id, CancellationToken cancellationToken);
     Task DownloadAttachmentAsync(Guid id, string partId, Stream output, CancellationToken cancellationToken);
     Task UpdateFlagsAsync(Guid id, bool? read, bool? star, CancellationToken cancellationToken);
-    Task DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
-    Task<bool> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
+    Task<MessageMoveResult> DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
+    Task<MessageMoveResult> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
     Task ExportAsync(string folder, IReadOnlySet<Guid>? ids, System.IO.Compression.ZipArchive archive,
         IProgress<(int Done, int Total)> progress, CancellationToken token);
     Task<DraftSaveResult> SaveDraftAsync(OutgoingMail message, Guid? replacing, CancellationToken cancellationToken);
@@ -205,7 +207,7 @@ internal sealed class SampleMailbox : IMailbox
         return Task.CompletedTask;
     }
 
-    public Task DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken)
+    public Task<MessageMoveResult> DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (folder == "Drafts")
@@ -224,10 +226,10 @@ internal sealed class SampleMailbox : IMailbox
                 if (item.Summary.Folder == folder && ids.Contains(item.Summary.Id))
                     mail[index] = (item.Summary with { Folder = "Trash", Read = true }, item.Content);
             }
-        return Task.CompletedTask;
+        return Task.FromResult(new MessageMoveResult(true));
     }
 
-    public Task<bool> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken)
+    public Task<MessageMoveResult> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         bool markRead = MailFolders.MarksMovedMessagesRead(destination);
@@ -241,7 +243,7 @@ internal sealed class SampleMailbox : IMailbox
                     draftMessages.Remove(item.Summary.Id);
             }
         }
-        return Task.FromResult(markRead);
+        return Task.FromResult(new MessageMoveResult(markRead));
     }
 
     public async Task ExportAsync(string folder, IReadOnlySet<Guid>? ids, System.IO.Compression.ZipArchive archive,

@@ -4,7 +4,9 @@ public partial class MailForm
 {
     private const string MessageMoveFormat = "Lit3Mail.MessageMove";
     private readonly Button moveMail = new() { Text = "Move...", AutoSize = true, FlatStyle = FlatStyle.Flat, Enabled = false };
-    private bool updatingMessageFolders;
+    private bool updatingMessageFolders => pendingMoves.Count > 0;
+    private readonly Dictionary<(FolderEntry Source, IMailbox Mailbox), HashSet<Guid>> pendingMoves = new();
+    private Task messageFolderChange = Task.CompletedTask;
     private MessageDrag? pendingMessageDrag;
     private MessageDrag? activeMessageDrag;
     private FolderEntry? highlightedDropFolder;
@@ -61,7 +63,7 @@ public partial class MailForm
     private void CaptureMessageDrag(MouseEventArgs e)
     {
         pendingMessageDrag = null;
-        if (e.Button != MouseButtons.Left || updatingMessageFolders ||
+        if (e.Button != MouseButtons.Left ||
             SelectedFolder is not { Account.Mailbox: not null } source)
             return;
 
@@ -81,7 +83,7 @@ public partial class MailForm
             return;
 
         pendingMessageDrag = null;
-        if (SelectedFolder != drag.Source || updatingMessageFolders)
+        if (SelectedFolder != drag.Source)
             return;
 
         messages.ClearSelection();
@@ -113,8 +115,7 @@ public partial class MailForm
     private FolderEntry? GetDropTarget(DragEventArgs e)
     {
         if (activeMessageDrag is not { } drag || e.Data?.GetDataPresent(MessageMoveFormat, false) != true ||
-            (e.AllowedEffect & DragDropEffects.Move) == 0 || SelectedFolder != drag.Source ||
-            updatingMessageFolders)
+            (e.AllowedEffect & DragDropEffects.Move) == 0 || SelectedFolder != drag.Source)
             return null;
 
         int index = folders.IndexFromPoint(folders.PointToClient(new Point(e.X, e.Y)));
@@ -137,10 +138,10 @@ public partial class MailForm
 
     private void ShowMoveMenu(ContextMenuStrip menu)
     {
-        if (updatingMessageFolders || showingCachedFolder || SelectedFolder is not { } source ||
-            SelectedMessage is not { } message)
+        if (SelectedFolder is not { } source || SelectedMessage is null)
             return;
 
+        var ids = SelectedMessageIds();
         foreach (ToolStripItem item in menu.Items.Cast<ToolStripItem>().ToArray())
         {
             menu.Items.Remove(item);
@@ -151,8 +152,8 @@ public partial class MailForm
             var item = new ToolStripMenuItem(target.FolderTitle);
             item.Click += async (_, _) =>
             {
-                if (SelectedFolder == source && SelectedMessage?.Id == message.Id)
-                    await ChangeMessageFolderAsync(source, [message.Id], target.Folder, deleting: false);
+                if (SelectedFolder == source)
+                    await ChangeMessageFolderAsync(source, ids, target.Folder, deleting: false);
             };
             menu.Items.Add(item);
         }

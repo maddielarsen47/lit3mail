@@ -12,6 +12,7 @@ public partial class MailForm
         Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(12, 2, 12, 2), Visible = false
     };
     private CancellationTokenSource? exportCancellation;
+    private Task exportCompletion = Task.CompletedTask;
     private object? batchActivity;
     private System.Windows.Forms.Timer batchStatusTimer = null!;
     private ContextMenuStrip exportMenu = null!;
@@ -87,6 +88,8 @@ public partial class MailForm
         string partial = Path.Combine(Path.GetDirectoryName(target)!, $".{Guid.NewGuid():N}.part");
         using var cancellation = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
         exportCancellation = cancellation;
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        exportCompletion = completion.Task;
         var progress = new Progress<(int Done, int Total)>(state =>
         {
             if (!IsDisposed && ReferenceEquals(exportCancellation, cancellation))
@@ -125,6 +128,7 @@ public partial class MailForm
             exportCancellation = null;
             try { File.Delete(partial); }
             catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+            completion.TrySetResult();
         }
     }
 
