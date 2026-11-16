@@ -1102,7 +1102,7 @@ public partial class MailForm : Form, IMessageFilter
         {
             var selected = SelectedMessage;
             messages.Columns[sortColumn].HeaderCell.SortGlyphDirection = SortOrder.None;
-            descending = e.ColumnIndex == sortColumn ? !descending : e.ColumnIndex == 5;
+            descending = e.ColumnIndex == sortColumn ? !descending : e.ColumnIndex is 1 or 2 or 5;
             sortColumn = e.ColumnIndex;
             RenderFolder(messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!).ToArray(), selected);
         };
@@ -1189,6 +1189,7 @@ public partial class MailForm : Form, IMessageFilter
             }
             UpdateFlag(e);
         };
+        messages.CellPainting += PaintSortIndicator;
         messages.CellPainting += PaintFlagIcon;
         search.TextChanged += async (_, _) =>
         {
@@ -2373,6 +2374,52 @@ public partial class MailForm : Form, IMessageFilter
         }
     }
 
+    private void PaintSortIndicator(object? sender, DataGridViewCellPaintingEventArgs e)
+    {
+        if (ThemedPopup.UseDarkTheme != true || e.RowIndex != -1 || e.ColumnIndex < 0 ||
+            e.Graphics is not { } graphics || e.CellStyle is not { } style)
+            return;
+
+        var direction = messages.Columns[e.ColumnIndex].HeaderCell.SortGlyphDirection;
+        if (direction == SortOrder.None)
+            return;
+
+        var padding = style.Padding;
+        var bounds = Rectangle.FromLTRB(e.CellBounds.Left + padding.Left + 2,
+            e.CellBounds.Top, e.CellBounds.Right - padding.Right - 2, e.CellBounds.Bottom);
+        var flags = TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter |
+            TextFormatFlags.NoPadding | TextFormatFlags.PreserveGraphicsClipping;
+        var font = style.Font ?? messages.Font;
+        var arrowFont = messages.ColumnHeadersDefaultCellStyle.Font ?? messages.Font;
+        var ink = style.ForeColor;
+        string arrow = direction == SortOrder.Ascending ? "▲" : "▼";
+        int arrowWidth = TextRenderer.MeasureText(graphics, arrow, arrowFont, Size.Empty, flags).Width;
+        if (bounds.Width < arrowWidth)
+            return;
+
+        e.Paint(e.ClipBounds, e.PaintParts & ~DataGridViewPaintParts.ContentForeground);
+        var state = graphics.Save();
+        try
+        {
+            graphics.IntersectClip(Rectangle.Intersect(e.CellBounds, e.ClipBounds));
+            var arrowBounds = new Rectangle(bounds.Right - arrowWidth, bounds.Top, arrowWidth, bounds.Height);
+            TextRenderer.DrawText(graphics, arrow, arrowFont, arrowBounds, ink, flags);
+            bounds.Width -= arrowWidth + padding.Right;
+            if (bounds.Width > 0)
+            {
+                if (style.Alignment == DataGridViewContentAlignment.MiddleCenter)
+                    flags |= TextFormatFlags.HorizontalCenter;
+                TextRenderer.DrawText(graphics, e.FormattedValue as string ?? "", font,
+                    bounds, ink, flags | TextFormatFlags.EndEllipsis);
+            }
+        }
+        finally
+        {
+            graphics.Restore(state);
+        }
+        e.Handled = true;
+    }
+
     private void PaintFlagIcon(object? sender, DataGridViewCellPaintingEventArgs e)
     {
         if (e.RowIndex < 0 || e.ColumnIndex is not (1 or 2) ||
@@ -2463,10 +2510,11 @@ public partial class MailForm : Form, IMessageFilter
             RemoveVisibleRows(rows);
             _ = ShowPreview();
 
+            bool markedRead = deleting;
             if (deleting)
                 await mailbox.DeleteAsync(folder, ids, mailboxLifetime.Token);
             else
-                await mailbox.MoveAsync(folder, destination!, ids, mailboxLifetime.Token);
+                markedRead = await mailbox.MoveAsync(folder, destination!, ids, mailboxLifetime.Token);
             confirmed = true;
             if (IsDisposed)
                 return;
@@ -2477,7 +2525,7 @@ public partial class MailForm : Form, IMessageFilter
                 int unread = removedRows.Count(mail => !mail.Read);
                 AdjustFolderCount(entry.Account, folder, -unread, -ids.Count);
                 if (destination is not null)
-                    AdjustFolderCount(entry.Account, destination, unread, ids.Count);
+                    AdjustFolderCount(entry.Account, destination, markedRead ? 0 : unread, ids.Count);
             }
             entry.Account.CountsUpdatedAt = default;
             string result = destination is null ? "deleted" : deleting ? "moved to Trash" : "moved";

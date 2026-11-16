@@ -538,7 +538,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     {
         if (folder != "Trash")
         {
-            await MoveMessagesAsync(folder, "Trash", ids, token, markRead: true);
+            await MoveMessagesAsync(folder, "Trash", ids, token);
             return;
         }
         if (ids.Count == 0)
@@ -556,15 +556,15 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             messages.TryRemove(id, out _);
     }
 
-    public Task MoveAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
+    public Task<bool> MoveAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
         CancellationToken token) =>
-        MoveMessagesAsync(sourceFolder, destinationFolder, ids, token, markRead: false);
+        MoveMessagesAsync(sourceFolder, destinationFolder, ids, token);
 
-    private async Task MoveMessagesAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
-        CancellationToken token, bool markRead)
+    private async Task<bool> MoveMessagesAsync(string sourceFolder, string destinationFolder, IReadOnlyCollection<Guid> ids,
+        CancellationToken token)
     {
         if (ids.Count == 0)
-            return;
+            return false;
         if (sourceFolder == destinationFolder)
             throw new InvalidOperationException("Choose a different destination folder.");
 
@@ -580,6 +580,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
 
         await source.OpenAsync(FolderAccess.ReadWrite, token);
         var uids = await ResolveMessageUidsAsync(source, ids, token);
+        bool markRead = MailFolders.MarksMovedMessagesRead(destinationFolder) ||
+            MailFolders.MarksMovedMessagesRead(destination.Name);
         if (markRead)
             await source.AddFlagsAsync(uids, MessageFlags.Seen, true, token);
         var moved = await source.MoveToAsync(uids, destination, token);
@@ -590,6 +592,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         }
         foreach (Guid id in ids)
             messages.TryRemove(id, out _);
+        return markRead;
     }
 
     private async Task<IList<UniqueId>> ResolveMessageUidsAsync(IMailFolder source, IReadOnlyCollection<Guid> ids,

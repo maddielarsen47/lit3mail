@@ -2,6 +2,13 @@ using System.Text.RegularExpressions;
 
 namespace Lit3Mail;
 
+internal static class MailFolders
+{
+    public static bool MarksMovedMessagesRead(string name) =>
+        name.Equals("Trash", StringComparison.OrdinalIgnoreCase) ||
+        name.Equals("Bin", StringComparison.OrdinalIgnoreCase);
+}
+
 internal sealed record MailSummary(Guid Id, string Folder, bool Read, bool Star, bool Attachments,
     string Subject, string CorrespondentName, DateTime Date,
     string FromAddress, string ToAddresses, string CcAddresses, string ReplyToAddress,
@@ -79,7 +86,7 @@ internal interface IMailbox
     Task DownloadAttachmentAsync(Guid id, string partId, Stream output, CancellationToken cancellationToken);
     Task UpdateFlagsAsync(Guid id, bool? read, bool? star, CancellationToken cancellationToken);
     Task DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
-    Task MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
+    Task<bool> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
     Task ExportAsync(string folder, IReadOnlySet<Guid>? ids, System.IO.Compression.ZipArchive archive,
         IProgress<(int Done, int Total)> progress, CancellationToken token);
     Task<DraftSaveResult> SaveDraftAsync(OutgoingMail message, Guid? replacing, CancellationToken cancellationToken);
@@ -220,20 +227,21 @@ internal sealed class SampleMailbox : IMailbox
         return Task.CompletedTask;
     }
 
-    public Task MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken)
+    public Task<bool> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
+        bool markRead = MailFolders.MarksMovedMessagesRead(destination);
         for (int index = 0; index < mail.Count; index++)
         {
             var item = mail[index];
             if (item.Summary.Folder == source && ids.Contains(item.Summary.Id))
             {
-                mail[index] = (item.Summary with { Folder = destination }, item.Content);
+                mail[index] = (item.Summary with { Folder = destination, Read = markRead || item.Summary.Read }, item.Content);
                 if (source == "Drafts" && destination != "Drafts")
                     draftMessages.Remove(item.Summary.Id);
             }
         }
-        return Task.CompletedTask;
+        return Task.FromResult(markRead);
     }
 
     public async Task ExportAsync(string folder, IReadOnlySet<Guid>? ids, System.IO.Compression.ZipArchive archive,
