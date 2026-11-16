@@ -88,8 +88,7 @@ internal sealed class RecipientAutocomplete
                 ReadToken(field.Text, field.SelectionStart) != token)
                 return;
 
-            var otherAddresses = field.Text.Remove(token.Start, token.End - token.Start)
-                .Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
+            var otherAddresses = RecipientSeparators.Split(field.Text.Remove(token.Start, token.End - token.Start))
                 .ToHashSet(StringComparer.OrdinalIgnoreCase);
             var options = matches.Where(address => !otherAddresses.Contains(address)).Take(8).ToArray();
             if (options.Length == 0)
@@ -174,9 +173,18 @@ internal sealed class RecipientAutocomplete
 
     private static (int Start, int End, string Prefix) ReadToken(string text, int caret)
     {
-        int start = caret == 0 ? 0 : text.LastIndexOf(';', caret - 1) + 1;
-        int end = text.IndexOf(';', caret);
-        return (start, end < 0 ? text.Length : end, text[start..caret].Trim());
+        int start = 0;
+        int end = text.Length;
+        foreach (int separator in RecipientSeparators.Find(text))
+        {
+            if (separator >= caret)
+            {
+                end = separator;
+                break;
+            }
+            start = separator + 1;
+        }
+        return (start, end, text[start..caret].Trim());
     }
 
     internal static (string Text, int Caret) CompleteAddress(string text, int caret, string address)
@@ -185,7 +193,9 @@ internal sealed class RecipientAutocomplete
         string prefix = text[..token.Start];
         if (prefix.Length > 0)
             prefix += " ";
-        string inserted = prefix + address + "; ";
+        char separator = token.End < text.Length ? text[token.End] :
+            token.Start > 0 ? text[token.Start - 1] : ';';
+        string inserted = prefix + address + separator + " ";
         string suffix = token.End < text.Length ? text[(token.End + 1)..].TrimStart() : "";
         return (inserted + suffix, inserted.Length);
     }

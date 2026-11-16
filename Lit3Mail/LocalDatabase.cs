@@ -16,7 +16,7 @@ internal sealed record AccountSettings(
     string ProfileName, bool ProfileUsesAccountName, bool IncomingUsesEmail, bool OutgoingUsesEmail);
 
 internal sealed record DraftEditorState(string To, string Cc, string Bcc, string ReplyTo, string Subject,
-    bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature);
+    bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature, ComposeHtmlQuote? HtmlQuote = null);
 
 internal sealed record LocalDraft(Guid? SenderId, DraftEditorState Editor, MailFileAttachment[] Files,
     Guid? ServerDraftId, string? ServerConnectionKey);

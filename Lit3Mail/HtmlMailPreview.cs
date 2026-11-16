@@ -12,7 +12,7 @@ internal sealed class HtmlMailPreview : WebView2
     private const string PreviewHost = "lit3mail-preview.invalid";
     private const int MaxQuoteImageBytes = 32 * 1024 * 1024;
     private readonly SemaphoreSlim navigationGate = new(1);
-    private readonly Dictionary<Uri, byte[]> quoteImages = new();
+    private readonly Dictionary<Uri, (byte[] Bytes, string MediaType)> quoteImages = new();
     private int quoteImageBytes;
     private Task? initialization;
     private TaskCompletionSource<bool>? documentReady;
@@ -21,17 +21,30 @@ internal sealed class HtmlMailPreview : WebView2
     private byte[]? navigationDocument;
     private int displayVersion;
     private bool allowRemoteImages;
+    private bool allowInlineImages;
     private ContextMenuStrip? imageMenu;
 
     public byte[]? GetQuoteImage(string source) =>
+        GetDownloadedImage(source)?.Bytes;
+
+    public InlineMailImage? GetInlineQuoteImage(string source)
+    {
+        if (GetDownloadedImage(source) is not { } image ||
+            !ComposeHtmlQuote.IsSupportedImage(image.MediaType))
+            return null;
+        return new(MimeKit.Utils.MimeUtils.GenerateMessageId(), image.MediaType, image.Bytes, source);
+    }
+
+    private (byte[] Bytes, string MediaType)? GetDownloadedImage(string source) =>
         allowRemoteImages && Uri.TryCreate(source, UriKind.Absolute, out var uri) &&
-        quoteImages.TryGetValue(uri, out var bytes) ? bytes : null;
+        quoteImages.TryGetValue(uri, out var image) ? image : null;
 
     public void ClearDisplay()
     {
         ++displayVersion;
         imageMenu?.Close();
         allowRemoteImages = false;
+        allowInlineImages = false;
         quoteImages.Clear();
         quoteImageBytes = 0;
         Hide();
@@ -46,7 +59,7 @@ internal sealed class HtmlMailPreview : WebView2
         }
     }
 
-    public async Task<bool> DisplayAsync(string html, bool showRemoteImages)
+    public async Task<bool> DisplayAsync(string html, bool showRemoteImages, bool showInlineImages = false)
     {
         ClearDisplay();
         int version = displayVersion;
@@ -64,6 +77,7 @@ internal sealed class HtmlMailPreview : WebView2
             navigationDocument = Encoding.UTF8.GetBytes(BuildDocument(html));
             navigationTarget = $"http://{PreviewHost}/{Guid.NewGuid():N}";
             allowRemoteImages = showRemoteImages;
+            allowInlineImages = showInlineImages;
             documentReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
             CoreWebView2.Navigate(navigationTarget);
             bool loaded = await documentReady.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -87,7 +101,7 @@ internal sealed class HtmlMailPreview : WebView2
             navigationTarget = null;
             navigationDocument = null;
             if (!showingDocument)
-                allowRemoteImages = false;
+                allowRemoteImages = allowInlineImages = false;
             navigationGate.Release();
         }
     }
@@ -209,14 +223,14 @@ internal sealed class HtmlMailPreview : WebView2
             if (e.ResourceContext == CoreWebView2WebResourceContext.Document &&
                 e.Request.Uri == navigationTarget && navigationDocument is { } document)
             {
-                string imageSources = allowRemoteImages ? "data: https: http:" : "'none'";
+                string imageSources = allowRemoteImages ? "data: https: http:" : allowInlineImages ? "data:" : "'none'";
                 string policy = $"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src {imageSources}; " +
                     "base-uri 'none'; form-action 'none'; frame-src 'none'";
                 e.Response = environment.CreateWebResourceResponse(new MemoryStream(document, writable: false), 200, "OK",
                     $"Content-Type: text/html; charset=utf-8\r\nContent-Security-Policy: {policy}\r\n" +
                     "Cache-Control: no-store\r\nReferrer-Policy: no-referrer");
             }
-            else if (!CanLoadResource(e.Request.Uri, e.ResourceContext, allowRemoteImages))
+            else if (!CanLoadResource(e.Request.Uri, e.ResourceContext, allowRemoteImages, allowInlineImages))
                 e.Response = environment.CreateWebResourceResponse(null, 403, "Blocked", "");
             else if (Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri) && RemoteMailImages.IsWebImageUrl(uri))
             {
@@ -236,7 +250,7 @@ internal sealed class HtmlMailPreview : WebView2
                             if (!quoteImages.ContainsKey(uri) && image.Body.Length <= MaxQuoteImageBytes - quoteImageBytes)
                             {
                                 byte[] bytes = image.Body.ToArray();
-                                quoteImages.Add(uri, bytes);
+                                quoteImages.Add(uri, (bytes, image.MediaType));
                                 quoteImageBytes += bytes.Length;
                             }
                             pendingBody = null;
@@ -338,7 +352,8 @@ internal sealed class HtmlMailPreview : WebView2
         }
     }
 
-    internal static bool CanLoadResource(string address, CoreWebView2WebResourceContext context, bool allowRemoteImages)
+    internal static bool CanLoadResource(string address, CoreWebView2WebResourceContext context, bool allowRemoteImages,
+        bool allowInlineImages = false)
     {
         if (address == "about:blank")
             return true;
@@ -346,7 +361,8 @@ internal sealed class HtmlMailPreview : WebView2
             !Uri.TryCreate(address, UriKind.Absolute, out var uri))
             return false;
 
-        return allowRemoteImages && (uri.Scheme == "data" || RemoteMailImages.IsWebImageUrl(uri));
+        return uri.Scheme == "data" ? allowInlineImages || allowRemoteImages :
+            allowRemoteImages && RemoteMailImages.IsWebImageUrl(uri);
     }
 
     internal static string BuildDocument(string html)

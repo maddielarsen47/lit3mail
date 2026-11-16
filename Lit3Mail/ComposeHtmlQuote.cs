@@ -1,0 +1,163 @@
+using System.Net;
+using System.Text;
+using System.Text.RegularExpressions;
+using MimeKit.Text;
+
+namespace Lit3Mail;
+
+internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImage[] Images)
+{
+    private static readonly HashSet<string> LayoutTags = new(StringComparer.Ordinal)
+    {
+        "a", "abbr", "address", "b", "blockquote", "br", "caption", "center", "cite", "code", "col",
+        "colgroup", "dd", "del", "div", "dl", "dt", "em", "font", "h1", "h2", "h3", "h4", "h5", "h6",
+        "hr", "i", "img", "ins", "li", "ol", "p", "pre", "s", "small", "span", "strong", "sub", "sup",
+        "table", "tbody", "td", "tfoot", "th", "thead", "tr", "u", "ul"
+    };
+
+    private static readonly HashSet<string> LayoutAttributes = new(StringComparer.Ordinal)
+    {
+        "align", "alt", "bgcolor", "border", "cellpadding", "cellspacing", "class", "color", "colspan",
+        "dir", "face", "height", "id", "lang", "nowrap", "role", "rowspan", "size", "span", "start",
+        "style", "title", "type", "valign", "width"
+    };
+
+    public static ComposeHtmlQuote Create(string header, MailContent original,
+        Func<string, InlineMailImage?>? approvedImage)
+    {
+        var images = new List<InlineMailImage>();
+        var html = new StringBuilder();
+        using var reader = new StringReader(original.Html ?? "");
+        var tokenizer = new HtmlTokenizer(reader) { DecodeCharacterReferences = true };
+        string? hidden = null;
+        while (tokenizer.ReadNextToken(out var token))
+        {
+            if (token is HtmlTagToken tag)
+            {
+                string name = tag.Name.ToLowerInvariant();
+                if (hidden is not null)
+                {
+                    if (tag.IsEndTag && name == hidden)
+                    {
+                        if (hidden == "style")
+                            html.Append("</style>");
+                        hidden = null;
+                    }
+                    continue;
+                }
+                if (name is "script" or "title" or "iframe" or "object" or "svg" or "textarea" or "template" or "noscript")
+                {
+                    if (!tag.IsEndTag && !tag.IsEmptyElement)
+                        hidden = name;
+                    continue;
+                }
+                if (name == "body")
+                    name = "div";
+                else if (!LayoutTags.Contains(name) && name != "style")
+                    continue;
+
+                html.Append('<');
+                if (tag.IsEndTag)
+                {
+                    html.Append('/').Append(name).Append('>');
+                    continue;
+                }
+                html.Append(name);
+                foreach (var attribute in tag.Attributes)
+                {
+                    string key = attribute.Name.ToLowerInvariant();
+                    string value = attribute.Value ?? "";
+                    if (key == "src" && name == "img")
+                    {
+                        var image = images.FirstOrDefault(item => item.ContentLocation == value)
+                            ?? FindImage(value, original.InlineImages) ?? ReadDataImage(value) ?? approvedImage?.Invoke(value);
+                        if (image is null)
+                            continue;
+                        if (!images.Contains(image))
+                            images.Add(image);
+                        value = "cid:" + image.ContentId;
+                    }
+                    else if (key == "href" && name == "a")
+                    {
+                        if (!Uri.TryCreate(value, UriKind.Absolute, out var uri) ||
+                            uri.Scheme is not ("http" or "https" or "mailto"))
+                            continue;
+                    }
+                    else if (!LayoutAttributes.Contains(key))
+                        continue;
+                    else if (key == "style")
+                    {
+                        value = RemoveCssComments(value);
+                        if (!IsLocalCss(value))
+                            continue;
+                    }
+                    html.Append(' ').Append(key).Append("=\"").Append(WebUtility.HtmlEncode(value)).Append('"');
+                }
+                html.Append('>');
+                if (name == "style")
+                    hidden = "style";
+            }
+            else if (token is HtmlDataToken data)
+            {
+                if (hidden == "style")
+                {
+                    string css = RemoveCssComments(data.Data);
+                    if (IsLocalCss(css))
+                        html.Append(css);
+                }
+                else if (hidden is null && token.Kind == HtmlTokenKind.Data)
+                    html.Append(WebUtility.HtmlEncode(data.Data));
+            }
+        }
+        if (hidden == "style")
+            html.Append("</style>");
+
+        string label = WebUtility.HtmlEncode(header.TrimEnd()).Replace("\r", "").Replace("\n", "<br>");
+        return new(header + original.Body,
+            $"<div><p>{label}</p>{html}</div>", images.ToArray());
+    }
+
+    public MailContent WithReply(MailContent reply) =>
+        new(reply.Body + "\n\n" + Body, Html: $"<!doctype html><html><body>{reply.Html}{Html}</body></html>",
+            InlineImages: (reply.InlineImages ?? []).Concat(Images).ToArray());
+
+    public string PreviewHtml => new MailContent(Body, Html: Html, InlineImages: Images).HtmlForPreview() ?? Html;
+
+    private static InlineMailImage? FindImage(string source, IReadOnlyList<InlineMailImage>? images)
+    {
+        string id = source.StartsWith("cid:", StringComparison.OrdinalIgnoreCase)
+            ? Uri.UnescapeDataString(source[4..]) : "";
+        return images?.FirstOrDefault(image => IsSupportedImage(image.MediaType) &&
+            (image.ContentLocation == source || id.Equals(image.ContentId, StringComparison.OrdinalIgnoreCase)));
+    }
+
+    private static InlineMailImage? ReadDataImage(string source)
+    {
+        int comma = source.IndexOf(',');
+        if (!source.StartsWith("data:", StringComparison.OrdinalIgnoreCase) || comma < 12 ||
+            source.Length - comma > 14 * 1024 * 1024 ||
+            !source.AsSpan(0, comma).EndsWith(";base64", StringComparison.OrdinalIgnoreCase))
+            return null;
+        string mediaType = source[5..(comma - 7)].ToLowerInvariant();
+        if (!IsSupportedImage(mediaType))
+            return null;
+        try
+        {
+            return new(MimeKit.Utils.MimeUtils.GenerateMessageId(), mediaType,
+                Convert.FromBase64String(source[(comma + 1)..]));
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
+    }
+
+    internal static bool IsSupportedImage(string mediaType) =>
+        mediaType is "image/png" or "image/jpeg" or "image/gif" or "image/webp" or "image/bmp" or "image/avif";
+
+    private static string RemoveCssComments(string css) => Regex.Replace(css, @"/\*[\s\S]*?\*/", "");
+
+    private static bool IsLocalCss(string css) =>
+        !Regex.IsMatch(css, @"[\\<]|/\*|\b(?:url|image|image-set|expression|behavior)\s*\(|@(?:import|font-face|namespace)\b",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+}

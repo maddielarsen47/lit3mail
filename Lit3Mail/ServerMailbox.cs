@@ -890,7 +890,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
 
     internal static void AddRecipients(InternetAddressList recipients, string input, bool allowIncomplete = false)
     {
-        foreach (string segment in input.Split(';', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+        foreach (string segment in RecipientSeparators.Split(input))
         {
             if (!allowIncomplete)
                 recipients.AddRange(InternetAddressList.Parse(segment));

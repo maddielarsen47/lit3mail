@@ -71,7 +71,7 @@ public partial class MailForm : Form, IMessageFilter
     private readonly Panel settingsPage = new() { Dock = DockStyle.Fill, Padding = new Padding(24), Visible = false };
     private readonly Panel composePage = new() { Dock = DockStyle.Fill, Padding = new Padding(24), Visible = false };
     private RecipientAutocomplete? recipientAutocomplete;
-    private readonly ComboBox composeFrom = new()
+    private readonly WrappingAddressSelector composeFrom = new()
     {
         AccessibleName = "From", Dock = DockStyle.Top, DropDownStyle = ComboBoxStyle.DropDownList,
         FlatStyle = FlatStyle.Flat
@@ -81,6 +81,11 @@ public partial class MailForm : Form, IMessageFilter
     private readonly TextBox composeBcc = new() { AccessibleName = "Bcc", Dock = DockStyle.Fill };
     private readonly TextBox composeReplyTo = new() { AccessibleName = "Reply-To", Dock = DockStyle.Fill };
     private readonly TextBox composeSubject = new() { AccessibleName = "Subject", Dock = DockStyle.Fill };
+    private readonly CheckBox composeAddressDetails = new()
+    {
+        Text = "More", Appearance = Appearance.Button,
+        AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(0, 3, 3, 3)
+    };
     private sealed record SenderOption(MailAccount Account)
     {
         public override string ToString() => Account.Email.Trim();
@@ -88,7 +93,7 @@ public partial class MailForm : Form, IMessageFilter
     private MailAccount? ComposeSender => (composeFrom.SelectedItem as SenderOption)?.Account;
     private sealed record ComposeDraft(MailAccount? Sender, string To, string Cc, string Bcc, string ReplyTo,
         bool UsesDefaultReplyTo, string Subject, string BodyRtf, ComposeSignatureRange Signature,
-        IReadOnlyList<MailFileAttachment> Files, bool HasContent = false);
+        IReadOnlyList<MailFileAttachment> Files, bool HasContent = false, ComposeHtmlQuote? HtmlQuote = null);
     private sealed record EditingDraft(MailAccount Account, IMailbox Mailbox, Guid Id);
     private readonly MailBodyEditor composeBody = new()
     {
@@ -100,6 +105,18 @@ public partial class MailForm : Form, IMessageFilter
     {
         AutoSize = true, Dock = DockStyle.Fill, Margin = Padding.Empty, AccessibleName = "Message formatting"
     };
+    private readonly SplitContainer composeBodyLayout = new()
+    {
+        Dock = DockStyle.Fill, Orientation = Orientation.Horizontal, Size = new Size(500, 400),
+        SplitterDistance = 160, Panel2Collapsed = true
+    };
+    private readonly TextBox composeQuoteFallback = new()
+    {
+        Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
+        AccessibleName = "Original message"
+    };
+    private HtmlMailPreview? composeQuotePreview;
+    private ComposeHtmlQuote? composeHtmlQuote;
     private readonly Button backFromCompose = new()
     {
         Text = "Back to Mail", AutoSize = true, FlatStyle = FlatStyle.Flat,
@@ -486,9 +503,11 @@ public partial class MailForm : Form, IMessageFilter
             sendMail.Enabled = ComposeSender?.Mailbox is not null;
             saveDraft.Enabled = database is not null || sendMail.Enabled;
             layout.Hide();
+            composeAddressDetails.Checked = false;
             if (savedDraft is not null)
                 transientBaseline = CaptureDraft();
             composePage.Show();
+            DisplayComposeQuote();
             UpdateRecipientAccount();
             focus.Focus();
         }
@@ -504,7 +523,7 @@ public partial class MailForm : Form, IMessageFilter
                 !body.AsSpan(0, start).IsWhiteSpace() || !body.AsSpan(end).IsWhiteSpace() || composeFiles.Count > 0;
             return new(ComposeSender, composeTo.Text, composeCc.Text, composeBcc.Text, composeReplyTo.Text,
                 usesDefaultReplyTo, composeSubject.Text, composeBody.Rtf ?? "", signatureRange, composeFiles.ToArray(),
-                hasContent);
+                hasContent || composeHtmlQuote is not null, composeHtmlQuote);
         }
 
         static bool SameDraft(ComposeDraft draft, ComposeDraft baseline) =>
@@ -532,6 +551,7 @@ public partial class MailForm : Form, IMessageFilter
             try
             {
                 composeBody.Rtf = draft.BodyRtf;
+                composeHtmlQuote = draft.HtmlQuote;
                 signatureRange = draft.Signature;
                 previousBody = composeBody.Text;
             }
@@ -547,6 +567,10 @@ public partial class MailForm : Form, IMessageFilter
         {
             recipientAutocomplete?.SetAccount(null, null);
             composePage.Hide();
+            composeQuotePreview?.ClearDisplay();
+            composeQuoteFallback.Clear();
+            composeBodyLayout.Panel2Collapsed = true;
+            composeHtmlQuote = null;
             transientBaseline = null;
             editedDraft = null;
             editingLocalDraft = null;
@@ -602,16 +626,15 @@ public partial class MailForm : Form, IMessageFilter
             updatingBody = true;
             try
             {
-                composeBody.SetPlainText(quoteHeader is null ? "" : "\r\n\r\n" + quoteHeader);
-                if (quotedMessage is not null)
+                composeHtmlQuote = quoteHeader is not null && quotedMessage?.Html is { Length: > 0 }
+                    ? ComposeHtmlQuote.Create(quoteHeader, quotedMessage,
+                        includeQuotedImages ? source => htmlPreview?.GetInlineQuoteImage(source) : null)
+                    : null;
+                composeBody.SetPlainText(quoteHeader is null || composeHtmlQuote is not null ? "" : "\r\n\r\n" + quoteHeader);
+                if (quotedMessage is not null && composeHtmlQuote is null)
                 {
                     composeBody.Select(composeBody.TextLength, 0);
-                    string? html = includeQuotedImages ? quotedMessage.HtmlForPreview() : quotedMessage.Html;
-                    if (html is { Length: > 0 } &&
-                        HtmlSignature.ToRtf(html, source => htmlPreview?.GetQuoteImage(source), includeQuotedImages) is { } rtf)
-                        composeBody.SelectedRtf = rtf;
-                    else
-                        composeBody.AppendPlainText(quotedMessage.Body);
+                    composeBody.AppendPlainText(quotedMessage.Body);
                 }
                 signatureRange = default;
                 previousBody = composeBody.Text;
@@ -659,6 +682,7 @@ public partial class MailForm : Form, IMessageFilter
             updatingBody = true;
             try
             {
+                composeHtmlQuote = null;
                 string? html = new MailContent(mail.Body, Html: mail.Html, InlineImages: mail.InlineImages).HtmlForPreview();
                 if (string.IsNullOrEmpty(html))
                     composeBody.SetPlainText(mail.Body);
@@ -769,7 +793,7 @@ public partial class MailForm : Form, IMessageFilter
                 var editor = draft.Editor;
                 savedDraft = CaptureDraft();
                 RestoreDraft(new ComposeDraft(sender, editor.To, editor.Cc, editor.Bcc, editor.ReplyTo,
-                    editor.UsesDefaultReplyTo, editor.Subject, editor.BodyRtf, editor.Signature, draft.Files));
+                    editor.UsesDefaultReplyTo, editor.Subject, editor.BodyRtf, editor.Signature, draft.Files, HtmlQuote: editor.HtmlQuote));
                 editingLocalDraft = id;
                 if (sender is not null && draft.ServerDraftId is { } serverId &&
                     draft.ServerConnectionKey is { } connectionKey && connectionKey == sender.ConnectionKey())
@@ -804,7 +828,7 @@ public partial class MailForm : Form, IMessageFilter
 
             var id = editingLocalDraft ?? Guid.NewGuid();
             var editor = new DraftEditorState(snapshot.To, snapshot.Cc, snapshot.Bcc, snapshot.ReplyTo,
-                snapshot.Subject, snapshot.UsesDefaultReplyTo, snapshot.BodyRtf, snapshot.Signature);
+                snapshot.Subject, snapshot.UsesDefaultReplyTo, snapshot.BodyRtf, snapshot.Signature, snapshot.HtmlQuote);
             var sender = snapshot.Sender;
             var link = localDraftServerLink;
             if (sender is not null && editedDraft is { } serverDraft && ReferenceEquals(serverDraft.Account, sender))
@@ -868,7 +892,8 @@ public partial class MailForm : Form, IMessageFilter
                 savedDraft = CaptureDraft();
                 if (local is not null)
                     RestoreDraft(new ComposeDraft(folder.Account, local.To, local.Cc, local.Bcc, local.ReplyTo,
-                        local.UsesDefaultReplyTo, local.Subject, local.BodyRtf, local.Signature, serverDraft?.Files ?? []));
+                        local.UsesDefaultReplyTo, local.Subject, local.BodyRtf, local.Signature,
+                        serverDraft?.Files ?? [], HtmlQuote: local.HtmlQuote));
                 else
                     RestoreServerDraft(folder.Account, serverDraft!);
                 editedDraft = new(folder.Account, mailbox, summary.Id);
@@ -909,7 +934,7 @@ public partial class MailForm : Form, IMessageFilter
                 }
                 if (replacing is not null)
                     CancelBackgroundCache(sender);
-                content = composeBody.GetMessageContent();
+                content = GetComposeMessageContent();
                 saved = await mailbox.SaveDraftAsync(new(sender.Email.Trim(), snapshot.ReplyTo.Trim(),
                     snapshot.To, snapshot.Cc, snapshot.Subject, content.Body, content.Html, content.InlineImages,
                     Bcc: snapshot.Bcc, Files: snapshot.Files), replacing, mailboxLifetime.Token);
@@ -933,7 +958,8 @@ public partial class MailForm : Form, IMessageFilter
                 ClearDraftCache(sender!, oldId);
             if (saved.Summary is { } summary && database is not null)
                 CacheDraftEditorState(sender!, summary, new DraftEditorState(snapshot.To, snapshot.Cc, snapshot.Bcc,
-                    snapshot.ReplyTo, snapshot.Subject, snapshot.UsesDefaultReplyTo, snapshot.BodyRtf, snapshot.Signature), content);
+                    snapshot.ReplyTo, snapshot.Subject, snapshot.UsesDefaultReplyTo, snapshot.BodyRtf,
+                    snapshot.Signature, snapshot.HtmlQuote), content);
 
             sender!.CountsUpdatedAt = default;
             FinishCompose();
@@ -944,12 +970,13 @@ public partial class MailForm : Form, IMessageFilter
             if (saved.Warning is { } warning && !IsDisposed)
                 ThemedPopup.Show(this, warning, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
         };
-        sendMail.Click += async (_, _) =>
+        sendMail.Click += SendCompose;
+        async void SendCompose(object? senderControl, EventArgs e)
         {
             string recipient = composeTo.Text.Trim();
             string cc = composeCc.Text.Trim();
             string bcc = composeBcc.Text.Trim();
-            if (!(recipient + cc + bcc).Any(character => character != ';' && !char.IsWhiteSpace(character)))
+            if (!(recipient + cc + bcc).Any(character => character is not (';' or ',') && !char.IsWhiteSpace(character)))
             {
                 composeStatus.Text = "Enter a recipient.";
                 composeTo.Focus();
@@ -990,7 +1017,7 @@ public partial class MailForm : Form, IMessageFilter
             try
             {
                 string from = sender.Email.Trim();
-                content = composeBody.GetMessageContent();
+                content = GetComposeMessageContent();
                 sent = await mailbox.SendAsync(new(from, replyTo, recipient, cc,
                     subject.Length == 0 ? "(No subject)" : subject, content.Body, content.Html, content.InlineImages,
                     Bcc: bcc, Files: composeFiles.ToArray()), mailboxLifetime.Token);
@@ -1054,7 +1081,7 @@ public partial class MailForm : Form, IMessageFilter
                 ThemedPopup.Show(this, warning, Text, MessageBoxButtons.OK, MessageBoxIcon.Information);
             if (sourceDraft is not null && !IsDisposed)
                 await RemoveDraftAfterSend(sourceDraft);
-        };
+        }
         void OpenSettings()
         {
             layout.Hide();
@@ -1301,6 +1328,14 @@ public partial class MailForm : Form, IMessageFilter
     private void InitializeComposePage(Font headingFont, ToolTip hints)
     {
         var heading = new Label { Text = "New Mail", Dock = DockStyle.Top, Height = 48, Font = headingFont };
+        var addressHelp = new Label
+        {
+            Text = "Separate multiple addresses with a semi-colon ; or comma ,",
+            Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 0, 0, 9),
+            Font = new Font(Font, FontStyle.Italic)
+        };
+        var helpFont = addressHelp.Font;
+        addressHelp.Disposed += (_, _) => helpFont.Dispose();
         var fields = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2 };
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -1375,25 +1410,68 @@ public partial class MailForm : Form, IMessageFilter
             }
         }
 
-        foreach (var field in new Control[] { composeFrom, composeTo, composeCc, composeBcc, composeReplyTo, composeSubject, composeBody })
+        var addressDetailRows = new List<(RowStyle Style, Control Label, Control Field)>();
+        var moreRow = new RowStyle(SizeType.AutoSize);
+        foreach (var field in new Control[] { composeTo, composeCc, composeFrom, composeBcc, composeReplyTo, composeSubject, composeBody })
         {
+            if (field == composeFrom)
+            {
+                fields.RowStyles.Add(moreRow);
+                fields.Controls.Add(composeAddressDetails, 1, fields.RowCount++);
+            }
             if (field == composeBody)
             {
                 fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 fields.Controls.Add(composeFormatting, 1, fields.RowCount++);
             }
             int row = fields.RowCount++;
-            fields.RowStyles.Add(field == composeBody
+            var rowStyle = field == composeBody
                 ? new RowStyle(SizeType.Percent, 100)
-                : new RowStyle(SizeType.AutoSize));
-            fields.Controls.Add(new Label
+                : new RowStyle(SizeType.AutoSize);
+            fields.RowStyles.Add(rowStyle);
+            var label = new Label
             {
                 Text = field.AccessibleName, AutoSize = true,
                 Margin = new Padding(0, 6, 16, 0)
-            }, 0, row);
-            var fieldFrame = field is TextBoxBase input ? CreateTextField(input) : field;
+            };
+            fields.Controls.Add(label, 0, row);
+            var fieldFrame = field switch
+            {
+                TextBox address when address != composeSubject => CreateWrappingAddressField(address),
+                TextBoxBase input => CreateTextField(input),
+                WrappingAddressSelector selector => CreateAddressSelectorFrame(selector),
+                _ => field
+            };
+            if (field == composeBody)
+            {
+                composeBodyLayout.Panel1.Controls.Add(fieldFrame);
+                composeBodyLayout.Panel2.Controls.Add(composeQuoteFallback);
+                fieldFrame = composeBodyLayout;
+            }
             fieldFrame.Margin = new Padding(0, 3, 0, 9);
             fields.Controls.Add(fieldFrame, 1, row);
+            if (field == composeFrom || field == composeBcc || field == composeReplyTo)
+                addressDetailRows.Add((rowStyle, label, fieldFrame));
+        }
+        composeAddressDetails.CheckedChanged += (_, _) => UpdateAddressDetails();
+        UpdateAddressDetails();
+
+        void UpdateAddressDetails()
+        {
+            bool expanded = composeAddressDetails.Checked;
+            fields.SuspendLayout();
+            moreRow.SizeType = expanded ? SizeType.Absolute : SizeType.AutoSize;
+            moreRow.Height = 0;
+            composeAddressDetails.Visible = !expanded;
+            foreach (var (style, label, field) in addressDetailRows)
+            {
+                style.SizeType = expanded ? SizeType.AutoSize : SizeType.Absolute;
+                style.Height = 0;
+                label.Visible = field.Visible = expanded;
+            }
+            fields.ResumeLayout();
+            if (expanded)
+                composeBody.Focus();
         }
 
         fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -1402,17 +1480,23 @@ public partial class MailForm : Form, IMessageFilter
         var actions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, Margin = Padding.Empty };
         sendMail.Margin = Padding.Empty;
         saveDraft.Margin = new Padding(0, 0, 8, 0);
-        attachFiles.Margin = new Padding(0, 0, 8, 0);
+        attachFiles.Margin = Padding.Empty;
         backFromCompose.Margin = new Padding(0, 0, 8, 0);
         actions.Controls.Add(backFromCompose);
         actions.Controls.Add(saveDraft);
         actions.Controls.Add(attachFiles);
+        actions.Controls.Add(new Label
+        {
+            Text = "·", AutoSize = true, Anchor = AnchorStyles.None,
+            Margin = new Padding(8, 0, 8, 0), AccessibleRole = AccessibleRole.Separator
+        });
         actions.Controls.Add(sendMail);
         fields.Controls.Add(actions, 1, fields.RowCount++);
         fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         fields.Controls.Add(composeStatus, 1, fields.RowCount++);
         actions.SizeChanged += (_, _) => composeStatus.MaximumSize = new Size(Math.Max(1, actions.ClientSize.Width), 0);
         composePage.Controls.Add(fields);
+        composePage.Controls.Add(addressHelp);
         composePage.Controls.Add(heading);
         if (database is not null)
             recipientAutocomplete = new RecipientAutocomplete(composePage, database, composeTo, composeCc, composeBcc);
@@ -1433,6 +1517,70 @@ public partial class MailForm : Form, IMessageFilter
         frame.Controls.Add(input);
         frame.Click += (_, _) => input.Focus();
         return frame;
+    }
+
+    private static Panel CreateWrappingAddressField(TextBox input)
+    {
+        input.Multiline = true;
+        input.WordWrap = true;
+        var frame = CreateTextField(input);
+        frame.Dock = DockStyle.Top;
+        input.TextChanged += (_, _) => ResizeField();
+        input.FontChanged += (_, _) => ResizeField();
+        input.SizeChanged += (_, _) => ResizeField();
+        input.VisibleChanged += (_, _) => ResizeField();
+        ResizeField();
+        return frame;
+
+        void ResizeField()
+        {
+            if (input.Width <= 0)
+                return;
+            int lines = Math.Max(1, input.GetLineFromCharIndex(input.TextLength) + 1);
+            frame.Height = input.PreferredHeight + (lines - 1) * input.Font.Height +
+                frame.Padding.Vertical + 2;
+        }
+    }
+
+    private static Panel CreateAddressSelectorFrame(WrappingAddressSelector selector)
+    {
+        var frame = new Panel { Dock = DockStyle.Top, Height = selector.Height };
+        frame.Controls.Add(selector);
+        selector.SizeChanged += (_, _) => frame.Height = selector.Height;
+        return frame;
+    }
+
+    private MailContent GetComposeMessageContent()
+    {
+        var reply = composeBody.GetMessageContent();
+        return composeHtmlQuote?.WithReply(reply) ?? reply;
+    }
+
+    private void DisplayComposeQuote()
+    {
+        composeBodyLayout.Panel2Collapsed = composeHtmlQuote is null;
+        if (composeHtmlQuote is not { } quote)
+            return;
+
+        composeQuoteFallback.Text = quote.Body;
+        composeQuoteFallback.Show();
+        if (composeQuotePreview is null)
+        {
+            composeQuotePreview = new HtmlMailPreview
+            {
+                Dock = DockStyle.Fill, Visible = false, AccessibleName = "Original HTML message"
+            };
+            composeBodyLayout.Panel2.Controls.Add(composeQuotePreview);
+            composeQuotePreview.BringToFront();
+        }
+        _ = ShowQuoteAsync(quote);
+
+        async Task ShowQuoteAsync(ComposeHtmlQuote quote)
+        {
+            if (await composeQuotePreview.DisplayAsync(quote.PreviewHtml, showRemoteImages: false, showInlineImages: true) &&
+                ReferenceEquals(composeHtmlQuote, quote) && composePage.Visible)
+                composeQuoteFallback.Hide();
+        }
     }
 
     protected override void OnSystemColorsChanged(EventArgs e)
@@ -1509,6 +1657,7 @@ public partial class MailForm : Form, IMessageFilter
         exportMenu.Renderer = new ExportMenuRenderer(chrome, ink,
             SystemInformation.HighContrast ? SystemColors.GrayText : muted, border, selectedBackground, selectedText);
         StyleButton(cancelExport, chrome, ink, border, selectedBackground);
+        StyleButton(composeAddressDetails, chrome, ink, border, selectedBackground);
         foreach (var field in new[] { search, composeTo, composeCc, composeBcc, composeReplyTo, composeSubject })
         {
             field.Parent!.BackColor = field.BackColor = surface;
@@ -1637,7 +1786,7 @@ public partial class MailForm : Form, IMessageFilter
             ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(bounds, -4, -4), ink, background);
     }
 
-    private enum ToolbarIcon { Palette, NumberedList, BulletedList, Back, Send, Save }
+    private enum ToolbarIcon { Palette, NumberedList, BulletedList, Back, Send, Save, PaperClip }
 
     private static void DrawToolbarIcon(Graphics graphics, Rectangle bounds, Color ink, ToolbarIcon icon)
     {
@@ -1666,6 +1815,18 @@ public partial class MailForm : Form, IMessageFilter
                     new Point(14, 15), new Point(2, 15)]);
                 graphics.DrawRectangle(pen, 5, 1, 5, 5);
                 graphics.DrawRectangle(pen, 5, 9, 6, 6);
+            }
+            else if (icon == ToolbarIcon.PaperClip)
+            {
+                using var clip = new System.Drawing.Drawing2D.GraphicsPath();
+                clip.AddLine(9, 5, 4.5f, 9.5f);
+                clip.AddBezier(4.5f, 9.5f, 3, 11, 5, 13, 6.5f, 11.5f);
+                clip.AddLine(6.5f, 11.5f, 13, 5);
+                clip.AddBezier(13, 5, 15.5f, 2.5f, 12, -1, 9.5f, 1.5f);
+                clip.AddLine(9.5f, 1.5f, 3, 8);
+                clip.AddBezier(3, 8, -1, 12, 4, 17, 8, 13);
+                clip.AddLine(8, 13, 14, 7);
+                graphics.DrawPath(pen, clip);
             }
             else if (icon == ToolbarIcon.Palette)
             {

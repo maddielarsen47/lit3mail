@@ -8,7 +8,11 @@ public partial class MailForm
     private readonly List<string> openedAttachmentFiles = [];
     private CancellationTokenSource? previewAttachmentLoad;
 
-    private readonly Button attachFiles = new() { Text = "Attach Files...", AutoSize = true };
+    private readonly Button attachFiles = new()
+    {
+        Text = "Attach Files...", AutoSize = true, FlatStyle = FlatStyle.Flat,
+        Tag = ToolbarIcon.PaperClip, Padding = new Padding(22, 0, 0, 0)
+    };
     private readonly Button removeAttachment = new() { Text = "Remove", AutoSize = true };
     private readonly ComboBox composeAttachmentPicker = new()
     {
