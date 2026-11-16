@@ -30,6 +30,7 @@ internal sealed record LocalDraftEntry(Guid Id, string Subject, string Sender, D
 internal sealed class LocalDatabase(string path)
 {
     internal const int FolderCacheLimit = 1000;
+    private const int MaxCachedBodyPartBytes = 4 * 1024 * 1024;
     private const int SchemaVersion = 12;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
@@ -430,8 +431,10 @@ internal sealed class LocalDatabase(string path)
         command.CommandText = """
             SELECT message_id, body FROM message_body_cache
             WHERE account_id = $account AND folder = $folder AND connection_key = $connection
+              AND octet_length(body) <= $maxPartBytes
             """;
         AddFolderParameters(command, account, folder, connectionKey);
+        command.Parameters.AddWithValue("$maxPartBytes", MaxCachedBodyPartBytes);
         using var reader = command.ExecuteReader();
         while (reader.Read())
         {
@@ -827,8 +830,10 @@ internal sealed class LocalDatabase(string path)
         command.CommandText = """
             SELECT body, html FROM message_body_cache
             WHERE account_id = $account AND folder = $folder AND connection_key = $connection AND message_id = $message
+              AND octet_length(body) <= $maxPartBytes AND (html IS NULL OR octet_length(html) <= $maxPartBytes)
             """;
         AddFolderParameters(command, account, folder, connectionKey);
+        command.Parameters.AddWithValue("$maxPartBytes", MaxCachedBodyPartBytes);
         command.Parameters.AddWithValue("$message", message.ToString());
         using var reader = command.ExecuteReader();
         return reader.Read() ? new MailContent(reader.GetString(0), Html: reader.IsDBNull(1) ? null : reader.GetString(1)) : null;

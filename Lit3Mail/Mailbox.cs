@@ -30,7 +30,8 @@ internal sealed record MailFileAttachment(string FileName, string MediaType, byt
 internal sealed record MailAttachmentInfo(string PartId, string FileName, string MediaType);
 
 internal sealed record MailContent(string Body, bool HasInlineImage = false, string? Html = null,
-    IReadOnlyList<InlineMailImage>? InlineImages = null, IReadOnlyList<MailAttachmentInfo>? AttachmentList = null)
+    IReadOnlyList<InlineMailImage>? InlineImages = null, IReadOnlyList<MailAttachmentInfo>? AttachmentList = null,
+    bool PreviewTooLarge = false)
 {
     private static readonly Regex ContentIdReference = new("""\bcid:([^"'<>\s)]+)""", RegexOptions.IgnoreCase);
 
@@ -47,7 +48,10 @@ internal sealed record MailContent(string Body, bool HasInlineImage = false, str
         ContentIdReference.Matches(html).Select(match => Uri.UnescapeDataString(match.Groups[1].Value))
             .ToHashSet(StringComparer.OrdinalIgnoreCase);
 
-    public string? HtmlForPreview()
+    public string? HtmlForPreview() => HtmlWithInlineImages(image =>
+        $"data:{image.MediaType};base64,{Convert.ToBase64String(image.Bytes)}");
+
+    public string? HtmlWithInlineImages(Func<InlineMailImage, string> imageSource)
     {
         if (Html is null || InlineImages is not { Count: > 0 } images)
             return Html;
@@ -62,15 +66,13 @@ internal sealed record MailContent(string Body, bool HasInlineImage = false, str
         }
 
         string html = ImageSource.Replace(Html, match => byLocation.TryGetValue(ImageSourceValue(match), out var image)
-            ? match.Groups[1].Value + "\"" + ImageData(image) + "\""
+            ? match.Groups[1].Value + "\"" + imageSource(image) + "\""
             : match.Value);
         return ContentIdReference.Replace(html, match =>
             byId.TryGetValue(Uri.UnescapeDataString(match.Groups[1].Value), out var image)
-                ? ImageData(image)
+                ? imageSource(image)
                 : match.Value);
     }
-    private static string ImageData(InlineMailImage image) =>
-        $"data:{image.MediaType};base64,{Convert.ToBase64String(image.Bytes)}";
 }
 internal sealed record OutgoingMail(string From, string ReplyTo, string To, string Cc, string Subject, string Body, string? Html = null,
     IReadOnlyList<InlineMailImage>? InlineImages = null, string Bcc = "", IReadOnlyList<MailFileAttachment>? Files = null);

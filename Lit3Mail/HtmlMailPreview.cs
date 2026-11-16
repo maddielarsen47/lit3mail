@@ -10,9 +10,11 @@ namespace Lit3Mail;
 internal sealed class HtmlMailPreview : WebView2
 {
     private const string PreviewHost = "lit3mail-preview.invalid";
+    private const string DarkScrollbarColors = "#7b879a #202939";
     private const int MaxQuoteImageBytes = 32 * 1024 * 1024;
     private readonly SemaphoreSlim navigationGate = new(1);
     private readonly Dictionary<Uri, (byte[] Bytes, string MediaType)> quoteImages = new();
+    private readonly Dictionary<string, InlineMailImage> inlineResources = new(StringComparer.Ordinal);
     private int quoteImageBytes;
     private Task? initialization;
     private TaskCompletionSource<bool>? documentReady;
@@ -22,10 +24,36 @@ internal sealed class HtmlMailPreview : WebView2
     private int displayVersion;
     private bool allowRemoteImages;
     private bool allowInlineImages;
+    private bool useDarkScrollbars;
+    [System.ComponentModel.DefaultValue(false)]
+    internal bool UseDarkScrollbars
+    {
+        get => useDarkScrollbars;
+        set
+        {
+            if (useDarkScrollbars == value)
+                return;
+            useDarkScrollbars = value;
+            _ = UpdateScrollbarsAsync();
+        }
+    }
+
+    private async Task UpdateScrollbarsAsync()
+    {
+        if (IsDisposed || CoreWebView2 is not { } browser ||
+            !Uri.TryCreate(browser.Source, UriKind.Absolute, out var source) || source.Host != PreviewHost)
+            return;
+        try
+        {
+            string colors = useDarkScrollbars ? DarkScrollbarColors : "auto";
+            await browser.ExecuteScriptAsync($"document.documentElement.style.setProperty('scrollbar-color', '{colors}', 'important')");
+        }
+        catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException) { }
+    }
     private ContextMenuStrip? imageMenu;
 
     public byte[]? GetQuoteImage(string source) =>
-        GetDownloadedImage(source)?.Bytes;
+        inlineResources.GetValueOrDefault(source)?.Bytes ?? GetDownloadedImage(source)?.Bytes;
 
     public InlineMailImage? GetInlineQuoteImage(string source)
     {
@@ -46,6 +74,7 @@ internal sealed class HtmlMailPreview : WebView2
         allowRemoteImages = false;
         allowInlineImages = false;
         quoteImages.Clear();
+        inlineResources.Clear();
         quoteImageBytes = 0;
         Hide();
         documentReady?.TrySetResult(false);
@@ -59,7 +88,7 @@ internal sealed class HtmlMailPreview : WebView2
         }
     }
 
-    public async Task<bool> DisplayAsync(string html, bool showRemoteImages, bool showInlineImages = false)
+    public async Task<bool> DisplayAsync(MailContent content, bool showRemoteImages, bool showInlineImages = false)
     {
         ClearDisplay();
         int version = displayVersion;
@@ -74,10 +103,25 @@ internal sealed class HtmlMailPreview : WebView2
             if (IsDisposed || version != displayVersion)
                 return false;
 
-            navigationDocument = Encoding.UTF8.GetBytes(BuildDocument(html));
             navigationTarget = $"http://{PreviewHost}/{Guid.NewGuid():N}";
             allowRemoteImages = showRemoteImages;
             allowInlineImages = showInlineImages;
+            string html = content.Html ?? "";
+            if ((showRemoteImages || showInlineImages) && content.InlineImages is { Count: > 0 })
+            {
+                var resourceUrls = new Dictionary<InlineMailImage, string>(ReferenceEqualityComparer.Instance);
+                html = content.HtmlWithInlineImages(image =>
+                {
+                    if (!resourceUrls.TryGetValue(image, out var url))
+                    {
+                        url = $"{navigationTarget}/image/{resourceUrls.Count}";
+                        resourceUrls.Add(image, url);
+                        inlineResources.Add(url, image);
+                    }
+                    return url;
+                }) ?? html;
+            }
+            navigationDocument = Encoding.UTF8.GetBytes(BuildDocument(html, useDarkScrollbars));
             documentReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
             CoreWebView2.Navigate(navigationTarget);
             bool loaded = await documentReady.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -101,7 +145,10 @@ internal sealed class HtmlMailPreview : WebView2
             navigationTarget = null;
             navigationDocument = null;
             if (!showingDocument)
+            {
                 allowRemoteImages = allowInlineImages = false;
+                inlineResources.Clear();
+            }
             navigationGate.Release();
         }
     }
@@ -224,11 +271,19 @@ internal sealed class HtmlMailPreview : WebView2
                 e.Request.Uri == navigationTarget && navigationDocument is { } document)
             {
                 string imageSources = allowRemoteImages ? "data: https: http:" : allowInlineImages ? "data:" : "'none'";
+                if (inlineResources.Count > 0)
+                    imageSources += " 'self'";
                 string policy = $"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src {imageSources}; " +
                     "base-uri 'none'; form-action 'none'; frame-src 'none'";
                 e.Response = environment.CreateWebResourceResponse(new MemoryStream(document, writable: false), 200, "OK",
                     $"Content-Type: text/html; charset=utf-8\r\nContent-Security-Policy: {policy}\r\n" +
                     "Cache-Control: no-store\r\nReferrer-Policy: no-referrer");
+            }
+            else if (e.ResourceContext == CoreWebView2WebResourceContext.Image &&
+                inlineResources.TryGetValue(e.Request.Uri, out var inline))
+            {
+                e.Response = environment.CreateWebResourceResponse(new MemoryStream(inline.Bytes, writable: false), 200, "OK",
+                    $"Content-Type: {inline.MediaType}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff");
             }
             else if (!CanLoadResource(e.Request.Uri, e.ResourceContext, allowRemoteImages, allowInlineImages))
                 e.Response = environment.CreateWebResourceResponse(null, 403, "Blocked", "");
@@ -362,18 +417,21 @@ internal sealed class HtmlMailPreview : WebView2
             return false;
 
         return uri.Scheme == "data" ? allowInlineImages || allowRemoteImages :
-            allowRemoteImages && RemoteMailImages.IsWebImageUrl(uri);
+            allowRemoteImages && !uri.Host.Equals(PreviewHost, StringComparison.OrdinalIgnoreCase) &&
+            RemoteMailImages.IsWebImageUrl(uri);
     }
 
-    internal static string BuildDocument(string html)
+    internal static string BuildDocument(string html, bool darkScrollbars = false)
     {
         using var writer = new StringWriter();
         writer.Write("""
             <!doctype html><html><head><meta charset="utf-8">
             <meta name="referrer" content="no-referrer">
             <style>body { font-family: 'Segoe UI', sans-serif; overflow-wrap: anywhere; } img { max-width: 100%; }</style>
-            </head>
             """);
+        if (darkScrollbars)
+            writer.Write($"<style>html {{ scrollbar-color: {DarkScrollbarColors} !important; }}</style>");
+        writer.Write("</head>");
 
         using var reader = new StringReader(html);
         var tokenizer = new HtmlTokenizer(reader);

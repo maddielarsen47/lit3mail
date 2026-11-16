@@ -19,6 +19,9 @@ internal sealed record MailEndpoint(string Host, int Port, string User, string P
 internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing) : IMailbox
 {
     internal const string GmailLabelPrefix = "gmail-label:";
+    private const int MaxPreviewTextBytes = 1024 * 1024;
+    private const int MaxInlineImageBytes = 5 * 1024 * 1024;
+    private const int MaxInlinePreviewBytes = 12 * 1024 * 1024;
     public bool IsGmail => string.Equals(incoming.Host, "imap.gmail.com", StringComparison.OrdinalIgnoreCase);
 
     private static readonly (string Name, SpecialFolder Special, FolderAttributes Attribute)[] SpecialFolders =
@@ -375,9 +378,10 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         using var client = new ImapClient();
         var (folder, uid) = await OpenMessageFolderAsync(client, id, FolderAccess.ReadOnly, token);
         var structure = await GetPreviewStructureAsync(folder, uid, id, token);
-        string? text = await ReadTextPartAsync(folder, uid, structure.Text, token);
-        string? html = await ReadTextPartAsync(folder, uid, structure.Html, token);
+        var (text, textLimited) = await ReadTextPartAsync(folder, uid, structure.Text, token);
+        var (html, htmlLimited) = await ReadTextPartAsync(folder, uid, structure.Html, token);
         var inlineImages = new List<InlineMailImage>();
+        int imageBudget = MaxInlinePreviewBytes;
         if (html is not null)
         {
             var pending = MailContent.ReferencedContentIds(html);
@@ -387,20 +391,25 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 string mediaType = part.ContentType.MimeType.ToLowerInvariant();
                 string? contentId = part.ContentId?.Trim('<', '>');
                 string? location = part.ContentLocation?.OriginalString;
-                if (mediaType is not ("image/png" or "image/jpeg" or "image/gif" or "image/webp" or "image/bmp" or "image/avif" or "image/svg+xml") ||
+                if (part is not BodyPartBasic imagePart ||
+                    mediaType is not ("image/png" or "image/jpeg" or "image/gif" or "image/webp" or "image/bmp" or "image/avif" or "image/svg+xml") ||
                     !(contentId is not null && pending.Contains(contentId) || location is not null && sources.Contains(location)))
                     continue;
-                using var image = await folder.GetBodyPartAsync(uid, part, token);
-                if (image is MimePart { Content: { } content })
-                {
-                    using var bytes = new MemoryStream();
-                    await content.DecodeToAsync(bytes, token);
-                    inlineImages.Add(new(contentId ?? MimeKit.Utils.MimeUtils.GenerateMessageId(), mediaType, bytes.ToArray(), location));
-                }
+                using var image = await ReadPreviewPartAsync(folder, uid, imagePart, Math.Min(imageBudget, MaxInlineImageBytes), token);
+                if (image is null)
+                    continue;
+                imageBudget -= (int)image.Length;
+                using var content = new MimeContent(image, PreviewEncoding(imagePart));
+                using var bytes = new MemoryStream();
+                await content.DecodeToAsync(bytes, token);
+                inlineImages.Add(new(contentId ?? MimeKit.Utils.MimeUtils.GenerateMessageId(), mediaType, bytes.ToArray(), location));
+                if (imageBudget == 0)
+                    break;
             }
         }
         return new(text ?? (html is null ? "" : ReadHtmlAsText(html)), Html: html ?? "",
-            InlineImages: inlineImages, AttachmentList: structure.Attachments);
+            InlineImages: inlineImages, AttachmentList: structure.Attachments, PreviewTooLarge: text is null && html is null &&
+                (textLimited || htmlLimited));
     }
 
     private static async Task<MailContent> ReadMessageContentAsync(MimeMessage message, CancellationToken token)
@@ -490,8 +499,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 if (!known.TryGetValue(item.UniqueId, out Guid id) || item.TextBody is null && item.HtmlBody is null)
                     continue;
 
-                string? text = await ReadTextPartAsync(folder, item.UniqueId, item.TextBody, token);
-                string? html = await ReadTextPartAsync(folder, item.UniqueId, item.HtmlBody, token);
+                var (text, _) = await ReadTextPartAsync(folder, item.UniqueId, item.TextBody, token);
+                var (html, _) = await ReadTextPartAsync(folder, item.UniqueId, item.HtmlBody, token);
                 if (text is not null || html is not null)
                     yield return (id, new MailContent(text ?? ReadHtmlAsText(html!), Html: html ?? ""));
 
@@ -501,15 +510,44 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         }
     }
 
-    private static async Task<string?> ReadTextPartAsync(
+    private static async Task<(string? Text, bool Limited)> ReadTextPartAsync(
         IMailFolder folder, UniqueId uid, BodyPartText? part, CancellationToken token)
     {
         if (part is null || part.IsAttachment)
-            return null;
+            return (null, false);
 
-        using var entity = await folder.GetBodyPartAsync(uid, part, token);
-        return (entity as TextPart)?.Text;
+        using var stream = await ReadPreviewPartAsync(folder, uid, part, MaxPreviewTextBytes, token);
+        if (stream is null)
+            return (null, true);
+        using var text = new TextPart(part.ContentType.MediaSubtype)
+        {
+            Content = new MimeContent(stream, PreviewEncoding(part))
+        };
+        text.ContentType.Charset = part.ContentType.Charset;
+        return (text.Text, false);
     }
+
+    private static async Task<Stream?> ReadPreviewPartAsync(IMailFolder folder, UniqueId uid, BodyPartBasic part,
+        int limit, CancellationToken token)
+    {
+        if (limit <= 0 || part.Octets > limit)
+            return null;
+        // Request one extra byte to detect an oversized part even if BODYSTRUCTURE understated its size.
+        string section = string.IsNullOrEmpty(part.PartSpecifier) ? "TEXT" : part.PartSpecifier;
+        var stream = await folder.GetStreamAsync(uid, section, 0, limit + 1, token);
+        if (stream.Length <= limit)
+            return stream;
+        stream.Dispose();
+        return null;
+    }
+
+    private static ContentEncoding PreviewEncoding(BodyPartBasic part) => part.ContentTransferEncoding?.ToLowerInvariant() switch
+    {
+        "base64" => ContentEncoding.Base64,
+        "quoted-printable" => ContentEncoding.QuotedPrintable,
+        "x-uuencode" or "uuencode" or "uue" or "x-uue" => ContentEncoding.UUEncode,
+        _ => ContentEncoding.Default
+    };
 
     private static string ReadHtmlAsText(string html)
     {
@@ -598,8 +636,17 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         var moved = await source.MoveToAsync(uids, destination, token);
         if (markRead && moved.Count > 0)
         {
-            await destination.OpenAsync(FolderAccess.ReadWrite, token);
-            await destination.AddFlagsAsync(moved.Destination.ToList(), MessageFlags.Seen, true, token);
+            try
+            {
+                await destination.OpenAsync(FolderAccess.ReadWrite, token);
+                await destination.AddFlagsAsync(moved.Destination.ToList(), MessageFlags.Seen, true, token);
+            }
+            catch (Exception error) when (error is IOException or CommandException or ProtocolException or
+                InvalidOperationException or OperationCanceledException)
+            {
+                // The move already succeeded and the source was marked read before it moved.
+                System.Diagnostics.Debug.WriteLine($"Could not confirm the destination read flag ({error.GetType().Name}).");
+            }
         }
         var destinationIds = new Dictionary<Guid, Guid>();
         foreach (var pair in moved)

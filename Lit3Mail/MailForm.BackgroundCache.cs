@@ -130,12 +130,13 @@ public partial class MailForm
             .Where(mail => !cachedBodies.Contains(mail.Id))
             .Select(mail => mail.Id).ToArray();
 
-        var batch = new List<(Guid Id, MailContent Content)>(25);
+        const int bodyBatchSize = 4;
+        var batch = new List<(Guid Id, MailContent Content)>(bodyBatchSize);
         await foreach (var body in work.Mailbox.PrefetchContentsAsync(missing, token))
         {
             token.ThrowIfCancellationRequested();
             batch.Add(body);
-            if (batch.Count == 25)
+            if (batch.Count == bodyBatchSize)
             {
                 database.SaveMessageBodies(account, work.Folder, work.ConnectionKey, batch, onlyIfMissing: true);
                 batch.Clear();

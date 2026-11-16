@@ -117,11 +117,39 @@ internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImag
             $"<div><p>{label}</p>{html}</div>", images.ToArray());
     }
 
-    public MailContent WithReply(MailContent reply) =>
-        new(reply.Body + "\n\n" + Body, Html: $"<!doctype html><html><body>{reply.Html}{Html}</body></html>",
+    public MailContent WithReply(MailContent reply)
+    {
+        const string scope = "lit3mail-original-message";
+        string scopedQuote = Regex.Replace(Html, @"<style(?:\s[^>]*)?>(.*?)</style>", match =>
+        {
+            string css = match.Groups[1].Value;
+            return HasBalancedCss(css) ? $"<style>@scope (.{scope}) {{ {css} }}</style>" : "";
+        }, RegexOptions.IgnoreCase | RegexOptions.Singleline);
+        return new(reply.Body + "\n\n" + Body,
+            Html: $"<!doctype html><html><body>{reply.Html}<div class=\"{scope}\">{scopedQuote}</div></body></html>",
             InlineImages: (reply.InlineImages ?? []).Concat(Images).ToArray());
+    }
 
-    public string PreviewHtml => new MailContent(Body, Html: Html, InlineImages: Images).HtmlForPreview() ?? Html;
+    private static bool HasBalancedCss(string css)
+    {
+        int depth = 0;
+        char quoted = '\0';
+        foreach (char character in css)
+        {
+            if (quoted != '\0')
+            {
+                if (character == quoted)
+                    quoted = '\0';
+            }
+            else if (character is '\'' or '"')
+                quoted = character;
+            else if (character == '{')
+                depth++;
+            else if (character == '}' && --depth < 0)
+                return false;
+        }
+        return depth == 0 && quoted == '\0';
+    }
 
     private static InlineMailImage? FindImage(string source, IReadOnlyList<InlineMailImage>? images)
     {
