@@ -11,8 +11,7 @@ internal static class HtmlSignature
     private sealed record Style(bool Bold = false, bool Italic = false, bool Underline = false,
         bool Strike = false, Color? Color = null, int? HalfPoints = null, string? Link = null);
 
-    public static string? ToRtf(string html, Func<string, byte[]?>? getPreviewImage = null,
-        bool includeImages = true)
+    public static string? ToRtf(string html)
     {
         using var reader = new StringReader(html);
         var tokenizer = new HtmlTokenizer(reader) { DecodeCharacterReferences = true };
@@ -73,7 +72,7 @@ internal static class HtmlSignature
             }
             if (name == "img")
             {
-                string? picture = includeImages ? ReadEmbeddedPicture(tag, style, getPreviewImage) : null;
+                string? picture = ReadEmbeddedPicture(tag, style);
                 if (picture is not null)
                 {
                     if (picture.Length > 0)
@@ -219,7 +218,7 @@ internal static class HtmlSignature
         return null;
     }
 
-    private static string? ReadEmbeddedPicture(HtmlTagToken tag, Style style, Func<string, byte[]?>? getPreviewImage)
+    private static string? ReadEmbeddedPicture(HtmlTagToken tag, Style style)
     {
         if (Attribute(tag, "src") is not { } source)
             return null;
@@ -228,15 +227,11 @@ internal static class HtmlSignature
             return "";
         try
         {
-            byte[]? bytes = getPreviewImage?.Invoke(source);
-            if (bytes is null)
-            {
-                int comma = source.IndexOf(',');
-                if (comma < 0 || source[..comma].ToLowerInvariant() is not
-                    ("data:image/png;base64" or "data:image/jpeg;base64" or "data:image/gif;base64"))
-                    return null;
-                bytes = Convert.FromBase64String(source[(comma + 1)..]);
-            }
+            int comma = source.IndexOf(',');
+            if (comma < 0 || source[..comma].ToLowerInvariant() is not
+                ("data:image/png;base64" or "data:image/jpeg;base64" or "data:image/gif;base64"))
+                return null;
+            byte[] bytes = Convert.FromBase64String(source[(comma + 1)..]);
             using var data = new MemoryStream(bytes, writable: false);
             using var image = Image.FromStream(data);
             double aspectRatio = (double)image.Width / image.Height;

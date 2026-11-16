@@ -853,7 +853,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         }
     }
 
-    internal static MimeMessage CreateOutgoingMessage(OutgoingMail mail, string messageId, bool draft = false)
+    private static MimeMessage CreateOutgoingMessage(OutgoingMail mail, string messageId, bool draft = false)
     {
         var message = new MimeMessage
         {

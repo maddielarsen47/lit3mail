@@ -52,7 +52,7 @@ internal sealed class HtmlMailPreview : WebView2
     }
     private ContextMenuStrip? imageMenu;
 
-    public byte[]? GetQuoteImage(string source) =>
+    private byte[]? GetQuoteImage(string source) =>
         inlineResources.GetValueOrDefault(source)?.Bytes ?? GetDownloadedImage(source)?.Bytes;
 
     public InlineMailImage? GetInlineQuoteImage(string source)

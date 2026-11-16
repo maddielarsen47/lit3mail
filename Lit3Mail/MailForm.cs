@@ -163,11 +163,6 @@ public partial class MailForm : Form, IMessageFilter
         Text = "·", AutoSize = true, Anchor = AnchorStyles.None,
         Margin = new Padding(6, 0, 6, 0), Visible = false
     };
-    private readonly PictureBox inlineImage = new()
-    {
-        Dock = DockStyle.Bottom, Height = 64, SizeMode = PictureBoxSizeMode.CenterImage,
-        Visible = false, AccessibleName = "Sample newsletter image"
-    };
     private Guid? imagePermission;
     private readonly Label composeStatus = new() { AutoSize = true, Margin = new Padding(8, 7, 0, 0) };
     private readonly Label settingsHeading = new() { Text = "Settings", Dock = DockStyle.Top, Height = 44 };
@@ -244,15 +239,10 @@ public partial class MailForm : Form, IMessageFilter
     private Color selectedText;
     private const string DateFormat = "dd MMM yyyy h:mm tt";
 
-    public MailForm() : this(null, LocalDatabase.ForCurrentUser(), rememberWindowLayout: true) { }
-
-    internal MailForm(IMailbox? mailbox, LocalDatabase? database = null, bool rememberWindowLayout = false)
+    public MailForm()
     {
-        this.database = database;
-        if (database is not null)
-            LoadAccountSettings(database);
-        else
-            accounts.Add(new MailAccount("Your Name", "me@example.com", mailbox));
+        database = LocalDatabase.ForCurrentUser();
+        LoadAccountSettings(database);
 
         bool firstRun = accounts.Count == 0;
         if (firstRun)
@@ -291,7 +281,6 @@ public partial class MailForm : Form, IMessageFilter
             refreshFont.Dispose();
             unreadFont.Dispose();
             flagIconFont.Dispose();
-            inlineImage.Image?.Dispose();
             mailboxLifetime.Cancel();
             mailboxLifetime.Dispose();
         };
@@ -333,7 +322,6 @@ public partial class MailForm : Form, IMessageFilter
         mailPane.Panel1.Controls.Add(searchStatus);
         mailPane.Panel1.Controls.Add(searchBar);
         preview.Controls.Add(previewBody);
-        preview.Controls.Add(inlineImage);
         InitializeAttachmentControls();
         preview.Controls.Add(previewAttachmentPanel);
         var previewActions = new FlowLayoutPanel
@@ -352,14 +340,11 @@ public partial class MailForm : Form, IMessageFilter
         previewActions.Controls.Add(showImages);
         showImages.Click += (_, _) =>
         {
-            if (SelectedMessage is not { } mail || previewContent is not { } content)
+            if (SelectedMessage is not { } mail || previewContent is not { Html.Length: > 0 } content)
                 return;
 
             imagePermission = mail.Id;
-            if (!string.IsNullOrEmpty(content.Html))
-                _ = DisplayHtmlBodyAsync(content, previewRequest, showRemoteImages: true);
-            else if (content.HasInlineImage)
-                inlineImage.Image ??= SystemIcons.Information.ToBitmap();
+            _ = DisplayHtmlBodyAsync(content, previewRequest, showRemoteImages: true);
             UpdateImagePreview(mail);
         };
         var previewHeader = new TableLayoutPanel
@@ -1389,8 +1374,7 @@ public partial class MailForm : Form, IMessageFilter
                 e.Cancel = choice != DialogResult.Yes;
             }
         };
-        if (rememberWindowLayout)
-            InitializeWindowLayout(layout);
+        InitializeWindowLayout(layout);
         InitializeUnreadBadge();
         InitializeAutoRefresh();
         InitializeMessageMove();
@@ -3195,10 +3179,8 @@ public partial class MailForm : Form, IMessageFilter
         if (imagePermission != mail?.Id)
             imagePermission = null;
 
-        bool containsImages = mail is not null && previewContent?.HasInlineImage == true;
-        inlineImage.Visible = containsImages && imagePermission is not null;
         bool hasHtml = mail is not null && previewContent?.Html is { Length: > 0 };
-        imageActionSeparator.Visible = showImages.Visible = (containsImages || hasHtml) && imagePermission is null;
+        imageActionSeparator.Visible = showImages.Visible = hasHtml && imagePermission is null;
     }
 }
 
