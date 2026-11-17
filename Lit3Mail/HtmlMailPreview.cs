@@ -50,7 +50,7 @@ internal sealed class HtmlMailPreview : WebView2
         }
         catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException) { }
     }
-    private ContextMenuStrip? imageMenu;
+    private ContextMenuStrip? previewMenu;
 
     private byte[]? GetQuoteImage(string source) =>
         inlineResources.GetValueOrDefault(source)?.Bytes ?? GetDownloadedImage(source)?.Bytes;
@@ -70,7 +70,7 @@ internal sealed class HtmlMailPreview : WebView2
     public void ClearDisplay()
     {
         ++displayVersion;
-        imageMenu?.Close();
+        previewMenu?.Close();
         allowRemoteImages = false;
         allowInlineImages = false;
         quoteImages.Clear();
@@ -171,23 +171,25 @@ internal sealed class HtmlMailPreview : WebView2
         core.WebMessageReceived += (_, e) =>
         {
             if (e.Source != core.Source || !Uri.TryCreate(e.Source, UriKind.Absolute, out var page) ||
-                page.Host != PreviewHost || !allowRemoteImages)
+                page.Host != PreviewHost)
                 return;
 
             if (JsonSerializer.Deserialize<string>(e.WebMessageAsJson) is not { } message)
                 return;
 
             int version = displayVersion;
-            const string menuPrefix = "image-menu:";
-            if (message == "dismiss-image-menu")
-                BeginInvoke(() => imageMenu?.Close());
+            const string menuPrefix = "preview-menu:";
+            if (message == "dismiss-preview-menu")
+                BeginInvoke(() => previewMenu?.Close());
             else if (message.StartsWith(menuPrefix, StringComparison.Ordinal))
             {
-                string source = message[menuPrefix.Length..];
-                Point location = Cursor.Position;
-                BeginInvoke(() => ShowImageMenu(source, version, location));
+                if (JsonSerializer.Deserialize<string?[]>(message[menuPrefix.Length..]) is [var selection, var source])
+                {
+                    Point location = Cursor.Position;
+                    BeginInvoke(() => ShowPreviewMenu(selection, source, version, location));
+                }
             }
-            else
+            else if (allowRemoteImages)
                 UseImage(message, version, save: false);
         };
         settings.AreDevToolsEnabled = false;
@@ -225,14 +227,14 @@ internal sealed class HtmlMailPreview : WebView2
                     });
                     document.addEventListener('pointerdown', event => {
                         if (event.button === 0)
-                            chrome.webview.postMessage('dismiss-image-menu');
+                            chrome.webview.postMessage('dismiss-preview-menu');
                     }, true);
                     document.addEventListener('contextmenu', event => {
+                        event.preventDefault();
                         const image = event.target.closest?.('img');
-                        if (image?.naturalWidth) {
-                            event.preventDefault();
-                            chrome.webview.postMessage('image-menu:' + image.currentSrc);
-                        }
+                        const selection = getSelection()?.toString() ?? '';
+                        const source = image?.naturalWidth ? image.currentSrc : null;
+                        chrome.webview.postMessage('preview-menu:' + JSON.stringify([selection, source]));
                     }, true);
                     document.addEventListener('click', event => {
                         const image = event.target.closest?.('img');
@@ -346,18 +348,32 @@ internal sealed class HtmlMailPreview : WebView2
         });
     }
 
-    private void ShowImageMenu(string source, int version, Point location)
+    private void ShowPreviewMenu(string? selection, string? source, int version, Point location)
     {
-        if (IsDisposed || !allowRemoteImages || version != displayVersion)
+        if (IsDisposed || version != displayVersion)
             return;
 
-        imageMenu?.Close();
-        var menu = imageMenu = new ContextMenuStrip();
-        menu.Items.Add("Copy image", null, (_, _) => BeginInvoke(() => UseImage(source, version, save: false)));
-        menu.Items.Add("Save image as...", null, (_, _) => BeginInvoke(() => UseImage(source, version, save: true)));
+        previewMenu?.Close();
+        var menu = previewMenu = new ContextMenuStrip();
+        menu.Items.Add("Copy", null, (_, _) =>
+        {
+            if (version == displayVersion && !string.IsNullOrEmpty(selection))
+            {
+                try { Clipboard.SetText(selection); }
+                catch (System.Runtime.InteropServices.ExternalException)
+                {
+                    ThemedPopup.Show(FindForm(), "Could not copy the selected text.", "Lit3Mail");
+                }
+            }
+        }).Enabled = !string.IsNullOrEmpty(selection);
+        if (allowRemoteImages && source is not null)
+        {
+            menu.Items.Add("Copy image", null, (_, _) => BeginInvoke(() => UseImage(source, version, save: false)));
+            menu.Items.Add("Save image as...", null, (_, _) => BeginInvoke(() => UseImage(source, version, save: true)));
+        }
         menu.Closed += (_, _) =>
         {
-            imageMenu = null;
+            previewMenu = null;
             BeginInvoke(() => menu.Dispose());
         };
         menu.Show(this, PointToClient(location));

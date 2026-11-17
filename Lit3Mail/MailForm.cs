@@ -265,6 +265,11 @@ public partial class MailForm : Form, IMessageFilter
         hints.SetToolTip(clearSearch, "Clear search");
         mailPane.Panel1.Controls.Add(searchStatus);
         mailPane.Panel1.Controls.Add(searchBar);
+        var previewMenu = new ContextMenuStrip();
+        var copyPreview = previewMenu.Items.Add("Copy", null, (_, _) => previewBody.Copy());
+        previewMenu.Opening += (_, _) => copyPreview.Enabled = previewBody.SelectionLength > 0;
+        previewBody.ContextMenuStrip = previewMenu;
+        previewBody.Disposed += (_, _) => previewMenu.Dispose();
         preview.Controls.Add(previewBody);
         InitializeAttachmentControls();
         preview.Controls.Add(previewAttachmentPanel);
@@ -497,7 +502,7 @@ public partial class MailForm : Form, IMessageFilter
             exact.Checked = IsQuoted(search.Text.Trim());
             clearSearch.Visible = search.TextLength > 0;
             if (!suppressSearchReload)
-                await ShowFolder(SelectedMessage, debounce: search.TextLength > 0);
+                await ShowFolder(SelectedMessage, debounce: search.TextLength > 0, clearingSearch: search.TextLength == 0);
         };
         clearSearch.Click += (_, _) =>
         {
@@ -512,7 +517,7 @@ public partial class MailForm : Form, IMessageFilter
             search.SelectionStart = search.TextLength;
         };
         checkMail.Click += async (_, _) =>
-            await ShowFolder(SelectedMessage, refreshCounts: true, showRefreshStatus: true);
+            await RefreshMailAsync(fullRefresh: true, manual: true);
         folders.DrawItem += DrawFolder;
         folders.ClientSizeChanged += (_, _) => folders.Invalidate();
         InitializeStatusBars();
@@ -995,7 +1000,7 @@ public partial class MailForm : Form, IMessageFilter
 
     private async Task ShowFolder(MailSummary? selected = null, bool debounce = false,
         bool refreshCounts = false, bool showRefreshStatus = false, bool backgroundRefresh = false,
-        Action? onListDisplayed = null)
+        bool clearingSearch = false, bool prioritizeCurrentFolder = false)
     {
         if (SelectedFolder is not { Folder: { } folder } entry || IsDisposed)
             return;
@@ -1012,6 +1017,7 @@ public partial class MailForm : Form, IMessageFilter
         searchStatus.Hide();
         bool receivedBatch = false;
         bool seededSearch = false;
+        bool mergedFirstBatch = false;
         Task cachedSearch = Task.CompletedTask;
         var publishedIds = new HashSet<Guid>();
         try
@@ -1022,12 +1028,12 @@ public partial class MailForm : Form, IMessageFilter
             string query = search.Text;
             bool cacheable = database is not null && mailbox is ServerMailbox && string.IsNullOrWhiteSpace(query);
             string? connectionKey = cacheable ? entry.Account.ConnectionKey() : null;
-            if (connectionKey is not null && (messages.Rows.Count == 0 || debounce))
+            if (connectionKey is not null && (messages.Rows.Count == 0 || debounce || clearingSearch))
             {
                 var cached = ReadCachedFolder(entry, folder, connectionKey);
-                if (cached.Count > 0)
+                if (cached.Count > 0 || clearingSearch)
                 {
-                    SetCachedFolder(true);
+                    SetCachedFolder(cached.Count > 0);
                     RenderFolder(cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
                     _ = ShowPreview();
                 }
@@ -1048,7 +1054,7 @@ public partial class MailForm : Form, IMessageFilter
             var folderMail = mailbox switch
             {
                 ServerMailbox server when !string.IsNullOrWhiteSpace(query) ||
-                    messages.Rows.Count == 0 || showingCachedFolder =>
+                    messages.Rows.Count == 0 || showingCachedFolder || clearingSearch || prioritizeCurrentFolder =>
                     await server.ListAsync(folder, query, token, PublishBatch),
                 null => [],
                 _ => await mailbox.ListAsync(folder, query, token)
@@ -1069,7 +1075,7 @@ public partial class MailForm : Form, IMessageFilter
             if (mailbox is not null && string.IsNullOrWhiteSpace(query) && !IsPendingMoveSource())
                 SetFolderCount(entry.Account, folder, folderMail.Count(mail => !mail.Read), folderMail.Count);
             SetCachedFolder(false);
-            if (receivedBatch && !seededSearch)
+            if (receivedBatch && !seededSearch && !mergedFirstBatch)
                 SortPublishedRows();
             else
                 RenderFolder(folderMail.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
@@ -1081,7 +1087,6 @@ public partial class MailForm : Form, IMessageFilter
                     messages.FirstDisplayedScrollingRowIndex = row.Index;
             }
             loadedUnfilteredFolder = string.IsNullOrWhiteSpace(query) ? entry : null;
-            onListDisplayed?.Invoke();
             var displayed = SelectedMessage;
             bool keepPreview = !seededSearch && current?.Id == displayed?.Id && (receivedBatch || backgroundRefresh && !wasCached);
             var preview = keepPreview ? Task.CompletedTask : ShowPreview();
@@ -1146,7 +1151,7 @@ public partial class MailForm : Form, IMessageFilter
 
         void PublishBatch(IReadOnlyList<MailSummary> batch)
         {
-            if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry)
+            if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry || mergedFirstBatch)
                 return;
             var newRows = batch.Where(mail => IsVisibleDuringMove(mail) && publishedIds.Add(mail.Id))
                 .Select(mail => ApplyFlagOverrides(mail)).ToArray();
@@ -1155,6 +1160,14 @@ public partial class MailForm : Form, IMessageFilter
                 receivedBatch = true;
                 if (!seededSearch)
                 {
+                    if (prioritizeCurrentFolder && loadedUnfilteredFolder == entry &&
+                        string.IsNullOrWhiteSpace(search.Text) && messages.Rows.Count > 0)
+                    {
+                        mergedFirstBatch = true;
+                        var existing = messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!);
+                        RenderFolder(newRows.Concat(existing).DistinctBy(mail => mail.Id).ToArray(), SelectedMessage);
+                        return;
+                    }
                     SetCachedFolder(false);
                     RenderFolder(newRows, selected);
                     _ = ShowPreview();

@@ -30,7 +30,7 @@ internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImag
     };
 
     public static ComposeHtmlQuote Create(string header, MailContent original,
-        Func<string, InlineMailImage?>? approvedImage)
+        bool includeImages, Func<string, InlineMailImage?>? approvedImage = null)
     {
         var images = new List<InlineMailImage>();
         var html = new StringBuilder();
@@ -76,6 +76,8 @@ internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImag
                     string value = attribute.Value ?? "";
                     if (key == "src" && name == "img")
                     {
+                        if (!includeImages)
+                            continue;
                         var image = images.FirstOrDefault(item => item.ContentLocation == value)
                             ?? FindImage(value, original.InlineImages) ?? ReadDataImage(value) ?? approvedImage?.Invoke(value);
                         if (image is null)
@@ -172,7 +174,7 @@ internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImag
         quoteHtml = Regex.Replace(quoteHtml, Regex.Escape(scopeStart) + "(.*?)" + Regex.Escape(" }</style>"),
             "<style>$1</style>", RegexOptions.Singleline);
         editableBody = draft with { Body = body[..bodySplit], Html = replyHtml };
-        return Create("", draft with { Body = body[(bodySplit + 2)..], Html = quoteHtml }, null);
+        return Create("", draft with { Body = body[(bodySplit + 2)..], Html = quoteHtml }, includeImages: true);
     }
 
     internal static Group? FindQuotedBcc(string body)

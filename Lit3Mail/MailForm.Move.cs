@@ -293,36 +293,27 @@ public partial class MailForm
             }
             ClearPendingIds();
             completion.TrySetResult();
-            if (destination is not null && SelectedFolder == new FolderEntry(entry.Account, destination))
+            if (destination is not null)
             {
-                if (movedMessages.Count > 0 && string.IsNullOrWhiteSpace(search.Text))
+                ShowMoveStatus(completedStatus);
+                var destinationEntry = new FolderEntry(entry.Account, destination);
+                QueueBackgroundCache(destinationEntry);
+                if (SelectedFolder == destinationEntry)
                 {
-                    var existing = messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!);
-                    RenderFolder(existing.Concat(movedMessages).DistinctBy(mail => mail.Id).ToArray(), SelectedMessage);
+                    if (movedMessages.Count > 0 && string.IsNullOrWhiteSpace(search.Text))
+                    {
+                        var existing = messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!);
+                        RenderFolder(existing.Concat(movedMessages).DistinctBy(mail => mail.Id).ToArray(), SelectedMessage);
+                    }
+                    _ = ShowFolder(SelectedMessage, refreshCounts: true, backgroundRefresh: true);
+                    return;
                 }
-                ShowMoveStatus("Refreshing the destination folder...", inProgress: true);
-                bool displayed = false;
-                await ShowFolder(SelectedMessage, refreshCounts: true, backgroundRefresh: true, onListDisplayed: () =>
-                {
-                    displayed = true;
-                    ShowMoveStatus(string.IsNullOrWhiteSpace(search.Text)
-                        ? completedStatus : "Destination refreshed with the current search.");
-                });
-                if (!displayed && !IsDisposed)
-                    ShowMoveStatus("Refresh the destination to see the latest messages.");
             }
+
+            if (finishLoad && SelectedFolder == entry && (folderLoad is null || ReferenceEquals(folderLoad, interruptedLoad)))
+                _ = ShowFolder(SelectedMessage, refreshCounts: true);
             else
-            {
-                if (destination is not null)
-                {
-                    ShowMoveStatus(completedStatus);
-                    QueueBackgroundCache(new FolderEntry(entry.Account, destination));
-                }
-                if (finishLoad && SelectedFolder == entry && (folderLoad is null || ReferenceEquals(folderLoad, interruptedLoad)))
-                    _ = ShowFolder(SelectedMessage, refreshCounts: true);
-                else
-                    _ = RefreshFolderCounts(entry.Account, mailbox, true, mailboxLifetime.Token);
-            }
+                _ = RefreshFolderCounts(entry.Account, mailbox, true, mailboxLifetime.Token);
         }
         catch (OperationCanceledException) when (mailboxLifetime.IsCancellationRequested) { }
         catch (Exception error) when (!confirmed)

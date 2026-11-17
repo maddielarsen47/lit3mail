@@ -58,7 +58,8 @@ public partial class MailForm
                 return;
 
             SetUnreadBadge(unfocusedSince is not null && accountsWithNewUnread.Count > 0);
-            ShowMailReminders(await reminders);
+            if (unfocusedSince is not null)
+                ShowMailReminders(await reminders);
         }
         finally
         {

@@ -26,14 +26,14 @@ public partial class MailForm
     private MailAccount? ComposeSender => (composeFrom.SelectedItem as SenderOption)?.Account;
     private sealed record ComposeDraft(MailAccount? Sender, string To, string Cc, string Bcc, string ReplyTo,
         bool UsesDefaultReplyTo, string Subject, string BodyRtf, ComposeSignatureRange Signature,
-        IReadOnlyList<MailFileAttachment> Files, bool HasContent = false, ComposeHtmlQuote? HtmlQuote = null,
+        IReadOnlyList<MailFileAttachment> Files, ComposeHtmlQuote? HtmlQuote = null,
         ResponseOrigin? Response = null);
     private sealed record EditingDraft(MailAccount Account, IMailbox Mailbox, Guid Id);
     private readonly MailBodyEditor composeBody = new()
     {
         AccessibleName = "Message", Dock = DockStyle.Fill, Multiline = true, AcceptsTab = false,
         ScrollBars = RichTextBoxScrollBars.Vertical, HideSelection = false, DetectUrls = false,
-        ForeColor = Color.Black, BackColor = Color.White, BulletIndent = 16
+        Font = new Font("Segoe UI", 12), ForeColor = Color.Black, BackColor = Color.White, BulletIndent = 16
     };
     private readonly FlowLayoutPanel composeFormatting = new()
     {
@@ -74,10 +74,8 @@ public partial class MailForm
 
     private sealed class ComposeSession
     {
-        public ComposeDraft? PreviousDraft;
         public ComposeDraft? Baseline;
         public ResponseOrigin? Response;
-        public MailAccount? Account;
         public EditingDraft? EditingServerDraft;
         public Guid? EditingLocalDraft;
         public (Guid SenderId, Guid DraftId, string ConnectionKey)? LocalDraftServerLink;
@@ -94,7 +92,6 @@ public partial class MailForm
     }
 
     private readonly ComposeSession composeSession = new();
-    private readonly Dictionary<MailAccount, ComposeDraft> accountDrafts = new();
 
     private void InitializeCompose(Font headingFont, ToolTip hints)
     {
@@ -183,7 +180,7 @@ public partial class MailForm
         saveDraft.Enabled = database is not null || sendMail.Enabled;
         mailLayout.Hide();
         composeAddressDetails.Checked = false;
-        if (resetBaseline && composeSession.PreviousDraft is not null)
+        if (resetBaseline)
             composeSession.Baseline = CaptureDraft();
         composePage.Show();
         DisplayComposeQuote();
@@ -193,22 +190,15 @@ public partial class MailForm
 
     private ComposeDraft CaptureDraft()
     {
-        string body = composeBody.Text;
-        int start = Math.Clamp(composeSession.Signature.Start, 0, body.Length);
-        int end = Math.Clamp(composeSession.Signature.End, start, body.Length);
-        bool hasContent = !string.IsNullOrWhiteSpace(composeTo.Text) ||
-            !string.IsNullOrWhiteSpace(composeCc.Text) || !string.IsNullOrWhiteSpace(composeBcc.Text) ||
-            !string.IsNullOrWhiteSpace(composeSubject.Text) || !composeSession.UsesDefaultReplyTo ||
-            !body.AsSpan(0, start).IsWhiteSpace() || !body.AsSpan(end).IsWhiteSpace() || composeFiles.Count > 0;
         return new(ComposeSender, composeTo.Text, composeCc.Text, composeBcc.Text, composeReplyTo.Text,
             composeSession.UsesDefaultReplyTo, composeSubject.Text, composeBody.Rtf ?? "", composeSession.Signature, composeFiles.ToArray(),
-            hasContent || composeSession.HtmlQuote is not null, composeSession.HtmlQuote, composeSession.Response);
+            composeSession.HtmlQuote, composeSession.Response);
     }
 
     private static bool SameDraft(ComposeDraft draft, ComposeDraft baseline) =>
         (draft with { Files = baseline.Files }) == baseline && draft.Files.SequenceEqual(baseline.Files);
 
-    private bool HasUnsavedTransientDraft() =>
+    private bool HasUnsavedDrafts() =>
         composeSession.Baseline is { } baseline && !SameDraft(CaptureDraft(), baseline);
 
     private bool ConfirmDiscardDrafts() => ThemedPopup.Show(this,
@@ -217,7 +207,7 @@ public partial class MailForm
 
     private void RestoreDraft(ComposeDraft draft)
     {
-        PopulateSenders(draft.Sender ?? composeSession.Account);
+        PopulateSenders(draft.Sender ?? SelectedFolder?.Account);
         (composeTo.Text, composeCc.Text, composeBcc.Text, composeSubject.Text) =
             (draft.To, draft.Cc, draft.Bcc, draft.Subject);
         SetComposeAttachments(draft.Files);
@@ -255,11 +245,6 @@ public partial class MailForm
         composeSession.EditingServerDraft = null;
         composeSession.EditingLocalDraft = null;
         composeSession.LocalDraftServerLink = null;
-        if (composeSession.PreviousDraft is { } draft)
-        {
-            RestoreDraft(draft);
-            composeSession.PreviousDraft = null;
-        }
         if (!settingsPage.Visible)
         {
             mailLayout.Show();
@@ -313,7 +298,7 @@ public partial class MailForm
         {
             composeSession.HtmlQuote = quoteHeader is not null && quotedMessage?.Html is { Length: > 0 }
                 ? ComposeHtmlQuote.Create(quoteHeader, quotedMessage,
-                    includeQuotedImages ? source => htmlPreview?.GetInlineQuoteImage(source) : null)
+                    includeQuotedImages, includeQuotedImages ? source => htmlPreview?.GetInlineQuoteImage(source) : null)
                 : null;
             composeBody.SetPlainText(quoteHeader is null || composeSession.HtmlQuote is not null ? "" : "\r\n\r\n" + quoteHeader);
             if (quotedMessage is not null && composeSession.HtmlQuote is null)
@@ -334,14 +319,6 @@ public partial class MailForm
 
     private void FinishCompose()
     {
-        if (composeSession.PreviousDraft is null)
-        {
-            if (composeSession.Account is not null)
-            {
-                accountDrafts.Remove(composeSession.Account);
-            }
-            composeSession.Account = null;
-        }
         composeTo.Clear();
         composeCc.Clear();
         composeBcc.Clear();
@@ -399,7 +376,6 @@ public partial class MailForm
             previewContent is not { } content)
             return;
 
-        composeSession.PreviousDraft = CaptureDraft();
         (composeTo.Text, composeCc.Text) = includeOtherRecipients
             ? ReplyRecipients.ReplyAll(mail, accounts.Select(account => account.Email))
             : (isReply ? ReplyRecipients.ReplyTarget(mail) : "", "");
@@ -437,7 +413,7 @@ public partial class MailForm
 
     private void LeaveCompose()
     {
-        if (composePage.Enabled && (!HasUnsavedTransientDraft() || ConfirmDiscardDrafts()))
+        if (composePage.Enabled && (!HasUnsavedDrafts() || ConfirmDiscardDrafts()))
             CloseCompose();
     }
 
@@ -491,12 +467,12 @@ public partial class MailForm
         composePage.Hide();
         composeQuotePreview?.ClearDisplay();
         mailLayout.Show();
-        bool hadSearch = search.TextLength > 0;
-        suppressSearchReload = true;
-        search.Clear();
-        suppressSearchReload = false;
         if (target is { Folder: { } folder })
         {
+            bool hadSearch = search.TextLength > 0;
+            suppressSearchReload = true;
+            search.Clear();
+            suppressSearchReload = false;
             if (SelectedFolder != target)
                 SelectFolder(target.Account, folder);
             else if (hadSearch)
@@ -559,7 +535,7 @@ public partial class MailForm
         var sourceDraft = composeSession.EditingServerDraft;
         var originalMessage = composeSession.Response;
         var sentFolder = new FolderEntry(sender, "Sent");
-        BeginComposeOperation(sentFolder, SendingMailStatus);
+        BeginComposeOperation(null, SendingMailStatus);
         await Task.Yield();
 
         try
@@ -642,32 +618,8 @@ public partial class MailForm
     {
         if (composeSession.OperationPending || SelectedFolder is not { } entry)
             return;
-        if (composeSession.Account != entry.Account)
-        {
-            if (composeSession.Account is not null)
-                accountDrafts[composeSession.Account] = CaptureDraft();
-            composeSession.Account = entry.Account;
-            if (accountDrafts.TryGetValue(composeSession.Account, out var draft))
-                RestoreDraft(draft);
-            else
-            {
-                (composeTo.Text, composeCc.Text, composeBcc.Text, composeSubject.Text) = ("", "", "", "");
-                SetComposeBody(composeSession.Account);
-            }
-
-        }
-        else
-        {
-            var previousSender = ComposeSender;
-            PopulateSenders(previousSender ?? entry.Account);
-            if (ComposeSender is { } sender)
-            {
-                if (!ReferenceEquals(sender, previousSender))
-                    ReplaceSignature(sender);
-                if (composeSession.UsesDefaultReplyTo)
-                    SetReplyTo(DefaultReplyTo(sender));
-            }
-        }
+        (composeTo.Text, composeCc.Text, composeBcc.Text, composeSubject.Text) = ("", "", "", "");
+        SetComposeBody(entry.Account);
         OpenCompose(composeTo);
     }
 
@@ -691,7 +643,6 @@ public partial class MailForm
             }
             var sender = accounts.FirstOrDefault(account => account.Id == draft.SenderId);
             var editor = draft.Editor;
-            composeSession.PreviousDraft = CaptureDraft();
             RestoreDraft(new ComposeDraft(sender, editor.To, editor.Cc, editor.Bcc, editor.ReplyTo,
                 editor.UsesDefaultReplyTo, editor.Subject, editor.BodyRtf, editor.Signature, draft.Files,
                 HtmlQuote: editor.HtmlQuote, Response: editor.Response));
@@ -735,7 +686,6 @@ public partial class MailForm
                 settingsPage.Visible || composePage.Visible || composeSession.OperationPending)
                 return;
 
-            composeSession.PreviousDraft = CaptureDraft();
             if (local is not null)
                 RestoreDraft(new ComposeDraft(folder.Account, local.To, local.Cc, local.Bcc, local.ReplyTo,
                     local.UsesDefaultReplyTo, local.Subject, local.BodyRtf, local.Signature,
@@ -849,11 +799,6 @@ public partial class MailForm
             }
         }
     }
-
-    private bool HasUnsavedDrafts() =>
-        HasUnsavedTransientDraft() ||
-        (composeSession.Account is not null && (composeSession.PreviousDraft ?? CaptureDraft()).HasContent) ||
-        accountDrafts.Any(pair => pair.Key != composeSession.Account && pair.Value.HasContent);
 
     private void InitializeComposePage(Font headingFont, ToolTip hints)
     {

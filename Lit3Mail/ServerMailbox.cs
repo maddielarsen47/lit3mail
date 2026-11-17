@@ -166,7 +166,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     internal sealed record InboxArrivalPreview(DateTimeOffset ArrivalTime, string? Subject, string? Text);
 
     public async Task<(InboxPosition? Position, int Arrivals, InboxArrivalPreview? Preview)> CheckInboxArrivalsAsync(
-        InboxPosition? previous, CancellationToken token)
+        InboxPosition? previous, DateTimeOffset? notifyAfter, CancellationToken token)
     {
         using var client = new ImapClient();
         await ConnectAsync(client, incoming, token);
@@ -177,21 +177,23 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             return (previous, 0, null);
 
         var current = new InboxPosition(inbox.UidValidity, next.Id, checkedAt);
-        if (previous is not { } old || old.Validity != current.Validity || old.NextUid >= current.NextUid)
+        if (notifyAfter is not { } since || previous is not { } old ||
+            old.Validity != current.Validity || old.NextUid >= current.NextUid)
             return (current, 0, null);
 
         await inbox.OpenAsync(FolderAccess.ReadOnly, token);
         if (inbox.UidValidity != current.Validity)
             return (null, 0, null);
         var range = new UniqueIdRange(new UniqueId(old.NextUid), new UniqueId(current.NextUid - 1));
+        var earliestArrival = since > old.CheckedAt ? since : old.CheckedAt;
         var candidates = await inbox.SearchAsync(SearchQuery.Uids(range).And(SearchQuery.NotDraft)
-            .And(SearchQuery.DeliveredAfter(old.CheckedAt.UtcDateTime.Date.AddDays(-1))), token);
+            .And(SearchQuery.DeliveredAfter(earliestArrival.UtcDateTime.Date.AddDays(-1))), token);
         var arrivals = new List<UniqueId>();
         foreach (var batch in candidates.Chunk(100))
         {
             var summaries = await inbox.FetchAsync(batch, MessageSummaryItems.UniqueId | MessageSummaryItems.InternalDate, token);
             // A move can assign a new UID while retaining the original delivery time.
-            arrivals.AddRange(summaries.Where(item => item.InternalDate >= old.CheckedAt).Select(item => item.UniqueId));
+            arrivals.AddRange(summaries.Where(item => item.InternalDate >= earliestArrival).Select(item => item.UniqueId));
         }
         var preview = arrivals.Count == 0 ? null : await ReadArrivalPreviewAsync(inbox, arrivals.Max(), token);
         return (current, arrivals.Count, preview);
@@ -212,8 +214,10 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 return null;
 
             string? text = await ReadSnippetAsync(summary.TextBody);
+            if (text?.Contains('<') == true)
+                text = ReadHtmlAsText(text, stripNonVisibleContent: true);
             if (string.IsNullOrWhiteSpace(text) && await ReadSnippetAsync(summary.HtmlBody) is { } html)
-                text = ReadHtmlAsText(html);
+                text = ReadHtmlAsText(html, stripNonVisibleContent: true);
             return new(summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, text);
         }
         catch (Exception error) when (error is IOException or CommandException or ProtocolException or
@@ -708,13 +712,27 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         _ => ContentEncoding.Default
     };
 
-    private static string ReadHtmlAsText(string html)
+    private static string ReadHtmlAsText(string html, bool stripNonVisibleContent = false)
     {
         using var reader = new StringReader(html);
         var tokenizer = new HtmlTokenizer(reader);
         var text = new System.Text.StringBuilder();
+        string? hiddenTag = null;
         while (tokenizer.ReadNextToken(out var part))
         {
+            if (hiddenTag is not null)
+            {
+                if (part is HtmlTagToken { IsEndTag: true } close &&
+                    hiddenTag.Equals(close.Name, StringComparison.OrdinalIgnoreCase))
+                    hiddenTag = null;
+                continue;
+            }
+            if (stripNonVisibleContent && part is HtmlTagToken { IsEndTag: false, IsEmptyElement: false } open &&
+                open.Name.ToLowerInvariant() is "head" or "style" or "script" or "title" or "template")
+            {
+                hiddenTag = open.Name;
+                continue;
+            }
             if (part is HtmlDataToken data && part.Kind == HtmlTokenKind.Data)
                 text.Append(data.Data);
             else if (part is HtmlTagToken { Id: HtmlTagId.Br or HtmlTagId.P or HtmlTagId.Div })

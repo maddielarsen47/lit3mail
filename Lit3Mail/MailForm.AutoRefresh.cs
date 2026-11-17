@@ -16,30 +16,39 @@ public partial class MailForm
                 return;
             if (fullRefresh)
                 minutesUntilFullRefresh = 10;
-            await RefreshAutomaticallyAsync(fullRefresh);
+            await RefreshMailAsync(fullRefresh);
         };
         Shown += (_, _) => timer.Start();
     }
 
-    private async Task RefreshAutomaticallyAsync(bool fullRefresh)
+    private async Task RefreshMailAsync(bool fullRefresh, bool manual = false)
     {
-        if (refreshingAutomatically || updatingMessageFolders || exportCancellation is not null || IsDisposed || Disposing ||
+        if ((!manual && (refreshingAutomatically || updatingMessageFolders || exportCancellation is not null)) ||
+            IsDisposed || Disposing ||
             !accounts.Any(account => account.Mailbox is not null))
             return;
 
-        refreshingAutomatically = true;
-        var activity = fullRefresh ? BeginBatchActivity(CheckingForMailStatus) : null;
+        if (!manual)
+            refreshingAutomatically = true;
+        var activity = fullRefresh && !manual ? BeginBatchActivity(CheckingForMailStatus) : null;
         var token = mailboxLifetime.Token;
         try
         {
             var current = SelectedFolder;
-            bool refreshList = current?.Account.Mailbox is not null && folderLoad is null &&
+            bool refreshList = current?.Account.Mailbox is not null && (manual || folderLoad is null) &&
                 !composePage.Visible && !settingsPage.Visible;
             var activeInbox = refreshList && current?.Folder == "Inbox" && string.IsNullOrWhiteSpace(search.Text)
                 ? current.Account : null;
+            bool reloadCurrent = refreshList && (fullRefresh || activeInbox is not null);
+            if (reloadCurrent)
+                await ShowFolder(SelectedMessage, refreshCounts: fullRefresh, showRefreshStatus: manual,
+                    backgroundRefresh: !manual, prioritizeCurrentFolder: true);
+
+            if (token.IsCancellationRequested || IsDisposed)
+                return;
+            if (unfocusedSince is null)
+                _ = CheckMailIndicatorsAsync();
             QueueInboxRefresh(activeInbox);
-            if (refreshList && (fullRefresh || activeInbox is not null))
-                await ShowFolder(SelectedMessage, refreshCounts: fullRefresh, backgroundRefresh: true);
 
             if (!fullRefresh)
             {
@@ -52,13 +61,14 @@ public partial class MailForm
             {
                 if (token.IsCancellationRequested)
                     return;
-                if (!refreshList || account != current?.Account)
+                if (!reloadCurrent || account != current?.Account)
                     await RefreshFolderCounts(account, account.Mailbox, true, token);
             }
         }
         finally
         {
-            refreshingAutomatically = false;
+            if (!manual)
+                refreshingAutomatically = false;
             if (activity is not null)
                 EndBatchActivity(activity);
         }

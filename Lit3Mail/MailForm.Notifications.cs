@@ -110,13 +110,14 @@ public partial class MailForm
                 notificationCursors.Remove(account);
 
         var checks = new List<Task<NotificationCheck>>();
+        var notifyAfter = unfocusedSince;
         foreach (var account in accounts)
         {
             if (!account.DesktopNotifications || account.Mailbox is not ServerMailbox mailbox)
                 continue;
             if (!notificationCursors.TryGetValue(account, out var cursor))
                 notificationCursors.Add(account, cursor = new(mailbox));
-            checks.Add(CheckAccountAsync(account, cursor, mailboxLifetime.Token));
+            checks.Add(CheckAccountAsync(account, cursor, notifyAfter, mailboxLifetime.Token));
         }
 
         return await Task.WhenAll(checks);
@@ -179,14 +180,15 @@ public partial class MailForm
         ReferenceEquals(notificationCursors.GetValueOrDefault(account), cursor);
 
     private async Task<NotificationCheck> CheckAccountAsync(
-        MailAccount account, InboxNotificationCursor cursor, CancellationToken token)
+        MailAccount account, InboxNotificationCursor cursor, DateTimeOffset? notifyAfter, CancellationToken token)
     {
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
         timeout.CancelAfter(TimeSpan.FromSeconds(8));
         try
         {
-            var (position, arrivals, preview) = await cursor.Mailbox.CheckInboxArrivalsAsync(cursor.Position, timeout.Token);
-            if (!timeout.IsCancellationRequested && !IsDisposed && IsCurrent(account, cursor))
+            var (position, arrivals, preview) = await cursor.Mailbox.CheckInboxArrivalsAsync(cursor.Position, notifyAfter, timeout.Token);
+            if (!timeout.IsCancellationRequested && !IsDisposed && IsCurrent(account, cursor) &&
+                (notifyAfter is not null || unfocusedSince is null))
             {
                 cursor.Position = position;
                 return new(account, cursor, arrivals, preview);
