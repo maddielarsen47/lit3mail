@@ -106,7 +106,12 @@ public partial class MailForm : Form, IMessageFilter
         Margin = new Padding(6, 0, 6, 0), Visible = false
     };
     private const string AutomaticRemoteContentLabel = "Images & Remote Content";
-    private readonly CheckBox automaticRemoteContent = new()
+    private sealed class RemoteContentToggle : CheckBox
+    {
+        public RemoteContentToggle() => SetStyle(ControlStyles.ResizeRedraw, true);
+    }
+
+    private readonly RemoteContentToggle automaticRemoteContent = new()
     {
         AccessibleName = AutomaticRemoteContentLabel, Appearance = Appearance.Button,
         Checked = true, Dock = DockStyle.Bottom, FlatStyle = FlatStyle.Flat,
@@ -1960,10 +1965,12 @@ public partial class MailForm : Form, IMessageFilter
         }
 
         automaticRemoteContent.Paint += PaintButton;
-        automaticRemoteContent.SizeChanged += (_, _) => FitRemoteContentToggle();
+        sidebar.ClientSizeChanged += (_, _) => FitRemoteContentToggle();
+        automaticRemoteContent.LocationChanged += (_, _) => automaticRemoteContent.Invalidate();
         automaticRemoteContent.FontChanged += (_, _) => FitRemoteContentToggle();
         automaticRemoteContent.TextChanged += (_, _) => FitRemoteContentToggle();
         UpdateRemoteContentToggleAppearance();
+        FitRemoteContentToggle();
         automaticRemoteContent.CheckedChanged += async (_, _) =>
         {
             bool enabled = automaticRemoteContent.Checked;
@@ -2003,7 +2010,7 @@ public partial class MailForm : Form, IMessageFilter
     }
     private void FitRemoteContentToggle()
     {
-        int textWidth = Math.Max(1, automaticRemoteContent.ClientSize.Width - 12);
+        int textWidth = Math.Max(1, sidebar.DisplayRectangle.Width - 12);
         int textHeight = TextRenderer.MeasureText(automaticRemoteContent.Text, automaticRemoteContent.Font,
             new Size(textWidth, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix).Height;
         int height = Math.Max(exportMail.Height, textHeight + LogicalToDeviceUnits(10));
