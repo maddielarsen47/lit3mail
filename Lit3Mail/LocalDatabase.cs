@@ -34,7 +34,7 @@ internal sealed class LocalDatabase(string path)
     internal const int FolderCacheLimit = 1000;
     private const int MaxCachedBodyPartBytes = 4 * 1024 * 1024;
     private const int MaxOpenedPreviewCacheBytes = 128 * 1024 * 1024;
-    private const int SchemaVersion = 18;
+    private const int SchemaVersion = 19;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
@@ -375,6 +375,15 @@ internal sealed class LocalDatabase(string path)
             command.ExecuteNonQuery();
         }
 
+        if (version < 19)
+        {
+            command.CommandText = """
+                ALTER TABLE app_preferences ADD COLUMN theme INTEGER NOT NULL DEFAULT 0 CHECK (theme BETWEEN 0 AND 2);
+                PRAGMA user_version = 19;
+                """;
+            command.ExecuteNonQuery();
+        }
+
         command.CommandText = """
             SELECT id, name, email, reply_to, organisation, signature,
                    incoming_host, incoming_port, incoming_user, incoming_starttls,
@@ -396,6 +405,25 @@ internal sealed class LocalDatabase(string path)
         }
         transaction.Commit();
         return accounts;
+    }
+
+    public int LoadTheme()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT theme FROM app_preferences WHERE id = 1";
+        return command.ExecuteScalar() is long value && value is >= 0 and <= 2 ? (int)value : 0;
+    }
+
+    public void SaveTheme(int theme)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(theme);
+        ArgumentOutOfRangeException.ThrowIfGreaterThan(theme, 2);
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE app_preferences SET theme = $theme WHERE id = 1";
+        command.Parameters.AddWithValue("$theme", theme);
+        command.ExecuteNonQuery();
     }
 
     public bool LoadAutomaticRemoteContent()

@@ -1265,8 +1265,7 @@ public partial class MailForm
         {
             composeQuotePreview = new HtmlMailPreview
             {
-                Dock = DockStyle.Fill, Visible = false, AccessibleName = "Original HTML message",
-                UseDarkScrollbars = darkTitleBar
+                Dock = DockStyle.Fill, Visible = false, AccessibleName = "Original HTML message"
             };
             composeQuoteHost.Controls.Add(composeQuotePreview);
             composeQuotePreview.BringToFront();

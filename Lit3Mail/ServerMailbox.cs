@@ -20,7 +20,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
 {
     internal const string GmailLabelPrefix = "gmail-label:";
     private const string ForwardedKeyword = "$Forwarded";
-    private const int MaxPreviewTextBytes = 1024 * 1024;
+    private const int MaxPreviewTextBytes = 4 * 1024 * 1024;
     private const int MaxInlineImageBytes = 5 * 1024 * 1024;
     private const int MaxInlinePreviewBytes = 12 * 1024 * 1024;
     public bool IsGmail => string.Equals(incoming.Host, "imap.gmail.com", StringComparison.OrdinalIgnoreCase);
@@ -511,8 +511,25 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             string shownBody = previewTooLarge ? "This message body is too large to preview." : body;
             html = $"<div style=\"white-space:pre-wrap\">{System.Net.WebUtility.HtmlEncode(shownBody)}</div>{standaloneImages}";
         }
+        if (string.IsNullOrWhiteSpace(body) && string.IsNullOrWhiteSpace(html) && !previewTooLarge)
+        {
+            var original = await ReadOriginalPreviewAsync(folder, uid, token);
+            return original with { AttachmentList = structure.Attachments };
+        }
         return new(body, Html: html ?? "", InlineImages: inlineImages,
             AttachmentList: structure.Attachments, PreviewTooLarge: previewTooLarge);
+    }
+
+    private static async Task<MailContent> ReadOriginalPreviewAsync(
+        IMailFolder folder, UniqueId uid, CancellationToken token)
+    {
+        // Some servers return an empty body section despite a valid original MIME message.
+        // Bound this fallback download just like individual preview text parts.
+        using var stream = await folder.GetStreamAsync(uid, 0, MaxPreviewTextBytes + 1, token);
+        if (stream.Length > MaxPreviewTextBytes)
+            return new("", PreviewTooLarge: true);
+        using var message = await MimeMessage.LoadAsync(stream, token);
+        return await ReadMessageContentAsync(message, token);
     }
 
     private static async Task<MailContent> ReadMessageContentAsync(MimeMessage message, CancellationToken token)

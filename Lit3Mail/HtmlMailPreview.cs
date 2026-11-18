@@ -10,7 +10,6 @@ namespace Lit3Mail;
 internal sealed class HtmlMailPreview : WebView2
 {
     private const string PreviewHost = "lit3mail-preview.invalid";
-    private const string DarkScrollbarColors = "#7b879a #202939";
     private const int MaxQuoteImageBytes = 32 * 1024 * 1024;
     private readonly SemaphoreSlim navigationGate = new(1);
     private readonly Dictionary<Uri, (byte[] Bytes, string MediaType)> quoteImages = new();
@@ -24,32 +23,17 @@ internal sealed class HtmlMailPreview : WebView2
     private int displayVersion;
     private bool allowRemoteImages;
     private bool allowInlineImages;
-    private bool useDarkScrollbars;
-    [System.ComponentModel.DefaultValue(false)]
-    internal bool UseDarkScrollbars
+    public HtmlMailPreview() => DefaultBackgroundColor = Color.White;
+
+    private static async Task ApplyColorSchemeAsync(CoreWebView2 browser)
     {
-        get => useDarkScrollbars;
-        set
+        browser.Profile.PreferredColorScheme = CoreWebView2PreferredColorScheme.Light;
+        await browser.CallDevToolsProtocolMethodAsync("Emulation.setEmulatedMedia", JsonSerializer.Serialize(new
         {
-            if (useDarkScrollbars == value)
-                return;
-            useDarkScrollbars = value;
-            _ = UpdateScrollbarsAsync();
-        }
+            features = new[] { new { name = "prefers-color-scheme", value = "light" } }
+        }));
     }
 
-    private async Task UpdateScrollbarsAsync()
-    {
-        if (IsDisposed || CoreWebView2 is not { } browser ||
-            !Uri.TryCreate(browser.Source, UriKind.Absolute, out var source) || source.Host != PreviewHost)
-            return;
-        try
-        {
-            string colors = useDarkScrollbars ? DarkScrollbarColors : "auto";
-            await browser.ExecuteScriptAsync($"document.documentElement.style.setProperty('scrollbar-color', '{colors}', 'important')");
-        }
-        catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException) { }
-    }
     private ContextMenuStrip? previewMenu;
 
     private byte[]? GetQuoteImage(string source) =>
@@ -121,7 +105,7 @@ internal sealed class HtmlMailPreview : WebView2
                     return url;
                 }) ?? html;
             }
-            navigationDocument = Encoding.UTF8.GetBytes(BuildDocument(html, useDarkScrollbars, allowRemoteImages));
+            navigationDocument = Encoding.UTF8.GetBytes(BuildDocument(html, allowRemoteImages));
             documentReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
             CoreWebView2.Navigate(navigationTarget);
             bool loaded = await documentReady.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -164,6 +148,7 @@ internal sealed class HtmlMailPreview : WebView2
         options.IsInPrivateModeEnabled = true;
         await EnsureCoreWebView2Async(environment, options);
         var core = CoreWebView2;
+        await ApplyColorSchemeAsync(core);
         var settings = core.Settings;
         settings.IsScriptEnabled = true; // The document CSP blocks sender scripts.
         settings.AreHostObjectsAllowed = false;
@@ -481,16 +466,14 @@ internal sealed class HtmlMailPreview : WebView2
         tag.Attributes.Any(attribute => attribute.Name.Equals("rel", StringComparison.OrdinalIgnoreCase) &&
             string.Equals(attribute.Value?.Trim(), "stylesheet", StringComparison.OrdinalIgnoreCase));
 
-    internal static string BuildDocument(string html, bool darkScrollbars = false, bool allowRemoteContent = false)
+    internal static string BuildDocument(string html, bool allowRemoteContent = false)
     {
         using var writer = new StringWriter();
         writer.Write("""
             <!doctype html><html><head><meta charset="utf-8">
             <meta name="referrer" content="no-referrer">
-            <style>body { font-family: 'Segoe UI', sans-serif; overflow-wrap: anywhere; } img { max-width: 100%; }</style>
+            <style>html { background-color: white; color: black; color-scheme: light; } body { font-family: 'Segoe UI', sans-serif; overflow-wrap: anywhere; } img { max-width: 100%; }</style>
             """);
-        if (darkScrollbars)
-            writer.Write($"<style>html {{ scrollbar-color: {DarkScrollbarColors} !important; }}</style>");
         writer.Write("</head>");
 
         using var reader = new StringReader(html);

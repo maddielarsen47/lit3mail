@@ -9,11 +9,8 @@ internal static class ScrollbarTheme
 
     public static void Apply(Control control, bool dark)
     {
-        if (control is HtmlMailPreview preview)
-        {
-            preview.UseDarkScrollbars = dark;
+        if (control is HtmlMailPreview)
             return;
-        }
 
         if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000) &&
             control is (ScrollableControl { AutoScroll: true } or RichTextBox or ListBox or ScrollBar or

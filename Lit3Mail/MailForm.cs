@@ -42,6 +42,11 @@ public partial class MailForm : Form, IMessageFilter
         DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
         AccessibleName = "App theme"
     };
+    private readonly ComboBox sidebarTheme = new()
+    {
+        DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
+        AccessibleName = "App theme", Dock = DockStyle.Bottom
+    };
     private readonly TextBox search = new()
     {
         PlaceholderText = "Search this folder", AccessibleName = "Search this folder"
@@ -76,7 +81,7 @@ public partial class MailForm : Form, IMessageFilter
     };
     private readonly Label searchStatus = new()
     {
-        Text = "Searching...", Dock = DockStyle.Top, AutoSize = true,
+        Text = "Searching...", Dock = DockStyle.Top, AutoSize = false, Height = 26,
         Padding = new Padding(12, 0, 0, 4), Visible = false
     };
     private readonly Panel searchBar = new()
@@ -272,6 +277,8 @@ public partial class MailForm : Form, IMessageFilter
         sidebar.Controls.Add(localDrafts);
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(settings);
+        sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
+        sidebar.Controls.Add(sidebarTheme);
         sidebar.Controls.Add(updateNoticeSpacing);
         sidebar.Controls.Add(updateNotice);
         mailLayout.Panel1.Controls.Add(sidebar);
@@ -513,17 +520,25 @@ public partial class MailForm : Form, IMessageFilter
             if (messages.IsCurrentCellDirty)
                 messages.CommitEdit(DataGridViewDataErrorContexts.Commit);
         };
+        messages.MouseUp += (_, _) =>
+        {
+            var pending = flagSelection;
+            this.PostIfHandleAvailable(() =>
+            {
+                if (ReferenceEquals(flagSelection, pending))
+                    flagSelection = null;
+            });
+        };
         messages.KeyDown += (_, _) => flagSelection = null;
         messages.CellValueChanged += (_, e) =>
         {
-            if (e.RowIndex >= 0 && e.ColumnIndex == flagColumn &&
+            if (!rebuildingRows && e.RowIndex >= 0 && e.ColumnIndex == flagColumn &&
                 messages.Rows[e.RowIndex].Tag is MailSummary target && target.Id == flagMessage &&
                 flagSelection is { } selected)
             {
                 flagSelection = null;
                 foreach (DataGridViewRow row in messages.Rows)
-                    if (row.Tag is MailSummary mail && selected.Contains(mail.Id))
-                        row.Selected = true;
+                    row.Selected = row.Tag is MailSummary mail && selected.Contains(mail.Id);
             }
             UpdateFlag(e);
         };
@@ -555,8 +570,34 @@ public partial class MailForm : Form, IMessageFilter
         InitializeStatusBars();
         InitializeExport();
         theme.Items.AddRange(["System", "Light", "Dark"]);
-        theme.SelectedIndexChanged += (_, _) => ApplyTheme();
-        theme.SelectedIndex = 0;
+        sidebarTheme.Items.AddRange(["System", "Light", "Dark"]);
+        bool restoringTheme = true;
+        theme.SelectedIndexChanged += (_, _) =>
+        {
+            sidebarTheme.SelectedIndex = theme.SelectedIndex;
+            ApplyTheme();
+            if (!restoringTheme)
+            {
+                try { database?.SaveTheme(theme.SelectedIndex); }
+                catch (Microsoft.Data.Sqlite.SqliteException)
+                {
+                    ThemedPopup.Show(this, "Could not save the theme. The change applies to this session.", Text);
+                }
+            }
+        };
+        sidebarTheme.SelectedIndexChanged += (_, _) =>
+        {
+            if (sidebarTheme.SelectedIndex >= 0 && theme.SelectedIndex != sidebarTheme.SelectedIndex)
+                theme.SelectedIndex = sidebarTheme.SelectedIndex;
+        };
+        int savedTheme = 0;
+        try { savedTheme = database?.LoadTheme() ?? 0; }
+        catch (Microsoft.Data.Sqlite.SqliteException error)
+        {
+            System.Diagnostics.Debug.WriteLine($"Could not load the theme preference. {error.Message}");
+        }
+        theme.SelectedIndex = savedTheme;
+        restoringTheme = false;
         bool openingApp = false;
         folders.SelectedIndexChanged += async (_, _) =>
         {
@@ -747,14 +788,16 @@ public partial class MailForm : Form, IMessageFilter
         }
 
         BackColor = border;
-        sidebar.BackColor = folders.BackColor = theme.BackColor = composeFrom.BackColor = chrome;
+        sidebar.BackColor = folders.BackColor = theme.BackColor = sidebarTheme.BackColor = composeFrom.BackColor = chrome;
         automaticRemoteContent.FlatAppearance.BorderColor = border;
         automaticRemoteContent.FlatAppearance.CheckedBackColor = selectedBackground;
-        folderHeading.ForeColor = folders.ForeColor = theme.ForeColor = composeFrom.ForeColor = ink;
+        folderHeading.ForeColor = folders.ForeColor = theme.ForeColor = sidebarTheme.ForeColor = composeFrom.ForeColor = ink;
         UpdateRemoteContentToggleAppearance();
-        mailPane.Panel2.BackColor = preview.BackColor = previewBody.BackColor = messages.BackgroundColor = surface;
+        mailPane.Panel2.BackColor = preview.BackColor = messages.BackgroundColor = surface;
         previewSubject.BackColor = previewDetails.BackColor = surface;
-        previewSubject.ForeColor = previewBody.ForeColor = ink;
+        previewSubject.ForeColor = ink;
+        previewBody.BackColor = composeQuoteFallback.BackColor = SystemInformation.HighContrast ? SystemColors.Window : Color.White;
+        previewBody.ForeColor = composeQuoteFallback.ForeColor = SystemInformation.HighContrast ? SystemColors.WindowText : Color.Black;
         previewDetails.ForeColor = muted;
         deleteActionSeparator.ForeColor = imageActionSeparator.ForeColor = muted;
         settingsPage.BackColor = surface;
@@ -764,7 +807,7 @@ public partial class MailForm : Form, IMessageFilter
         composePage.ForeColor = ink;
         recipientAutocomplete?.SetColors(surface, ink);
         ApplyAttachmentTheme(surface, chrome, ink, border, selectedBackground);
-        messageSelectionBar.BackColor = messageSelectionCount.BackColor = searchStatus.BackColor = surface;
+        messageSelectionBar.BackColor = messageSelectionCount.BackColor = surface;
         StyleButton(toggleMessageList, chrome, ink, border, selectedBackground, autoSize: false);
         toggleMessageList.TextAlign = ContentAlignment.MiddleCenter;
         batchBar.BackColor = batchStatus.BackColor = surface;
@@ -803,7 +846,7 @@ public partial class MailForm : Form, IMessageFilter
         messages.ColumnHeadersDefaultCellStyle.ForeColor = ink;
         messages.ColumnHeadersDefaultCellStyle.SelectionBackColor = chrome;
         messages.ColumnHeadersDefaultCellStyle.SelectionForeColor = ink;
-        searchBar.BackColor = chrome;
+        searchBar.BackColor = searchStatus.BackColor = chrome;
         mailPane.Panel1.BackColor = surface;
         if (messages.Parent is { } messageViewport)
             messageViewport.BackColor = surface;
@@ -1239,7 +1282,8 @@ public partial class MailForm : Form, IMessageFilter
                 receivedBatch = true;
                 if (!seededSearch)
                 {
-                    if ((showingCachedFolder || prioritizeCurrentFolder && loadedUnfilteredFolder == entry) &&
+                    // Keep the full list while refreshing: a partial batch may not contain the scroll anchor.
+                    if ((showingCachedFolder || loadedUnfilteredFolder == entry) &&
                         string.IsNullOrWhiteSpace(search.Text) && messages.Rows.Count > 0)
                     {
                         mergedFirstBatch = true;
@@ -1345,11 +1389,13 @@ public partial class MailForm : Form, IMessageFilter
         {
             messages.Sort(new PublishedRowOrder(positions));
             messages.CurrentCell = current;
+            if (preserveScrollAnchor && firstRow == 0)
+                TryScrollMessagesTo(0);
+            else if (top is not null)
+                TryScrollMessagesTo(top.Index);
             messages.ClearSelection();
             foreach (var row in selected)
                 row.Selected = true;
-            if (top is not null)
-                TryScrollMessagesTo(top.Index);
         }
         finally
         {
@@ -1494,6 +1540,8 @@ public partial class MailForm : Form, IMessageFilter
 
     private void RenderFolder(IReadOnlyList<MailSummary> folderMail, MailSummary? selected, bool preserveScrollAnchor = true)
     {
+        var currentId = (messages.CurrentCell?.OwningRow?.Tag as MailSummary)?.Id;
+        int currentColumn = messages.CurrentCell?.ColumnIndex ?? 3;
         var selectedIds = selectionMade
             ? messages.SelectedRows.Cast<DataGridViewRow>().Select(row => ((MailSummary)row.Tag!).Id).ToHashSet()
             : new HashSet<Guid>();
@@ -1520,15 +1568,19 @@ public partial class MailForm : Form, IMessageFilter
 
             messages.Columns[sortColumn].HeaderCell.SortGlyphDirection =
                 descending ? SortOrder.Descending : SortOrder.Ascending;
-            messages.CurrentCell = selectedRows.Count > 0 ? selectedRows[0].Cells[3] : null;
+            var currentRow = selectedRows.FirstOrDefault(row => ((MailSummary)row.Tag!).Id == currentId)
+                ?? selectedRows.FirstOrDefault();
+            messages.CurrentCell = currentRow?.Cells[currentColumn];
+            if (firstRow >= 0)
+                // Stay at the top for incoming mail; otherwise keep the visible message anchored.
+                TryScrollMessagesTo(firstRow == 0 ? 0 :
+                    anchorIndex >= 0 ? anchorIndex : Math.Min(firstRow, messages.Rows.Count - 1));
+
             messages.ClearSelection();
             foreach (var row in selectedRows)
                 row.Selected = true;
             selectionMade = selectedRows.Count > 0;
             selectedMessageId = SelectedMessage?.Id;
-
-            if (firstRow >= 0)
-                TryScrollMessagesTo(anchorIndex >= 0 ? anchorIndex : Math.Min(firstRow, messages.Rows.Count - 1));
         }
         finally
         {
@@ -1931,8 +1983,7 @@ public partial class MailForm : Form, IMessageFilter
         {
             htmlPreview = new HtmlMailPreview
             {
-                Dock = DockStyle.Fill, Visible = false, AccessibleName = "HTML email body",
-                UseDarkScrollbars = darkTitleBar
+                Dock = DockStyle.Fill, Visible = false, AccessibleName = "HTML email body"
             };
             htmlPreview.KeyDown += (_, e) =>
             {
