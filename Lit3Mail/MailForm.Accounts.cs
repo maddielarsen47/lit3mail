@@ -409,6 +409,8 @@ public partial class MailForm
     }
 
     private ReleaseUpdate.StagedRelease? pendingUpdate;
+    private bool restartingForUpdateAsAdministrator;
+    private readonly Panel updateNoticeSpacing = new() { Dock = DockStyle.Bottom, Height = 6, Visible = false };
     private DateTimeOffset lastUpdateCheck;
     private Version? availableUpdate;
     private bool checkingForUpdate;
@@ -437,41 +439,36 @@ public partial class MailForm
         Shown += async (_, _) =>
         {
             timer.Start();
-            await CheckForUpdateAsync(automatic: true);
+            bool installingAsAdministrator = Environment.GetCommandLineArgs().Contains(ReleaseUpdate.AdministratorUpdateArgument);
+            await CheckForUpdateAsync(automatic: !installingAsAdministrator, onStartup: true);
         };
     }
 
     private void UpdateAvailableNotice() =>
-        updateNotice.Visible = availableUpdate is { } version && version > ReleaseUpdate.InstalledVersion;
+        updateNoticeSpacing.Visible = updateNotice.Visible =
+            availableUpdate is { } version && version > ReleaseUpdate.InstalledVersion;
 
     private async Task<ReleaseUpdate.Release?> CheckAndRecordUpdateAsync()
     {
+        var release = await ReleaseUpdate.CheckAsync(mailboxLifetime.Token);
         lastUpdateCheck = DateTimeOffset.UtcNow;
-        try
+        availableUpdate = release?.Version;
+        if (!IsDisposed)
         {
-            var release = await ReleaseUpdate.CheckAsync(mailboxLifetime.Token);
-            availableUpdate = release?.Version;
-            if (!IsDisposed)
-                UpdateAvailableNotice();
-            return release;
-        }
-        finally
-        {
-            if (!IsDisposed)
+            UpdateAvailableNotice();
+            try { database?.SaveUpdateCheck(lastUpdateCheck, availableUpdate); }
+            catch (Microsoft.Data.Sqlite.SqliteException error)
             {
-                try { database?.SaveUpdateCheck(lastUpdateCheck, availableUpdate); }
-                catch (Microsoft.Data.Sqlite.SqliteException error)
-                {
-                    Debug.WriteLine($"Could not save update history. {error.Message}");
-                }
+                Debug.WriteLine($"Could not save update history. {error.Message}");
             }
         }
+        return release;
     }
 
-    private async Task CheckForUpdateAsync(bool automatic = false)
+    private async Task CheckForUpdateAsync(bool automatic = false, bool onStartup = false)
     {
         if (IsDisposed || Disposing || checkingForUpdate ||
-            automatic && DateTimeOffset.UtcNow - lastUpdateCheck < TimeSpan.FromDays(1))
+            automatic && !onStartup && DateTimeOffset.UtcNow - lastUpdateCheck < TimeSpan.FromDays(1))
             return;
 
         checkingForUpdate = true;
@@ -487,6 +484,18 @@ public partial class MailForm
                 ThemedPopup.Show(this, "Lit3Mail is up to date.", "Updates");
                 return;
             }
+            if (ReleaseUpdate.RequiresAdministrator())
+            {
+                if (ThemedPopup.Show(this,
+                        "Lit3Mail needs administrator permission to replace files in its installation folder. Restart as administrator to install the update?",
+                        "Updates", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                {
+                    restartingForUpdateAsAdministrator = true;
+                    Close();
+                }
+                return;
+            }
+
             if (ThemedPopup.Show(this, $"Download and install Lit3Mail {release.Version}? The app will restart.",
                     "Updates", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
                 return;
@@ -511,6 +520,7 @@ public partial class MailForm
         }
         finally
         {
+            restartingForUpdateAsAdministrator = false;
             pendingUpdate = null;
             staging?.Dispose();
             checkingForUpdate = false;

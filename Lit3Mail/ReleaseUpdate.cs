@@ -5,6 +5,7 @@ using System.Reflection;
 using System.Reflection.PortableExecutable;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -13,6 +14,7 @@ namespace Lit3Mail;
 
 internal static class ReleaseUpdate
 {
+    internal const string AdministratorUpdateArgument = "--install-update-as-administrator";
     private const string Repository = "maddielarsen47/lit3mail";
     private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromMinutes(3) };
 
@@ -73,6 +75,39 @@ internal static class ReleaseUpdate
         return new(version, url, selected.TryGetProperty("digest", out var digest) ? digest.GetString() : null);
     }
 
+    public static bool RequiresAdministrator()
+    {
+        try
+        {
+            CheckInstallWriteAccess(AppContext.BaseDirectory);
+            return false;
+        }
+        catch (UnauthorizedAccessException)
+        {
+            using var identity = WindowsIdentity.GetCurrent();
+            if (new WindowsPrincipal(identity).IsInRole(WindowsBuiltInRole.Administrator))
+                throw;
+            return true;
+        }
+    }
+
+    public static void RestartAsAdministrator()
+    {
+        var executable = Environment.ProcessPath
+            ?? throw new InvalidOperationException("Could not locate Lit3Mail.exe.");
+        var start = new ProcessStartInfo(executable)
+        {
+            UseShellExecute = true, Verb = "runas", WorkingDirectory = AppContext.BaseDirectory
+        };
+        start.ArgumentList.Add(AdministratorUpdateArgument);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("Could not start Lit3Mail as administrator.");
+    }
+
+    private static void CheckInstallWriteAccess(string install)
+    {
+        using var probe = File.Create(Path.Combine(install, $".lit3mail-update-{Guid.NewGuid():N}"), 1, FileOptions.DeleteOnClose);
+    }
+
     public static async Task<StagedRelease> StageAsync(Release release, CancellationToken token)
     {
         string executable = Environment.ProcessPath ?? "";
@@ -120,7 +155,7 @@ internal static class ReleaseUpdate
             }, token);
 
             // Check write access while Lit3Mail can still report an error and stay open.
-            using (File.Create(Path.Combine(install, $".lit3mail-update-{Guid.NewGuid():N}"), 1, FileOptions.DeleteOnClose)) { }
+            CheckInstallWriteAccess(install);
             return new(work, source, install, executable);
         }
         catch

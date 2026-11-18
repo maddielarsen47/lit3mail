@@ -272,6 +272,7 @@ public partial class MailForm : Form, IMessageFilter
         sidebar.Controls.Add(localDrafts);
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(settings);
+        sidebar.Controls.Add(updateNoticeSpacing);
         sidebar.Controls.Add(updateNotice);
         mailLayout.Panel1.Controls.Add(sidebar);
         mailLayout.Panel2.Controls.Add(mailPane);
@@ -616,7 +617,7 @@ public partial class MailForm : Form, IMessageFilter
                     e.Cancel = true;
                     return;
                 }
-                if (settingsPage.Visible && pendingUpdate is null)
+                if (settingsPage.Visible && pendingUpdate is null && !restartingForUpdateAsAdministrator)
                 {
                     e.Cancel = true;
                     LeaveSettings();
@@ -638,6 +639,21 @@ public partial class MailForm : Form, IMessageFilter
                 if (choice == DialogResult.No)
                     break;
                 e.Cancel = choice != DialogResult.Yes;
+            }
+
+            if (!e.Cancel && restartingForUpdateAsAdministrator)
+            {
+                try { ReleaseUpdate.RestartAsAdministrator(); }
+                catch (System.ComponentModel.Win32Exception error) when (error.NativeErrorCode == 1223)
+                {
+                    e.Cancel = true;
+                }
+                catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidOperationException)
+                {
+                    e.Cancel = true;
+                    ThemedPopup.Show(this, $"Could not restart as administrator. {error.Message}", "Updates",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
             }
 
             if (!e.Cancel && pendingUpdate is { } update)
