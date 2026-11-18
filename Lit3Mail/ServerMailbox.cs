@@ -532,7 +532,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         return await ReadMessageContentAsync(message, token);
     }
 
-    private static async Task<MailContent> ReadMessageContentAsync(MimeMessage message, CancellationToken token)
+    internal static async Task<MailContent> ReadMessageContentAsync(MimeMessage message, CancellationToken token)
     {
         string? html = message.HtmlBody;
         var inlineImages = new List<InlineMailImage>();

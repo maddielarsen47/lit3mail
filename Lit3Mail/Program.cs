@@ -6,7 +6,7 @@ namespace Lit3Mail
         ///  The main entry point for the application.
         /// </summary>
         [STAThread]
-        static void Main()
+        static void Main(string[] args)
         {
             // To customize application configuration such as set high DPI settings or default font,
             // see https://aka.ms/applicationconfiguration.
@@ -24,6 +24,8 @@ namespace Lit3Mail
                 return;
             }
 
+            if (args.Length > 0)
+                form.Shown += async (_, _) => await form.OpenEmlAsync(args[0]);
             Application.Run(form);
         }
     }

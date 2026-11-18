@@ -33,7 +33,7 @@ Lit3Mail. Use that App Password in both password fields. New accounts default to
 `imap.gmail.com` on port 993 and `smtp.gmail.com` on port 465 with implicit TLS.
 
 ### Updates
-- For automatic updates, use the Check for Updates... button in **Settings** &gt; General.
+- For automatic updates, use the Check for Updates... button in **Settings** > General.
 - For manual updates, delete all files in the program folder, then extract the ZIP to replace.
 
 ### Read and manage mail
@@ -53,6 +53,9 @@ Lit3Mail. Use that App Password in both password fields. New accounts default to
 - **Del** asks for confirmation before moving messages to Trash or permanently
   deleting them from Trash. Once confirmed, messages disappear from the list
   immediately and return if the server operation fails.
+- Use **Open EML...** in the sidebar or **Ctrl+O** to view a saved email in the
+  preview panel. You can also use Windows **Open with** to pass an EML file to Lit3Mail. 
+  Opening a file does not import it into a mailbox.
 - Use **Export** in the sidebar to save selected messages or the entire
   current folder as a ZIP of EML files. Folder export includes every message
   in the folder, even when a search filter is active. You can cancel an
@@ -63,7 +66,11 @@ Lit3Mail. Use that App Password in both password fields. New accounts default to
 - Lit3Mail’s interface is English-only, but the composer and message preview support Unicode, including
   Chinese, Japanese, Korean, Cyrillic, and accented Latin scripts. Emoji also work where the font supports them.
   Arabic and Hebrew text can be entered, but the composer currently has no dedicated right-to-left paragraph control.
-
+- **Windows Credential Manager** stores mail-server passwords for the current
+  Windows user. Use **Forget saved sign-in** in Settings to remove them.
+- The app's local database location is configurable in **Settings**. Default: 
+  `%LOCALAPPDATA%\Lit3Mail\lit3mail.db`
+  
 ### Offline drafts
 
 If the mail server is unavailable, **Save Draft** saves the message and its
@@ -84,7 +91,7 @@ draft on the server.
 
 ### Build
 
-Built in C#, for Windows, using the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
+Built in C#, WinForms, for Windows, using the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 The [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
 provides HTML previews. Lit3Mail can display the plain-text version if the
 runtime is unavailable.
@@ -98,9 +105,8 @@ runtime is unavailable.
 - **RtfPipe** converts rich-text drafts to
   HTML for sending with a plain-text alternative.
 - **SQLite** stores app data including account settings, cached messages, 
-  known addresses, and local drafts. The database location is configurable in **Settings**, default: 
-  `%LOCALAPPDATA%\Lit3Mail\lit3mail.db`
-- **Windows Credential Manager** stores mail-server passwords for the current
-  Windows user. Use **Forget saved sign-in** in Settings to remove them.
+  known addresses, and local drafts.
+- **Windows Credential Manager** stores mail-server passwords for the current 
+  Windows user.
 - **Other** Lit3Mail stores window layout and WebView2 profile data in:
   `%LOCALAPPDATA%\Lit3Mail`.

@@ -68,7 +68,7 @@ public partial class MailForm : Form, IMessageFilter
 
     private readonly SelectionCountLabel messageSelectionCount = new()
     {
-        Text = "0 selected", AccessibleName = "Message selection count",
+        Text = "0 selected", AccessibleName = "Message selection count", AutoEllipsis = true, UseMnemonic = false,
         Dock = DockStyle.Fill, AutoSize = false,
         TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 12, 0)
     };
@@ -205,9 +205,11 @@ public partial class MailForm : Form, IMessageFilter
     private Color selectedText;
     private const string DateFormat = "dd MMM yyyy h:mm tt";
 
-    public MailForm()
+    public MailForm() : this(LocalDatabase.ForCurrentUser()) { }
+
+    internal MailForm(LocalDatabase store)
     {
-        database = LocalDatabase.ForCurrentUser();
+        database = store;
         LoadAccountSettings(database);
 
         bool firstRun = accounts.Count == 0;
@@ -226,6 +228,7 @@ public partial class MailForm : Form, IMessageFilter
         var subjectFont = new Font("Segoe UI", 18, FontStyle.Bold);
         var refreshFont = new Font("Segoe UI Symbol", 15);
         var hints = new ToolTip(components!);
+        selectionPathTip = hints;
         Font = uiFont;
         folderHeading.Font = headingFont;
         previewSubject.Font = subjectFont;
@@ -272,6 +275,9 @@ public partial class MailForm : Form, IMessageFilter
         sidebar.Controls.Add(automaticRemoteContent);
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(exportMail);
+        sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
+        sidebar.Controls.Add(openEml);
+        openEml.Click += async (_, _) => await PickEmlAsync();
         InitializeRemoteContentSetting();
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(localDrafts);
@@ -293,7 +299,7 @@ public partial class MailForm : Form, IMessageFilter
         messageSelectionBar.Controls.Add(toggleMessageList);
         mailPane.Panel1.Controls.Add(messageSelectionBar);
         messages.SelectionChanged += (_, _) =>
-            messageSelectionCount.Text = $"{messages.SelectedRows.Count:N0} selected";
+            UpdateMessageSelectionCount();
         searchBar.Controls.Add(CreateTextField(search));
         searchBar.Controls.Add(clearSearch);
         searchBar.Controls.Add(exact);
@@ -324,7 +330,7 @@ public partial class MailForm : Form, IMessageFilter
         previewActions.Controls.Add(showImages);
         showImages.Click += (_, _) =>
         {
-            if (SelectedMessage is not { } mail || previewContent is not { Html.Length: > 0 } content)
+            if (PreviewMessage is not { } mail || previewContent is not { Html.Length: > 0 } content)
                 return;
 
             imagePermission = mail.Id;
@@ -604,6 +610,10 @@ public partial class MailForm : Form, IMessageFilter
             if (rebuildingFolders || folders.SelectedItem is not FolderEntry { Folder: not null } entry ||
                 entry == selectedFolder)
                 return;
+            openedEml = null;
+            openedEmlPath = null;
+            UpdateMessageSelectionCount();
+            ++emlOpenVersion;
             selectedFolder = entry;
             folders.Invalidate();
             loadedUnfilteredFolder = null;
@@ -824,7 +834,7 @@ public partial class MailForm : Form, IMessageFilter
             field.Parent!.BackColor = field.BackColor = surface;
             field.ForeColor = ink;
         }
-        foreach (var button in new[] { newEmail, checkMail, localDrafts, settings, updateNotice, backToMail, addAccount, backFromCompose,
+        foreach (var button in new[] { newEmail, checkMail, localDrafts, settings, openEml, updateNotice, backToMail, addAccount, backFromCompose,
             sendMail, saveDraft, attachFiles, editDraft, reply, replyAll, forward, moveMail, deleteMail, showImages, showComposeQuoteImages }.Concat(composeActionCopies))
         {
             StyleButton(button, chrome, ink, border, selectedBackground);
@@ -1033,6 +1043,11 @@ public partial class MailForm : Form, IMessageFilter
 
     protected override bool ProcessCmdKey(ref Message msg, Keys keyData)
     {
+        if (keyData == (Keys.Control | Keys.O))
+        {
+            _ = PickEmlAsync();
+            return true;
+        }
         if (keyData == (Keys.Control | Keys.F) && FocusFolderSearch())
             return true;
         if (keyData == Keys.Delete && (messages.ContainsFocus || preview.ContainsFocus))
@@ -1821,6 +1836,13 @@ public partial class MailForm : Form, IMessageFilter
         if (rebuildingRows)
             return;
 
+        if (messages.SelectedRows.Count > 0)
+        {
+            openedEml = null;
+            openedEmlPath = null;
+            UpdateMessageSelectionCount();
+            ++emlOpenVersion;
+        }
         selectionMade = messages.SelectedRows.Count > 0;
         var id = SelectedMessage?.Id;
         if (id == selectedMessageId)
@@ -1831,6 +1853,8 @@ public partial class MailForm : Form, IMessageFilter
 
     private async Task ShowPreview()
     {
+        if (openedEml is not null && SelectedMessage is null)
+            return;
         previewLoad?.Cancel();
         ResetPreviewAttachments();
         int request = ++previewRequest;
@@ -1964,7 +1988,7 @@ public partial class MailForm : Form, IMessageFilter
         {
             _ = DisplayHtmlBodyAsync(content, previewRequest, showImagesForMessage);
         }
-        reply.Enabled = replyAll.Enabled = forward.Enabled = true;
+        reply.Enabled = replyAll.Enabled = forward.Enabled = openedEml is null;
         RefreshComposeQuoteSource(mail, content);
         UpdateImagePreview(mail);
     }
@@ -2017,7 +2041,7 @@ public partial class MailForm : Form, IMessageFilter
             {
                 imagePermission = null;
                 previewRemoteContentFailed = true;
-                UpdateImagePreview(SelectedMessage);
+                UpdateImagePreview(PreviewMessage);
             }
         }
     }
@@ -2056,7 +2080,7 @@ public partial class MailForm : Form, IMessageFilter
             imagePermission = null;
             if (previewContent is { Html.Length: > 0 } content)
                 _ = DisplayHtmlBodyAsync(content, previewRequest, enabled);
-            UpdateImagePreview(SelectedMessage);
+            UpdateImagePreview(PreviewMessage);
             if (composeWindow is { Visible: true } && composeSession.QuoteImageSource is not null)
                 DisplayComposeQuote();
 

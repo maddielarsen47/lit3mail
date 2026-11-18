@@ -20,6 +20,11 @@ internal static class ThemedPopup
 
     internal static void ApplyTo(Form form)
     {
+        using var stream = typeof(ThemedPopup).Assembly.GetManifestResourceStream("Lit3Mail.Envelope.ico")!;
+        var appIcon = new Icon(stream);
+        form.Icon = appIcon;
+        form.ShowIcon = true;
+        form.Disposed += (_, _) => appIcon.Dispose();
         if (!IsDark)
             return;
 
@@ -54,13 +59,11 @@ internal static class ThemedPopup
         MessageBoxDefaultButton defaultButton = MessageBoxDefaultButton.Button1)
     {
         owner = GetDialogOwner(owner);
-        if (!IsDark)
-            return MessageBox.Show(owner, text, caption, buttons, icon, defaultButton);
 
         using var dialog = new Form
         {
             Text = caption, Font = SystemFonts.MessageBoxFont, AutoScaleMode = AutoScaleMode.Dpi,
-            FormBorderStyle = FormBorderStyle.FixedDialog, ShowInTaskbar = false,
+            FormBorderStyle = FormBorderStyle.FixedSingle, ShowInTaskbar = false,
             StartPosition = owner is null ? FormStartPosition.CenterScreen : FormStartPosition.CenterParent,
             MinimizeBox = false, MaximizeBox = false
         };
@@ -86,6 +89,7 @@ internal static class ThemedPopup
             MessageBoxIcon.Error => SystemIcons.Error,
             MessageBoxIcon.Warning => SystemIcons.Warning,
             MessageBoxIcon.Information => SystemIcons.Information,
+            MessageBoxIcon.Question => SystemIcons.Question,
             _ => null
         };
         using var bitmap = symbol?.ToBitmap();
