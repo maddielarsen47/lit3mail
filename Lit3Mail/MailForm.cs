@@ -105,7 +105,15 @@ public partial class MailForm : Form, IMessageFilter
         Text = "·", AutoSize = true, Anchor = AnchorStyles.None,
         Margin = new Padding(6, 0, 6, 0), Visible = false
     };
+    private const string AutomaticRemoteContentLabel = "Images & Remote Content";
+    private readonly CheckBox automaticRemoteContent = new()
+    {
+        AccessibleName = AutomaticRemoteContentLabel, Appearance = Appearance.Button,
+        Checked = true, Dock = DockStyle.Bottom, FlatStyle = FlatStyle.Flat,
+        TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false, UseVisualStyleBackColor = false
+    };
     private Guid? imagePermission;
+    private bool previewRemoteContentFailed;
     private readonly Label settingsHeading = new() { Text = "Settings", Dock = DockStyle.Top, Height = 44 };
     private readonly Button newEmail = new() { Text = "New Email", Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat };
     private readonly Button checkMail = new()
@@ -244,7 +252,10 @@ public partial class MailForm : Form, IMessageFilter
         localDrafts.Enabled = database is not null;
         sidebar.Controls.Add(mailActions);
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 8 });
+        sidebar.Controls.Add(automaticRemoteContent);
+        sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(exportMail);
+        InitializeRemoteContentSetting();
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(localDrafts);
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
@@ -366,9 +377,10 @@ public partial class MailForm : Form, IMessageFilter
         {
             mailLayout.Hide();
             int defaultTab = accountTabs.Controls.Count > 1 ? 1 : 0;
-            ((RadioButton)accountTabs.Controls[defaultTab]).Checked = true;
+            var tab = (RadioButton)accountTabs.Controls[defaultTab];
+            tab.Checked = true;
             settingsPage.Show();
-            backToMail.Focus();
+            tab.Focus();
         }
 
         settings.Click += (_, _) => OpenSettings();
@@ -590,12 +602,6 @@ public partial class MailForm : Form, IMessageFilter
                     e.Cancel = true;
                     return;
                 }
-                if (composePage.Visible && composeWindow is null)
-                {
-                    e.Cancel = true;
-                    LeaveCompose();
-                    return;
-                }
                 if (settingsPage.Visible && pendingUpdate is null)
                 {
                     e.Cancel = true;
@@ -712,7 +718,10 @@ public partial class MailForm : Form, IMessageFilter
 
         BackColor = border;
         sidebar.BackColor = folders.BackColor = theme.BackColor = composeFrom.BackColor = chrome;
+        automaticRemoteContent.FlatAppearance.BorderColor = border;
+        automaticRemoteContent.FlatAppearance.CheckedBackColor = selectedBackground;
         folderHeading.ForeColor = folders.ForeColor = theme.ForeColor = composeFrom.ForeColor = ink;
+        UpdateRemoteContentToggleAppearance();
         preview.BackColor = previewBody.BackColor = messages.BackgroundColor = surface;
         previewSubject.BackColor = previewDetails.BackColor = surface;
         previewSubject.ForeColor = previewBody.ForeColor = ink;
@@ -725,10 +734,11 @@ public partial class MailForm : Form, IMessageFilter
         composePage.ForeColor = ink;
         recipientAutocomplete?.SetColors(surface, ink);
         ApplyAttachmentTheme(surface, chrome, ink, border, selectedBackground);
-        batchBar.BackColor = surface;
-        batchStatus.ForeColor = ink;
-        composeOperationBar.BackColor = surface;
-        composeOperationStatus.ForeColor = ink;
+        messageSelectionCount.BackColor = searchStatus.BackColor = surface;
+        batchBar.BackColor = batchStatus.BackColor = surface;
+        composeOperationBar.BackColor = composeOperationStatus.BackColor = surface;
+        batchStatus.ForeColor = composeOperationStatus.ForeColor = ink;
+        searchStatus.ForeColor = messageSelectionCount.ForeColor = muted;
         StyleButton(exportMail, chrome, ink, border, selectedBackground);
         exportMenu.Renderer = new ExportMenuRenderer(chrome, ink,
             SystemInformation.HighContrast ? SystemColors.GrayText : muted, border, selectedBackground, selectedText);
@@ -740,7 +750,7 @@ public partial class MailForm : Form, IMessageFilter
             field.ForeColor = ink;
         }
         foreach (var button in new[] { newEmail, checkMail, localDrafts, settings, updateNotice, backToMail, addAccount, backFromCompose,
-            sendMail, saveDraft, popOutCompose, attachFiles, editDraft, reply, replyAll, forward, moveMail, deleteMail, showImages, showComposeQuoteImages }.Concat(composeActionCopies))
+            sendMail, saveDraft, attachFiles, editDraft, reply, replyAll, forward, moveMail, deleteMail, showImages, showComposeQuoteImages }.Concat(composeActionCopies))
         {
             StyleButton(button, chrome, ink, border, selectedBackground);
         }
@@ -762,12 +772,9 @@ public partial class MailForm : Form, IMessageFilter
         messages.ColumnHeadersDefaultCellStyle.SelectionBackColor = chrome;
         messages.ColumnHeadersDefaultCellStyle.SelectionForeColor = ink;
         searchBar.BackColor = chrome;
-        searchStatus.BackColor = chrome;
         mailPane.Panel1.BackColor = surface;
         if (messages.Parent is { } messageViewport)
             messageViewport.BackColor = surface;
-        messageSelectionCount.BackColor = surface;
-        searchStatus.ForeColor = messageSelectionCount.ForeColor = muted;
         StyleButton(exact, chrome, ink, border, selectedBackground);
         StyleButton(clearSearch, chrome, ink, border, selectedBackground);
         StyleButton(dismissComposeStatus, chrome, ink, border, selectedBackground);
@@ -847,7 +854,9 @@ public partial class MailForm : Form, IMessageFilter
         var alignment = button.TextAlign == ContentAlignment.MiddleLeft
             ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter;
         var textFlags = alignment | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine | TextFormatFlags.NoPrefix;
-        if (button.Parent != composeFormatting)
+        if (button == automaticRemoteContent)
+            textFlags = (textFlags & ~TextFormatFlags.SingleLine) | TextFormatFlags.WordBreak;
+        else if (button.Parent != composeFormatting)
             textFlags |= TextFormatFlags.EndEllipsis;
         if (button.Tag is ToolbarIcon icon)
         {
@@ -868,7 +877,7 @@ public partial class MailForm : Form, IMessageFilter
             ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(bounds, -4, -4), ink, background);
     }
 
-    private enum ToolbarIcon { Palette, NumberedList, BulletedList, Back, Send, Save, PaperClip, PopOut }
+    private enum ToolbarIcon { Palette, NumberedList, BulletedList, Back, Send, Save, PaperClip }
 
     private static void DrawToolbarIcon(Graphics graphics, Rectangle bounds, Color ink, ToolbarIcon icon)
     {
@@ -897,13 +906,6 @@ public partial class MailForm : Form, IMessageFilter
                     new Point(14, 15), new Point(2, 15)]);
                 graphics.DrawRectangle(pen, 5, 1, 5, 5);
                 graphics.DrawRectangle(pen, 5, 9, 6, 6);
-            }
-            else if (icon == ToolbarIcon.PopOut)
-            {
-                graphics.DrawLines(pen, [new Point(14, 8), new Point(14, 14), new Point(2, 14),
-                    new Point(2, 2), new Point(8, 2)]);
-                graphics.DrawLine(pen, 7, 9, 14, 2);
-                graphics.DrawLines(pen, [new Point(10, 2), new Point(14, 2), new Point(14, 6)]);
             }
             else if (icon == ToolbarIcon.PaperClip)
             {
@@ -1051,7 +1053,6 @@ public partial class MailForm : Form, IMessageFilter
         searchStatus.Hide();
         bool receivedBatch = false;
         bool seededSearch = false;
-        IReadOnlyList<MailSummary> cachedSearchMatches = [];
         bool mergedFirstBatch = false;
         Task cachedSearch = Task.CompletedTask;
         var publishedIds = new HashSet<Guid>();
@@ -1063,10 +1064,20 @@ public partial class MailForm : Form, IMessageFilter
             string query = search.Text;
             bool cacheable = database is not null && mailbox is ServerMailbox && string.IsNullOrWhiteSpace(query);
             string? connectionKey = cacheable ? entry.Account.ConnectionKey() : null;
-            if (connectionKey is not null && (messages.Rows.Count == 0 || debounce || clearingSearch))
+            string? cacheRevision = null;
+            if (connectionKey is not null)
             {
-                var cached = ReadCachedFolder(entry, folder, connectionKey);
-                if (cached.Count > 0 || clearingSearch)
+                bool readCachedRows = messages.Rows.Count == 0 || debounce || clearingSearch;
+                var cache = await Task.Run(() =>
+                {
+                    string? revision = ReadFolderCacheRevision(entry.Account.Id, folder);
+                    var rows = readCachedRows ? ReadCachedFolder(entry, folder, connectionKey) : [];
+                    return (Revision: revision, Rows: rows);
+                }, token);
+                token.ThrowIfCancellationRequested();
+                cacheRevision = cache.Revision;
+                var cached = cache.Rows;
+                if (readCachedRows && (cached.Count > 0 || clearingSearch))
                 {
                     SetCachedFolder(cached.Count > 0);
                     RenderFolder(cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
@@ -1110,10 +1121,10 @@ public partial class MailForm : Form, IMessageFilter
             if (mailbox is not null && string.IsNullOrWhiteSpace(query) && !IsPendingMoveSource())
                 SetFolderCount(entry.Account, folder, folderMail.Count(mail => !mail.Read), folderMail.Count);
             SetCachedFolder(false);
-            if (receivedBatch && cachedSearchMatches.Count == 0 && !mergedFirstBatch)
+            if (receivedBatch && !seededSearch && !mergedFirstBatch)
                 SortPublishedRows();
             else
-                RenderFolder(folderMail.Concat(cachedSearchMatches).DistinctBy(mail => mail.Id)
+                RenderFolder(folderMail
                     .Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
             if (scrollAnchor is not null)
             {
@@ -1124,14 +1135,17 @@ public partial class MailForm : Form, IMessageFilter
             }
             loadedUnfilteredFolder = string.IsNullOrWhiteSpace(query) ? entry : null;
             var displayed = SelectedMessage;
-            bool keepPreview = !seededSearch && current?.Id == displayed?.Id && (receivedBatch || backgroundRefresh && !wasCached);
+            bool keepPreview = !seededSearch && !wasCached && current?.Id == displayed?.Id &&
+                (receivedBatch || backgroundRefresh || prioritizeCurrentFolder);
             var preview = keepPreview ? Task.CompletedTask : ShowPreview();
             if (connectionKey is not null && !IsPendingMoveSource())
             {
                 var cacheMail = flagOverrides.Count > 0
                     ? folderMail.Select(mail => ApplyFlagOverrides(mail, confirmedOnly: true)).ToArray()
                     : folderMail;
-                WriteCachedFolder(entry, folder, connectionKey, cacheMail);
+                await Task.Run(() => WriteCachedFolder(entry, folder, connectionKey, cacheMail,
+                    onlyIfUnchanged: true, expectedRevision: cacheRevision), token);
+                token.ThrowIfCancellationRequested();
                 QueueBackgroundCache(entry, cacheMail);
             }
             await Task.WhenAll(preview, RefreshFolderCounts(entry.Account, mailbox, refreshCounts, token));
@@ -1176,7 +1190,6 @@ public partial class MailForm : Form, IMessageFilter
             if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry)
                 return;
 
-            cachedSearchMatches = cached;
             if (receivedBatch)
                 return;
 
@@ -1191,7 +1204,8 @@ public partial class MailForm : Form, IMessageFilter
 
         void PublishBatch(IReadOnlyList<MailSummary> batch)
         {
-            if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry || mergedFirstBatch)
+            if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry ||
+                mergedFirstBatch && !showingCachedFolder)
                 return;
             var newRows = batch.Where(mail => IsVisibleDuringMove(mail) && publishedIds.Add(mail.Id))
                 .Select(mail => ApplyFlagOverrides(mail)).ToArray();
@@ -1200,12 +1214,15 @@ public partial class MailForm : Form, IMessageFilter
                 receivedBatch = true;
                 if (!seededSearch)
                 {
-                    if (prioritizeCurrentFolder && loadedUnfilteredFolder == entry &&
+                    if ((showingCachedFolder || prioritizeCurrentFolder && loadedUnfilteredFolder == entry) &&
                         string.IsNullOrWhiteSpace(search.Text) && messages.Rows.Count > 0)
                     {
                         mergedFirstBatch = true;
                         var existing = messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!);
-                        RenderFolder(newRows.Concat(existing).DistinctBy(mail => mail.Id).ToArray(), SelectedMessage);
+                        var current = SelectedMessage;
+                        RenderFolder(newRows.Concat(existing).DistinctBy(mail => mail.Id).ToArray(), current);
+                        if (showingCachedFolder && current is not null && publishedIds.Contains(current.Id))
+                            _ = ShowPreview();
                         return;
                     }
                     SetCachedFolder(false);
@@ -1213,6 +1230,13 @@ public partial class MailForm : Form, IMessageFilter
                     _ = ShowPreview();
                     return;
                 }
+            }
+
+            if (mergedFirstBatch)
+            {
+                if (showingCachedFolder && SelectedMessage is { } current && newRows.Any(mail => mail.Id == current.Id))
+                    _ = ShowPreview();
+                return;
             }
 
             rebuildingRows = true;
@@ -1335,11 +1359,18 @@ public partial class MailForm : Form, IMessageFilter
         }
     }
 
-    private void WriteCachedFolder(FolderEntry entry, string folder, string connectionKey, IReadOnlyList<MailSummary> summaries)
+    private string? ReadFolderCacheRevision(Guid account, string folder)
+    {
+        try { return database!.GetFolderCacheRevision(account, folder); }
+        catch (Microsoft.Data.Sqlite.SqliteException) { return null; }
+    }
+
+    private void WriteCachedFolder(FolderEntry entry, string folder, string connectionKey, IReadOnlyList<MailSummary> summaries,
+        bool onlyIfUnchanged = false, string? expectedRevision = null)
     {
         try
         {
-            database!.SaveFolderCache(entry.Account.Id, folder, connectionKey, summaries);
+            database!.SaveFolderCache(entry.Account.Id, folder, connectionKey, summaries, onlyIfUnchanged, expectedRevision);
         }
         catch (Microsoft.Data.Sqlite.SqliteException)
         {
@@ -1347,11 +1378,12 @@ public partial class MailForm : Form, IMessageFilter
         }
     }
 
-    private void WriteCachedBody(MailAccount account, MailSummary summary, string connectionKey, MailContent content)
+    private void WriteCachedBody(MailAccount account, MailSummary summary, string connectionKey, MailContent content,
+        bool completePreview = false)
     {
         try
         {
-            database!.SaveMessageBody(account.Id, summary.Folder, connectionKey, summary.Id, content);
+            database!.SaveMessageBody(account.Id, summary.Folder, connectionKey, summary.Id, content, completePreview);
         }
         catch (Microsoft.Data.Sqlite.SqliteException)
         {
@@ -1712,6 +1744,7 @@ public partial class MailForm : Form, IMessageFilter
         ResetPreviewAttachments();
         int request = ++previewRequest;
         previewContent = null;
+        previewRemoteContentFailed = false;
         htmlPreview?.ClearDisplay();
         editDraft.Hide();
         moveMail.Enabled = deleteMail.Enabled = false;
@@ -1747,45 +1780,51 @@ public partial class MailForm : Form, IMessageFilter
             ShowPreviewAttachmentsLoading();
 
         string? connectionKey = database is not null && mailbox is ServerMailbox ? entry.Account.ConnectionKey() : null;
+        bool canLoadFromServer = !showingCachedFolder ||
+            mailbox is ServerMailbox server && server.KnowsMessage(mail.Id) && !NetworkUnavailable();
         bool displayedCachedBody = false;
-        if (connectionKey is not null)
-        {
-            try
-            {
-                if (database!.LoadMessageBody(entry.Account.Id, mail.Folder, connectionKey, mail.Id) is { } cached &&
-                    (!string.IsNullOrWhiteSpace(cached.Body) || !string.IsNullOrWhiteSpace(cached.Html)))
-                {
-                    DisplayMessageBody(mail, cached);
-                    displayedCachedBody = true;
-                    // Empty HTML marks a known plain-text message. NULL belongs to older cache entries.
-                    if (showingCachedFolder ||
-                        !mail.HasStandaloneImages && cached.Html is { } html && MailContent.ReferencedContentIds(html).Count == 0 &&
-                        MailContent.ReferencedImageSources(html).Count == 0)
-                    {
-                        if (mail.Attachments && !showingCachedFolder)
-                            _ = LoadPreviewAttachmentsAsync(mailbox, mail.Id, request);
-                        return;
-                    }
-                }
-            }
-            catch (Microsoft.Data.Sqlite.SqliteException)
-            {
-                // The preview can still use the server if the cache is unavailable.
-            }
-        }
-
-        if (showingCachedFolder)
-        {
-            SetPreviewBody("This message body is not saved on this computer. Connect to the mail server to read it.");
-            return;
-        }
-
-        if (!displayedCachedBody)
-            SetPreviewBody("Loading...", italic: true);
+        SetPreviewBody("Loading mail...", italic: true);
         using var load = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
         previewLoad = load;
         try
         {
+            if (connectionKey is not null)
+            {
+                try
+                {
+                    var cached = await Task.Run(() =>
+                        database!.LoadMessageBody(entry.Account.Id, mail.Folder, connectionKey, mail.Id), load.Token);
+                    if (request != previewRequest || IsDisposed)
+                        return;
+                    if (cached is not null && (!string.IsNullOrWhiteSpace(cached.Body) || !string.IsNullOrWhiteSpace(cached.Html)))
+                    {
+                        // A non-null image list marks a downloaded preview, even when there were no embedded images.
+                        bool cacheIsComplete = cached.InlineImages is not null || !mail.HasStandaloneImages && cached.Html is { } html &&
+                            MailContent.ReferencedContentIds(html).Count == 0 && MailContent.ReferencedImageSources(html).Count == 0;
+                        if (!canLoadFromServer || cacheIsComplete)
+                        {
+                            DisplayMessageBody(mail, cached);
+                            if (mail.Attachments && !showingCachedFolder)
+                                _ = LoadPreviewAttachmentsAsync(mailbox, mail.Id, request);
+                            return;
+                        }
+
+                        DisplayMessageBody(mail, cached);
+                        displayedCachedBody = true;
+                    }
+                }
+                catch (Microsoft.Data.Sqlite.SqliteException)
+                {
+                    // The preview can still use the server if the cache is unavailable.
+                }
+            }
+
+            if (!canLoadFromServer)
+            {
+                SetPreviewBody("This message body is not saved on this computer. Connect to the mail server to read it.");
+                return;
+            }
+
             var content = await mailbox.LoadContentAsync(mail.Id, load.Token);
             if (request != previewRequest || IsDisposed)
                 return;
@@ -1796,14 +1835,18 @@ public partial class MailForm : Form, IMessageFilter
             else if (mail.Attachments)
                 _ = LoadPreviewAttachmentsAsync(mailbox, mail.Id, request);
             if (connectionKey is not null && !content.PreviewTooLarge)
-                WriteCachedBody(entry.Account, mail, connectionKey, content);
+                await Task.Run(() => WriteCachedBody(entry.Account, mail, connectionKey, content,
+                    completePreview: !string.IsNullOrEmpty(content.Html)), load.Token);
         }
         catch (OperationCanceledException) { }
         catch (Exception error)
         {
-            if (!displayedCachedBody && request == previewRequest && !IsDisposed)
+            if (request != previewRequest || IsDisposed)
+                return;
+
+            if (!displayedCachedBody)
                 SetPreviewBody(MailOperationError(error, "Could not load the message."));
-            if (mail.Attachments && request == previewRequest && !IsDisposed)
+            if (mail.Attachments)
                 _ = LoadPreviewAttachmentsAsync(mailbox, mail.Id, request);
         }
         finally
@@ -1817,7 +1860,7 @@ public partial class MailForm : Form, IMessageFilter
     {
         var previous = previewContent;
         previewContent = content;
-        bool showImagesForMessage = imagePermission == mail.Id;
+        bool showImagesForMessage = ShouldShowRemoteContent(mail.Id);
         if (string.IsNullOrEmpty(content.Html))
         {
             if (previous is null || !string.IsNullOrEmpty(previous.Html) || previous.Body != content.Body ||
@@ -1830,13 +1873,15 @@ public partial class MailForm : Form, IMessageFilter
         {
             _ = DisplayHtmlBodyAsync(content, previewRequest, showImagesForMessage);
         }
-        reply.Enabled = replyAll.Enabled = forward.Enabled = !showingCachedFolder;
+        reply.Enabled = replyAll.Enabled = forward.Enabled = true;
+        RefreshComposeQuoteSource(mail, content);
         UpdateImagePreview(mail);
     }
 
     private async Task DisplayHtmlBodyAsync(MailContent content, int request, bool showRemoteImages)
     {
         int attempt = ++htmlDisplayAttempt;
+        previewRemoteContentFailed = false;
         if (string.IsNullOrEmpty(content.Html))
         {
             SetPreviewBody(content.Body);
@@ -1865,7 +1910,7 @@ public partial class MailForm : Form, IMessageFilter
             preview.Controls.Add(htmlPreview);
             preview.Controls.SetChildIndex(htmlPreview, preview.Controls.GetChildIndex(previewBody));
         }
-        SetPreviewBody("Loading...", italic: true);
+        SetPreviewBody("Loading mail...", italic: true);
         bool loaded = await htmlPreview.DisplayAsync(content, showRemoteImages);
         if (IsDisposed || request != previewRequest || attempt != htmlDisplayAttempt ||
             previewContent is not { Html.Length: > 0 } currentContent)
@@ -1881,6 +1926,7 @@ public partial class MailForm : Form, IMessageFilter
             if (showRemoteImages)
             {
                 imagePermission = null;
+                previewRemoteContentFailed = true;
                 UpdateImagePreview(SelectedMessage);
             }
         }
@@ -1897,13 +1943,77 @@ public partial class MailForm : Form, IMessageFilter
         previewBody.Select(0, 0);
     }
 
+    private void InitializeRemoteContentSetting()
+    {
+        try { automaticRemoteContent.Checked = database?.LoadAutomaticRemoteContent() ?? true; }
+        catch (Microsoft.Data.Sqlite.SqliteException error)
+        {
+            System.Diagnostics.Debug.WriteLine($"Could not load the remote content preference. {error.Message}");
+            automaticRemoteContent.Checked = false;
+        }
+
+        automaticRemoteContent.Paint += PaintButton;
+        automaticRemoteContent.SizeChanged += (_, _) => FitRemoteContentToggle();
+        automaticRemoteContent.FontChanged += (_, _) => FitRemoteContentToggle();
+        automaticRemoteContent.TextChanged += (_, _) => FitRemoteContentToggle();
+        UpdateRemoteContentToggleAppearance();
+        automaticRemoteContent.CheckedChanged += async (_, _) =>
+        {
+            bool enabled = automaticRemoteContent.Checked;
+            UpdateRemoteContentToggleAppearance();
+            imagePermission = null;
+            if (previewContent is { Html.Length: > 0 } content)
+                _ = DisplayHtmlBodyAsync(content, previewRequest, enabled);
+            UpdateImagePreview(SelectedMessage);
+            if (composeWindow is { Visible: true } && composeSession.QuoteImageSource is not null)
+                DisplayComposeQuote();
+
+            if (database is not { } store)
+                return;
+            automaticRemoteContent.Enabled = false;
+            try { await Task.Run(() => store.SaveAutomaticRemoteContent(enabled)); }
+            catch (Microsoft.Data.Sqlite.SqliteException)
+            {
+                if (!IsDisposed)
+                    ThemedPopup.Show(this, "Could not save the remote content setting. The change applies to this session.", Text);
+            }
+            finally
+            {
+                if (!IsDisposed)
+                    automaticRemoteContent.Enabled = true;
+            }
+        };
+    }
+
+    private void UpdateRemoteContentToggleAppearance()
+    {
+        bool enabled = automaticRemoteContent.Checked;
+        automaticRemoteContent.Text = (enabled ? "✓ " : "✕ ") + AutomaticRemoteContentLabel;
+        automaticRemoteContent.BackColor = enabled ? selectedBackground : sidebar.BackColor;
+        automaticRemoteContent.ForeColor = enabled ? selectedText : folders.ForeColor;
+        automaticRemoteContent.FlatAppearance.MouseOverBackColor = automaticRemoteContent.BackColor;
+        automaticRemoteContent.FlatAppearance.MouseDownBackColor = automaticRemoteContent.BackColor;
+    }
+    private void FitRemoteContentToggle()
+    {
+        int textWidth = Math.Max(1, automaticRemoteContent.ClientSize.Width - 12);
+        int textHeight = TextRenderer.MeasureText(automaticRemoteContent.Text, automaticRemoteContent.Font,
+            new Size(textWidth, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix).Height;
+        int height = Math.Max(exportMail.Height, textHeight + LogicalToDeviceUnits(10));
+        if (automaticRemoteContent.Height != height)
+            automaticRemoteContent.Height = height;
+    }
+
+    private bool ShouldShowRemoteContent(Guid messageId) =>
+        imagePermission == messageId || automaticRemoteContent.Checked;
+
     private void UpdateImagePreview(MailSummary? mail)
     {
         if (imagePermission != mail?.Id)
             imagePermission = null;
 
-        bool hasHtml = mail is not null && previewContent?.Html is { Length: > 0 };
-        imageActionSeparator.Visible = showImages.Visible = hasHtml && imagePermission is null;
+        imageActionSeparator.Visible = showImages.Visible = mail is not null && previewContent?.Html is { Length: > 0 } &&
+            (previewRemoteContentFailed || !ShouldShowRemoteContent(mail.Id));
     }
 }
 

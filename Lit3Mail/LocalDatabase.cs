@@ -14,7 +14,7 @@ internal sealed record AccountSettings(
     string IncomingHost, int IncomingPort, string IncomingUser, bool IncomingStartTls,
     string OutgoingHost, int OutgoingPort, string OutgoingUser, bool OutgoingStartTls, bool Expanded, int Position,
     string ProfileName, bool ProfileUsesAccountName, bool IncomingUsesEmail, bool OutgoingUsesEmail,
-    bool DesktopNotifications);
+    bool DesktopNotifications, bool EnableHtmlSignature);
 
 internal sealed record DraftEditorState(string To, string Cc, string Bcc, string ReplyTo, string Subject,
     bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature, ComposeHtmlQuote? HtmlQuote = null,
@@ -33,7 +33,8 @@ internal sealed class LocalDatabase(string path)
 {
     internal const int FolderCacheLimit = 1000;
     private const int MaxCachedBodyPartBytes = 4 * 1024 * 1024;
-    private const int SchemaVersion = 14;
+    private const int MaxOpenedPreviewCacheBytes = 128 * 1024 * 1024;
+    private const int SchemaVersion = 18;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
@@ -331,11 +332,55 @@ internal sealed class LocalDatabase(string path)
             command.ExecuteNonQuery();
         }
 
+        if (version < 15)
+        {
+            command.CommandText = """
+                ALTER TABLE accounts ADD COLUMN automatically_show_remote_content INTEGER NOT NULL DEFAULT 1;
+                PRAGMA user_version = 15;
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        if (version < 16)
+        {
+            command.CommandText = """
+                ALTER TABLE accounts ADD COLUMN enable_html_signature INTEGER NOT NULL DEFAULT 1;
+                PRAGMA user_version = 16;
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        if (version < 17)
+        {
+            command.CommandText = """
+                ALTER TABLE message_body_cache ADD COLUMN inline_images BLOB;
+                ALTER TABLE message_body_cache ADD COLUMN preview_cached_at INTEGER;
+                PRAGMA user_version = 17;
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        if (version < 18)
+        {
+            command.CommandText = """
+                CREATE TABLE app_preferences (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    automatically_show_remote_content INTEGER NOT NULL DEFAULT 1
+                );
+                INSERT INTO app_preferences (id, automatically_show_remote_content)
+                SELECT 1, NOT EXISTS (SELECT 1 FROM accounts WHERE automatically_show_remote_content = 0);
+                ALTER TABLE accounts DROP COLUMN automatically_show_remote_content;
+                PRAGMA user_version = 18;
+                """;
+            command.ExecuteNonQuery();
+        }
+
         command.CommandText = """
             SELECT id, name, email, reply_to, organisation, signature,
                    incoming_host, incoming_port, incoming_user, incoming_starttls,
                    outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
-                   profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications
+                   profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications,
+                   enable_html_signature
             FROM accounts ORDER BY position, rowid
             """;
         var accounts = new List<AccountSettings>();
@@ -347,10 +392,27 @@ internal sealed class LocalDatabase(string path)
                     reader.GetInt32(7), reader.GetString(8), reader.GetBoolean(9), reader.GetString(10),
                     reader.GetInt32(11), reader.GetString(12), reader.GetBoolean(13), reader.GetBoolean(14),
                     reader.GetInt32(15), reader.GetString(16), reader.GetBoolean(17),
-                    reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20)));
+                    reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20), reader.GetBoolean(21)));
         }
         transaction.Commit();
         return accounts;
+    }
+
+    public bool LoadAutomaticRemoteContent()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT automatically_show_remote_content FROM app_preferences WHERE id = 1";
+        return command.ExecuteScalar() is not long value || value != 0;
+    }
+
+    public void SaveAutomaticRemoteContent(bool enabled)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "UPDATE app_preferences SET automatically_show_remote_content = $enabled WHERE id = 1";
+        command.Parameters.AddWithValue("$enabled", enabled);
+        command.ExecuteNonQuery();
     }
 
     public (DateTimeOffset LastChecked, Version? AvailableVersion) LoadUpdateCheck()
@@ -402,12 +464,14 @@ internal sealed class LocalDatabase(string path)
                     id, name, email, reply_to, organisation, signature,
                     incoming_host, incoming_port, incoming_user, incoming_starttls,
                     outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
-                    profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications
+                    profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications,
+                   enable_html_signature
                 ) VALUES (
                     $id, $name, $email, $replyTo, $organisation, $signature,
                     $incomingHost, $incomingPort, $incomingUser, $incomingStartTls,
                     $outgoingHost, $outgoingPort, $outgoingUser, $outgoingStartTls, $expanded, $position,
-                    $profileName, $profileUsesAccountName, $incomingUsesEmail, $outgoingUsesEmail, $desktopNotifications
+                    $profileName, $profileUsesAccountName, $incomingUsesEmail, $outgoingUsesEmail, $desktopNotifications,
+                    $enableHtmlSignature
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, email = excluded.email, reply_to = excluded.reply_to,
@@ -419,7 +483,8 @@ internal sealed class LocalDatabase(string path)
                     expanded = excluded.expanded, position = excluded.position,
                     profile_name = excluded.profile_name, profile_uses_account_name = excluded.profile_uses_account_name,
                     incoming_uses_email = excluded.incoming_uses_email, outgoing_uses_email = excluded.outgoing_uses_email,
-                    desktop_notifications = excluded.desktop_notifications
+                    desktop_notifications = excluded.desktop_notifications,
+                    enable_html_signature = excluded.enable_html_signature
                 """;
             command.Parameters.Clear();
             command.Parameters.AddWithValue("$id", account.Id.ToString());
@@ -443,6 +508,7 @@ internal sealed class LocalDatabase(string path)
             command.Parameters.AddWithValue("$incomingUsesEmail", account.IncomingUsesEmail);
             command.Parameters.AddWithValue("$outgoingUsesEmail", account.OutgoingUsesEmail);
             command.Parameters.AddWithValue("$desktopNotifications", account.DesktopNotifications);
+            command.Parameters.AddWithValue("$enableHtmlSignature", account.EnableHtmlSignature);
             command.ExecuteNonQuery();
         }
         transaction.Commit();
@@ -669,7 +735,8 @@ internal sealed class LocalDatabase(string path)
             command.CommandText = """
                 DELETE FROM message_body_cache
                 WHERE account_id = $account AND folder = $folder AND
-                    (connection_key <> $connection OR message_id NOT IN (SELECT value FROM json_each($retained)));
+                    (connection_key <> $connection OR
+                     (inline_images IS NULL AND message_id NOT IN (SELECT value FROM json_each($retained))));
                 """;
             command.Parameters.AddWithValue("$retained", JsonSerializer.Serialize(newest.Select(message => message.Id)));
             command.ExecuteNonQuery();
@@ -723,14 +790,19 @@ internal sealed class LocalDatabase(string path)
         if (destination is not null && destinationIds is { Count: > 0 })
         {
             command.CommandText = """
-                INSERT INTO message_body_cache (account_id, folder, connection_key, message_id, body, html)
-                SELECT source.account_id, $destination, source.connection_key, moved.value, source.body, source.html
+                INSERT INTO message_body_cache (account_id, folder, connection_key, message_id, body, html,
+                                                inline_images, preview_cached_at)
+                SELECT source.account_id, $destination, source.connection_key, moved.value, source.body, source.html,
+                       source.inline_images, source.preview_cached_at
                 FROM json_each($destinationIds) AS moved
                 JOIN message_body_cache AS source ON source.message_id = moved.key
                 WHERE source.account_id = $account AND source.folder = $folder AND source.connection_key = $connection
                 ON CONFLICT(account_id, folder, connection_key, message_id) DO UPDATE SET
-                    body = excluded.body, html = excluded.html
-                WHERE message_body_cache.html IS NULL AND excluded.html IS NOT NULL;
+                    body = excluded.body, html = excluded.html, inline_images = excluded.inline_images,
+                    preview_cached_at = excluded.preview_cached_at
+                WHERE message_body_cache.inline_images IS NULL
+                  AND (excluded.inline_images IS NOT NULL OR
+                       (message_body_cache.html IS NULL AND excluded.html IS NOT NULL));
                 """;
             command.Parameters.AddWithValue("$destinationIds", JsonSerializer.Serialize(destinationIds));
             command.ExecuteNonQuery();
@@ -897,7 +969,7 @@ internal sealed class LocalDatabase(string path)
         using var command = connection.CreateCommand();
         command.CommandTimeout = 1;
         command.CommandText = """
-            SELECT body, html FROM message_body_cache
+            SELECT body, html, inline_images FROM message_body_cache
             WHERE account_id = $account AND folder = $folder AND connection_key = $connection AND message_id = $message
               AND octet_length(body) <= $maxPartBytes AND (html IS NULL OR octet_length(html) <= $maxPartBytes)
             """;
@@ -905,14 +977,23 @@ internal sealed class LocalDatabase(string path)
         command.Parameters.AddWithValue("$maxPartBytes", MaxCachedBodyPartBytes);
         command.Parameters.AddWithValue("$message", message.ToString());
         using var reader = command.ExecuteReader();
-        return reader.Read() ? new MailContent(reader.GetString(0), Html: reader.IsDBNull(1) ? null : reader.GetString(1)) : null;
+        if (!reader.Read())
+            return null;
+        InlineMailImage[]? images = null;
+        if (!reader.IsDBNull(2))
+        {
+            try { images = JsonSerializer.Deserialize<InlineMailImage[]>((byte[])reader.GetValue(2)); }
+            catch (JsonException) { }
+        }
+        return new MailContent(reader.GetString(0), Html: reader.IsDBNull(1) ? null : reader.GetString(1), InlineImages: images);
     }
 
-    public void SaveMessageBody(Guid account, string folder, string connectionKey, Guid message, MailContent content) =>
-        SaveMessageBodies(account, folder, connectionKey, [(message, content)], false);
+    public void SaveMessageBody(Guid account, string folder, string connectionKey, Guid message, MailContent content,
+        bool completePreview = false) =>
+        SaveMessageBodies(account, folder, connectionKey, [(message, content)], false, completePreview);
 
     public void SaveMessageBodies(Guid account, string folder, string connectionKey,
-        IReadOnlyList<(Guid Id, MailContent Content)> bodies, bool onlyIfMissing)
+        IReadOnlyList<(Guid Id, MailContent Content)> bodies, bool onlyIfMissing, bool completePreview = false)
     {
         using var connection = Open();
         using var transaction = connection.BeginTransaction();
@@ -934,26 +1015,63 @@ internal sealed class LocalDatabase(string path)
                     retained.Add(id);
             }
         }
-        if (retained.Count == 0)
+        if (retained.Count == 0 && !completePreview)
             return;
 
         command.CommandText = """
-            INSERT INTO message_body_cache (account_id, folder, connection_key, message_id, body, html)
-            VALUES ($account, $folder, $connection, $message, $body, $html)
-            ON CONFLICT(account_id, folder, connection_key, message_id) DO UPDATE SET body = excluded.body, html = excluded.html
-            WHERE NOT $onlyIfMissing OR message_body_cache.html IS NULL
+            INSERT INTO message_body_cache (account_id, folder, connection_key, message_id, body, html,
+                                            inline_images, preview_cached_at)
+            VALUES ($account, $folder, $connection, $message, $body, $html, $images, $cachedAt)
+            ON CONFLICT(account_id, folder, connection_key, message_id) DO UPDATE SET
+                body = excluded.body, html = excluded.html, inline_images = excluded.inline_images,
+                preview_cached_at = excluded.preview_cached_at
+            WHERE excluded.inline_images IS NOT NULL OR
+                (message_body_cache.inline_images IS NULL AND (NOT $onlyIfMissing OR message_body_cache.html IS NULL))
             """;
         var message = command.Parameters.Add("$message", SqliteType.Text);
         var body = command.Parameters.Add("$body", SqliteType.Text);
         var html = command.Parameters.Add("$html", SqliteType.Text);
+        var images = command.Parameters.Add("$images", SqliteType.Blob);
+        var cachedAt = command.Parameters.Add("$cachedAt", SqliteType.Integer);
         command.Parameters.AddWithValue("$onlyIfMissing", onlyIfMissing);
         foreach (var (id, content) in bodies)
         {
-            if (!retained.Contains(id))
+            if (!completePreview && !retained.Contains(id))
                 continue;
             message.Value = id.ToString();
             body.Value = content.Body;
             html.Value = content.Html ?? "";
+            images.Value = completePreview ? JsonSerializer.SerializeToUtf8Bytes(content.InlineImages ?? []) : DBNull.Value;
+            cachedAt.Value = completePreview ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() : DBNull.Value;
+            command.ExecuteNonQuery();
+        }
+        if (completePreview)
+        {
+            command.CommandText = """
+                DELETE FROM message_body_cache AS preview WHERE rowid IN (
+                    SELECT rowid FROM (
+                        SELECT rowid, sum(length(inline_images) + octet_length(body) + octet_length(html)) OVER (
+                            ORDER BY preview_cached_at DESC, rowid DESC
+                        ) AS bytes
+                        FROM message_body_cache WHERE inline_images IS NOT NULL
+                    ) WHERE bytes > $previewBudget
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM folder_cache AS retained,
+                        json_each(CASE WHEN json_valid(retained.summaries) THEN retained.summaries ELSE '[]' END) AS summary
+                    WHERE retained.account_id = preview.account_id AND retained.folder = preview.folder
+                      AND retained.connection_key = preview.connection_key
+                      AND json_extract(summary.value, '$.Id') = preview.message_id
+                );
+                UPDATE message_body_cache SET inline_images = NULL, preview_cached_at = NULL WHERE rowid IN (
+                    SELECT rowid FROM (
+                        SELECT rowid, sum(length(inline_images) + octet_length(body) + octet_length(html)) OVER (
+                            ORDER BY preview_cached_at DESC, rowid DESC
+                        ) AS bytes
+                        FROM message_body_cache WHERE inline_images IS NOT NULL
+                    ) WHERE bytes > $previewBudget
+                );
+                """;
+            command.Parameters.AddWithValue("$previewBudget", MaxOpenedPreviewCacheBytes);
             command.ExecuteNonQuery();
         }
         transaction.Commit();

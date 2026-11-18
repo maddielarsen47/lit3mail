@@ -46,10 +46,14 @@ internal static class ThemedPopup
     internal static DialogResult Show(string text, string caption, MessageBoxButtons buttons, MessageBoxIcon icon) =>
         Show(null, text, caption, buttons, icon);
 
+    internal static IWin32Window? GetDialogOwner(IWin32Window? owner) =>
+        owner is Control control && control.FindForm() is MailForm main ? main.ComposeDialogOwner : owner;
+
     internal static DialogResult Show(IWin32Window? owner, string text, string caption,
         MessageBoxButtons buttons = MessageBoxButtons.OK, MessageBoxIcon icon = MessageBoxIcon.None,
         MessageBoxDefaultButton defaultButton = MessageBoxDefaultButton.Button1)
     {
+        owner = GetDialogOwner(owner);
         if (!IsDark)
             return MessageBox.Show(owner, text, caption, buttons, icon, defaultButton);
 

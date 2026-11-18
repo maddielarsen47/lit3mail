@@ -1,38 +1,40 @@
 # Lit3Mail
 
-**Free for commercial and personal use. Currently in BETA.** 
-
-Lit3Mail's original code and documentation
-are dedicated to the public domain under [CC0 1.0 Universal](LICENCE.md).
-The software is provided as-is, without warranty.
+### Free for commercial and personal use. Currently in BETA.
 
 Lit3Mail is a **simple** Windows desktop email client AI-coded as a hobby project. 
 It was designed and tested with Gmail and can also connect to
 other IMAP and SMTP servers that accept passwords.
 
 - **Password login only.** Lit3Mail supports passwords and provider-issued app
-  passwords. It does not support OAuth, so accounts such 
-  as Outlook.com cannot connect.
+  passwords. It does not support OAuth, so accounts such as Outlook.com cannot connect.
 - **No conversation view.** Messages appear individually in each folder, by design.
 - **Explicit read status.** Messages must be ticked as read explicitly, by design.
-- **Images hidden by default.** Images must be explicitly enabled in messages, by design, 
-  for security/privacy.
 - **No calendar/non-email integration.** Excluded to keep scope small, by design.
+
+### Licence &amp; Disclaimer
+
+Lit3Mail's original code and documentation
+are dedicated to the public domain under [CC0 1.0 Universal](LICENCE.md).
+The software is provided as-is, without warranty.
 
 ## Using Lit3Mail
 
-### Connect an account
+### Install and Connect
 
 1. Ensure `.NET 10 Desktop Runtime` and `Microsoft Edge WebView2 Evergreen Runtime` are installed.
-1. Download the portable ZIP release, extract to the location of your choice (e.g. Program Files/Lit3Mail).
-   For app updates, delete all files in the program folder, then extract.
-2. Create shortcuts as desired to Lit3Mail.exe, and run it.
-3. Configure your account details in **Settings**.
+2. Download the portable ZIP release, extract to the location of your choice (e.g. C:/Program Files/Lit3Mail).
+3. Create shortcuts as desired to Lit3Mail.exe, and run it.
+4. Configure your account details in **Settings**.
 
 For Gmail, enable **2-Step Verification** in your Google Account and generate
 an [App Password](https://support.google.com/accounts/answer/185833) for
 Lit3Mail. Use that App Password in both password fields. New accounts default to
 `imap.gmail.com` on port 993 and `smtp.gmail.com` on port 465 with implicit TLS.
+
+### Updates
+- For automatic updates, use the Check for Updates... button in **Settings** &gt; General.
+- For manual updates, delete all files in the program folder, then extract the ZIP to replace.
 
 ### Read and manage mail
 
@@ -41,6 +43,7 @@ Lit3Mail. Use that App Password in both password fields. New accounts default to
 - When Windows allows banners, new mail notifications stay visible until you
   dismiss them or return to Lit3Mail. Turn them off per account under
   **Desktop notifications** in Settings.
+- **Search** filters the current folder in view only.
 - Gmail labels exposed over IMAP appear after the standard folders, marked
   with an asterisk. Lit3Mail skips **All Mail**, **Important**, and **Starred**.
   To make another label available, enable **Show in IMAP** for it
@@ -50,13 +53,16 @@ Lit3Mail. Use that App Password in both password fields. New accounts default to
 - **Del** asks for confirmation before moving messages to Trash or permanently
   deleting them from Trash. Once confirmed, messages disappear from the list
   immediately and return if the server operation fails.
-- Drag account tabs in **Settings** to change their order in the mail sidebar.
 - Use **Export** in the sidebar to save selected messages or the entire
   current folder as a ZIP of EML files. Folder export includes every message
   in the folder, even when a search filter is active. You can cancel an
   export while it runs.
-- While Lit3Mail is open in the background, a red dot on its Windows taskbar
-  icon indicates newly arrived unread mail. Returning to Lit3Mail clears the dot.
+- Drag account tabs in **Settings** to change their order in the mail sidebar.
+- Untick **Images & Remote Content** in the folders panel to hide images by default
+  and prevent senders from capturing mail-open data.
+- Lit3Mail’s interface is English-only, but the composer and message preview support Unicode, including
+  Chinese, Japanese, Korean, Cyrillic, and accented Latin scripts. Emoji also work where the font supports them.
+  Arabic and Hebrew text can be entered, but the composer currently has no dedicated right-to-left paragraph control.
 
 ### Offline drafts
 
@@ -70,8 +76,7 @@ it. Lit3Mail does not queue messages for sending.
 
 The composer allows up to **25 MiB per file** and **50 MiB total** in file
 attachments. If a selected file exceeds either limit, Lit3Mail skips it and
-lists it in the composer status. Files already attached and other selected
-files that fit are kept. If a server draft exceeds either attachment limit or
+lists it in the composer status. If a server draft exceeds either attachment limit or
 its full message exceeds **80 MiB**, Lit3Mail shows an error and leaves the
 draft on the server.
 

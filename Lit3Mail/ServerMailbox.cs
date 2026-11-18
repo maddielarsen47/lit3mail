@@ -450,6 +450,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     private static string Addresses(InternetAddressList list) =>
         string.Join("; ", list.Mailboxes.Select(mailbox => mailbox.Address));
 
+    public bool KnowsMessage(Guid id) => messages.ContainsKey(id);
+
     private async Task<(IMailFolder Folder, UniqueId Uid)> OpenMessageFolderAsync(
         ImapClient client, Guid id, FolderAccess access, CancellationToken token)
     {
@@ -866,20 +868,23 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         var uids = await ResolveMessageUidsAsync(source, ids, token);
         bool markRead = MailFolders.MarksMovedMessagesRead(destinationFolder) ||
             MailFolders.MarksMovedMessagesRead(destination.Name);
-        if (markRead)
-            await source.AddFlagsAsync(uids, MessageFlags.Seen, true, token);
         var moved = await source.MoveToAsync(uids, destination, token);
-        if (markRead && moved.Count > 0)
+        bool markedRead = false;
+        if (markRead && moved.Count == uids.Count)
         {
             try
             {
                 await destination.OpenAsync(FolderAccess.ReadWrite, token);
-                await destination.AddFlagsAsync(moved.Destination.ToList(), MessageFlags.Seen, true, token);
+                var movedUids = moved.Destination.ToList();
+                if (movedUids.All(uid => uid.Validity == 0 || uid.Validity == destination.UidValidity))
+                {
+                    await destination.AddFlagsAsync(movedUids, MessageFlags.Seen, true, token);
+                    markedRead = true;
+                }
             }
-            catch (Exception error) when (error is IOException or CommandException or ProtocolException or
-                InvalidOperationException or OperationCanceledException)
+            catch (Exception error)
             {
-                // The move already succeeded and the source was marked read before it moved.
+                // The move already succeeded. A later refresh can read the destination flags.
                 System.Diagnostics.Debug.WriteLine($"Could not confirm the destination read flag ({error.GetType().Name}).");
             }
         }
@@ -899,7 +904,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         }
         foreach (Guid id in ids)
             messages.TryRemove(id, out _);
-        return new(markRead, destinationIds);
+        return new(markedRead, destinationIds);
     }
 
     private async Task<IList<UniqueId>> ResolveMessageUidsAsync(IMailFolder source, IReadOnlyCollection<Guid> ids,
@@ -978,7 +983,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     public async Task<DraftSaveResult> SaveDraftAsync(OutgoingMail mail, Guid? replacing, CancellationToken token)
     {
         string messageId = MimeKit.Utils.MimeUtils.GenerateMessageId();
-        using var message = CreateOutgoingMessage(mail, messageId, draft: true);
+        using var message = await Task.Run(() => CreateOutgoingMessage(mail, messageId, draft: true), token);
         using var client = new ImapClient();
         await ConnectAsync(client, incoming, token);
         var drafts = (await FindFoldersAsync(client, token, "Drafts")).GetValueOrDefault("Drafts")
@@ -1070,7 +1075,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     public async Task<SentMailResult> SendAsync(OutgoingMail mail, CancellationToken token)
     {
         string messageId = MimeKit.Utils.MimeUtils.GenerateMessageId();
-        using var message = CreateOutgoingMessage(mail, messageId);
+        using var message = await Task.Run(() => CreateOutgoingMessage(mail, messageId), token);
 
         using (var client = new SmtpClient())
         {

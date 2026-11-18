@@ -1,7 +1,28 @@
+using MimeKit;
+
 namespace Lit3Mail;
 
 internal static class RecipientSeparators
 {
+    public static bool TryValidate(string input, out bool hasRecipient)
+    {
+        hasRecipient = false;
+        foreach (string segment in Split(input))
+        {
+            if (!InternetAddressList.TryParse(segment, out var recipients))
+                return false;
+
+            foreach (var mailbox in recipients.Mailboxes)
+            {
+                int separator = mailbox.Address.LastIndexOf('@');
+                if (separator <= 0 || separator == mailbox.Address.Length - 1)
+                    return false;
+                hasRecipient = true;
+            }
+        }
+        return true;
+    }
+
     public static IEnumerable<int> Find(string text)
     {
         bool quoted = false;

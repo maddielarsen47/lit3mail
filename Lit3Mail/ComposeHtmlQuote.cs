@@ -152,7 +152,12 @@ internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImag
         string quoteHtml = Regex.Replace(Html, @"\A<div><p>--- Original Message ---<br>.*?</p>", match =>
             Regex.Replace(match.Value, "<br>BCC: [^<]*", "", RegexOptions.IgnoreCase),
             RegexOptions.Singleline);
-        string scopedQuote = ScopeStyles(forDraft ? quoteHtml : InlineQuoteStyles(quoteHtml));
+        if (!forDraft)
+        {
+            try { quoteHtml = InlineQuoteStyles(quoteHtml); }
+            catch (RegexMatchTimeoutException) { }
+        }
+        string scopedQuote = ScopeStyles(quoteHtml);
         string marker = forDraft ? $"{DraftMarker}{reply.Body.ReplaceLineEndings("\n").Length.ToString(CultureInfo.InvariantCulture)}-->" : "";
         string body = FindQuotedBcc(Body) is { } bcc ? Body.Remove(bcc.Index, bcc.Length) : Body;
         return new(reply.Body + "\n\n" + body,
@@ -238,7 +243,8 @@ internal sealed record ComposeHtmlQuote(string Body, string Html, InlineMailImag
         void CollectRules(string css, int depth)
         {
             foreach (Match rule in Regex.Matches(css,
-                         @"(?<selector>[^{};]+)\{(?<body>(?:[^{}]|(?<nested>\{)|(?<-nested>\}))*)(?(nested)(?!))\}"))
+                         @"(?<selector>[^{};]+)\{(?<body>(?:[^{}]|(?<nested>\{)|(?<-nested>\}))*)(?(nested)(?!))\}",
+                         RegexOptions.None, TimeSpan.FromMilliseconds(250)))
             {
                 string selector = rule.Groups["selector"].Value.Trim();
                 string body = rule.Groups["body"].Value;

@@ -61,9 +61,9 @@ internal sealed class MailBodyEditor : RichTextBox
         OnSelectionChanged(EventArgs.Empty);
     }
 
-    public MailContent GetMessageContent()
+    internal static MailContent GetMessageContent(string rtf, string body)
     {
-        string html = Rtf is { Length: > 0 } rtf ? RtfPipe.Rtf.ToHtml(rtf) : "";
+        string html = rtf.Length > 0 ? RtfPipe.Rtf.ToHtml(rtf) : "";
         var images = new List<InlineMailImage>();
         html = Regex.Replace(html, "src=\"data:image/png;base64,([A-Za-z0-9+/=]+)\"", match =>
         {
@@ -71,7 +71,7 @@ internal sealed class MailBodyEditor : RichTextBox
             images.Add(new(id, "image/png", Convert.FromBase64String(match.Groups[1].Value)));
             return $"src=\"cid:{id}\"";
         });
-        return new(GetVisibleText(), Html: html, InlineImages: images);
+        return new(body, Html: html, InlineImages: images);
     }
 
     internal string GetVisibleText()

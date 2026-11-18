@@ -57,13 +57,10 @@ public partial class MailForm
         Margin = new Padding(0, 3, 3, 3), FlatStyle = FlatStyle.Flat, Visible = false
     };
     private HtmlMailPreview? composeQuotePreview;
+    private int composeQuoteDisplayAttempt;
     private Form? composeWindow;
-    private Form ComposeDialogOwner => composeWindow is { Visible: true } window ? window : this;
-    private readonly Button popOutCompose = new()
-    {
-        Text = "Pop Out", AutoSize = true, FlatStyle = FlatStyle.Flat,
-        Tag = ToolbarIcon.PopOut, Padding = new Padding(22, 0, 0, 0)
-    };
+    internal Form ComposeDialogOwner => composeWindow is { Visible: true, WindowState: not FormWindowState.Minimized } window
+        ? window : this;
     private readonly Button backFromCompose = new()
     {
         Text = "Back to Mail", AutoSize = true, FlatStyle = FlatStyle.Flat,
@@ -141,7 +138,6 @@ public partial class MailForm
         replyAll.Click += async (_, _) => await OpenResponseAsync(isReply: true, includeOtherRecipients: true);
         forward.Click += async (_, _) => await OpenResponseAsync(isReply: false);
         backFromCompose.Click += (_, _) => LeaveCompose();
-        popOutCompose.Click += (_, _) => ToggleComposeWindow();
         localDrafts.Click += async (_, _) => await OpenLocalDraftAsync();
 
         editDraft.Click += async (_, _) => await OpenServerDraftAsync();
@@ -193,14 +189,12 @@ public partial class MailForm
         composeStatus.Text = "";
         sendMail.Enabled = ComposeSender?.Mailbox is not null;
         saveDraft.Enabled = database is not null || sendMail.Enabled;
-        if (composeWindow is null)
-            mailLayout.Hide();
         composeAddressDetails.Checked = false;
         if (resetBaseline)
             composeSession.Baseline = CaptureDraft();
+        var window = composeWindow ?? CreateComposeWindow();
         composePage.Show();
-        if (composeWindow is { Visible: false } window)
-            window.Show();
+        window.Show();
         DisplayComposeQuote();
         UpdateRecipientAccount();
         focus.Focus();
@@ -216,23 +210,14 @@ public partial class MailForm
         return true;
     }
 
-    private void ToggleComposeWindow()
+    private Form CreateComposeWindow()
     {
-        if (composeWindow is not null)
-        {
-            if (settingsPage.Visible)
-                return;
-            mailLayout.Hide();
-            RestoreComposeToMainWindow();
-            composeBody.Focus();
-            return;
-        }
-
         var window = new Form
         {
             Text = "New Mail", Font = Font, AutoScaleMode = AutoScaleMode.Dpi,
             StartPosition = FormStartPosition.CenterScreen, MinimumSize = MinimumSize,
-            Size = new Size(Math.Max(720, Math.Min(Width, 860)), Math.Max(520, Math.Min(Height, 800))),
+            Size = WindowState == FormWindowState.Normal ? Size : RestoreBounds.Size,
+            WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Maximized : FormWindowState.Normal,
             Icon = Icon, TopMost = true
         };
         window.Activated += async (_, _) =>
@@ -254,20 +239,15 @@ public partial class MailForm
         };
         composeWindow = window;
         window.Controls.Add(composePage);
-        popOutCompose.Text = "Dock";
-        mailLayout.Show();
-        window.Show();
-        composeBody.Focus();
+        return window;
     }
 
-    private void RestoreComposeToMainWindow()
+    private void DisposeComposeWindow()
     {
         if (composeWindow is not { } window)
             return;
         composeWindow = null;
         Controls.Add(composePage);
-        composePage.BringToFront();
-        popOutCompose.Text = "Pop Out";
         window.Dispose();
     }
 
@@ -319,7 +299,7 @@ public partial class MailForm
         bool wasVisible = composePage.Visible;
         recipientAutocomplete?.SetAccount(null, null);
         composePage.Hide();
-        RestoreComposeToMainWindow();
+        DisposeComposeWindow();
         composeQuotePreview?.ClearDisplay();
         composeQuoteFallback.Clear();
         SetComposeQuoteVisible(false);
@@ -353,7 +333,10 @@ public partial class MailForm
             if (!string.IsNullOrWhiteSpace(sender.Signature))
             {
                 composeBody.SelectedText = "\r\n\r\n";
-                composeBody.InsertHtmlOrText(sender.Signature);
+                if (sender.EnableHtmlSignature)
+                    composeBody.InsertHtmlOrText(sender.Signature);
+                else
+                    composeBody.AppendPlainText(sender.Signature);
             }
 
             composeSession.Signature = new(oldRange.Start, composeBody.TextLength - originalLength + oldRange.Length);
@@ -386,7 +369,7 @@ public partial class MailForm
                 ? ComposeHtmlQuote.Create(quoteHeader, quotedMessage,
                     includeQuotedImages, includeQuotedImages ? source => htmlPreview?.GetInlineQuoteImage(source) : null)
                 : null;
-            composeSession.ShowQuoteImages = includeQuotedImages;
+            composeSession.ShowQuoteImages = false;
             composeSession.QuoteImageSource = composeSession.HtmlQuote is not null && quoteHeader is not null && quotedMessage is not null
                 ? (quoteHeader, quotedMessage)
                 : null;
@@ -487,7 +470,8 @@ public partial class MailForm
         SetComposeBody(folder.Account,
             $"{ComposeHtmlQuote.OriginalHeader}\r\n{addressLines}"
             + $"Date: {mail.Date.ToString(DateFormat)}\r\nSubject: {mail.Subject}\r\n\r\n", quotedContent,
-            includeQuotedImages: imagePermission == mail.Id);
+            includeQuotedImages: ShouldShowRemoteContent(mail.Id));
+        composeSession.ShowQuoteImages = imagePermission == mail.Id;
         if (folder.Folder is { } sourceFolder)
             composeSession.Response = new(folder.Account.Id, folder.Account.ConnectionKey(), sourceFolder, mail.Id, isReply);
 
@@ -595,7 +579,24 @@ public partial class MailForm
         string recipient = composeTo.Text.Trim();
         string cc = composeCc.Text.Trim();
         string bcc = composeBcc.Text.Trim();
-        if (!(recipient + cc + bcc).Any(character => character is not (';' or ',') && !char.IsWhiteSpace(character)))
+        bool hasRecipient = false;
+        foreach (var (input, field, label) in new[]
+                 {
+                     (recipient, composeTo, "To"), (cc, composeCc, "CC"), (bcc, composeBcc, "BCC")
+                 })
+        {
+            if (!RecipientSeparators.TryValidate(input, out bool hasAddress))
+            {
+                composeStatus.Text = $"Enter a valid email address in {label}.";
+                if (field != composeTo)
+                    composeAddressDetails.Checked = true;
+                field.Focus();
+                return;
+            }
+            hasRecipient |= hasAddress;
+        }
+
+        if (!hasRecipient)
         {
             composeStatus.Text = "Enter a recipient.";
             composeTo.Focus();
@@ -645,7 +646,7 @@ public partial class MailForm
             try
             {
                 string from = sender.Email.Trim();
-                content = GetComposeMessageContent();
+                (content, _) = await GetComposeMessageContentAsync();
                 sent = await mailbox.SendAsync(new(from, replyTo, recipient, cc,
                     subject.Length == 0 ? "(No subject)" : subject, content.Body, content.Html, content.InlineImages,
                     Bcc: bcc, Files: composeFiles.ToArray()), mailboxLifetime.Token);
@@ -670,9 +671,15 @@ public partial class MailForm
 
             if (ReferenceEquals(sender.Mailbox, mailbox))
             {
-                CacheRecipientAddresses(sender, recipient, cc, bcc);
-                if (sent.Summary is { } summary)
-                    CacheSentMessage(sentFolder, mailbox, summary, content);
+                string key = sender.ConnectionKey();
+                await Task.Run(() =>
+                {
+                    CacheRecipientAddresses(sender.Id, key, recipient, cc, bcc);
+                    if (sent.Summary is { } summary && mailbox is ServerMailbox)
+                        CacheOutgoingMessage(sentFolder, key, summary, content);
+                });
+                if (IsDisposed)
+                    return;
                 sender.CountsUpdatedAt = default;
             }
 
@@ -728,7 +735,7 @@ public partial class MailForm
         localDrafts.Enabled = false;
         try
         {
-            if (ChooseLocalDraft(database) is not { } id)
+            if (await ChooseLocalDraftAsync(database) is not { } id)
                 return;
             var draft = await Task.Run(() => database.LoadLocalDraft(id));
             if (IsDisposed || settingsPage.Visible || composePage.Visible || composeSession.OperationPending)
@@ -754,6 +761,7 @@ public partial class MailForm
             OpenCompose(composeBody);
             composeStatus.Text = "Opened a draft saved on this computer.";
         }
+        catch (OperationCanceledException) when (IsDisposed || Disposing) { }
         catch (Exception error) when (error is Microsoft.Data.Sqlite.SqliteException or System.Text.Json.JsonException or ArgumentException)
         {
             if (!IsDisposed)
@@ -776,7 +784,8 @@ public partial class MailForm
         editDraft.Enabled = false;
         try
         {
-            var local = ReadDraftEditorState(folder.Account, summary.Id);
+            string key = folder.Account.ConnectionKey();
+            var local = await Task.Run(() => ReadDraftEditorState(folder.Account.Id, key, summary.Id), mailboxLifetime.Token);
             var serverDraft = local is null || summary.Attachments
                 ? await mailbox.LoadDraftAsync(summary.Id, mailboxLifetime.Token) : null;
             if (IsDisposed || SelectedFolder != folder || SelectedMessage?.Id != summary.Id ||
@@ -813,6 +822,9 @@ public partial class MailForm
             return;
 
         var snapshot = CaptureDraft();
+        var quoteSource = composeSession.QuoteImageSource;
+        bool showQuoteImages = ShowComposeQuoteImages;
+        bool quoteResolved = false;
         var sender = snapshot.Sender;
         var mailbox = sender?.Mailbox;
         Guid? replacing = mailbox is not null && ReferenceEquals(composeSession.EditingServerDraft?.Mailbox, mailbox) ? composeSession.EditingServerDraft?.Id : null;
@@ -837,7 +849,10 @@ public partial class MailForm
             try
             {
                 CancelBackgroundCache(sender);
-                content = GetComposeMessageContent(forDraft: true);
+                ComposeHtmlQuote? savedQuote;
+                (content, savedQuote) = await GetComposeMessageContentAsync(forDraft: true);
+                snapshot = snapshot with { HtmlQuote = savedQuote };
+                quoteResolved = true;
                 saved = await mailbox.SaveDraftAsync(new(sender.Email.Trim(), snapshot.ReplyTo.Trim(),
                     snapshot.To, snapshot.Cc, snapshot.Subject, content.Body, content.Html, content.InlineImages,
                     Bcc: snapshot.Bcc, Files: snapshot.Files), replacing, mailboxLifetime.Token);
@@ -857,23 +872,26 @@ public partial class MailForm
                 return;
             if (ReferenceEquals(sender.Mailbox, mailbox))
             {
-                if (saved.Replaced && replacing is { } oldId)
-                    ClearDraftCache(sender, oldId);
-                if (saved.Summary is { } summary && target is not null)
+                if (database is not null && target is not null)
                 {
-                    if (database is not null)
+                    string key = sender.ConnectionKey();
+                    await Task.Run(() =>
                     {
+                        if (saved.Replaced && replacing is { } oldId)
+                            ClearDraftCache(sender.Id, key, oldId);
+                        if (saved.Summary is not { } cachedDraft)
+                            return;
                         if (mailbox is ServerMailbox)
-                        {
-                            string key = sender.ConnectionKey();
-                            var cached = ReadCachedFolder(target, "Drafts", key);
-                            WriteCachedFolder(target, "Drafts", key, cached.Where(mail => mail.Id != summary.Id)
-                                .Prepend(summary).ToArray());
-                        }
-                        CacheDraftEditorState(sender, summary, new DraftEditorState(snapshot.To, snapshot.Cc, snapshot.Bcc,
+                            CacheOutgoingMessage(target, key, cachedDraft, content);
+                        CacheDraftEditorState(sender.Id, key, cachedDraft.Id, new DraftEditorState(snapshot.To, snapshot.Cc, snapshot.Bcc,
                             snapshot.ReplyTo, snapshot.Subject, snapshot.UsesDefaultReplyTo, snapshot.BodyRtf,
-                            snapshot.Signature, snapshot.HtmlQuote, snapshot.Response), content);
-                    }
+                            snapshot.Signature, snapshot.HtmlQuote, snapshot.Response));
+                    });
+                    if (IsDisposed)
+                        return;
+                }
+                if (saved.Summary is { } summary && target is not null && ReferenceEquals(sender.Mailbox, mailbox))
+                {
                     if (SelectedFolder == target && string.IsNullOrWhiteSpace(search.Text))
                     {
                         var current = SelectedMessage;
@@ -899,7 +917,13 @@ public partial class MailForm
 
         async Task SaveLocalFallbackAsync(string reason)
         {
-            bool savedLocally = await SaveDraftLocallyAsync(snapshot);
+            var localSnapshot = snapshot;
+            if (!quoteResolved && snapshot.HtmlQuote is { } quote)
+            {
+                var localQuote = await Task.Run(() => BuildComposeQuote(quote, quoteSource, showQuoteImages));
+                localSnapshot = snapshot with { HtmlQuote = localQuote };
+            }
+            bool savedLocally = await SaveDraftLocallyAsync(localSnapshot);
             if (IsDisposed)
                 return;
             if (savedLocally)
@@ -1113,8 +1137,7 @@ public partial class MailForm
             };
             AddButton(backFromCompose, new Padding(0, 0, 8, 0));
             AddButton(saveDraft, new Padding(0, 0, 8, 0));
-            AddButton(attachFiles, new Padding(0, 0, 8, 0));
-            AddButton(popOutCompose, Padding.Empty);
+            AddButton(attachFiles, Padding.Empty);
             row.Controls.Add(new Label
             {
                 Text = "·", AutoSize = true, Anchor = AnchorStyles.None,
@@ -1135,7 +1158,6 @@ public partial class MailForm
                     };
                     button.Click += (_, _) => original.PerformClick();
                     original.EnabledChanged += (_, _) => button.Enabled = original.Enabled;
-                    original.TextChanged += (_, _) => button.Text = original.Text;
                     composeActionCopies.Add(button);
                 }
                 button.Margin = margin;
@@ -1175,11 +1197,47 @@ public partial class MailForm
         return frame;
     }
 
-    private MailContent GetComposeMessageContent(bool forDraft = false)
+    private Task<(MailContent Content, ComposeHtmlQuote? Quote)> GetComposeMessageContentAsync(bool forDraft = false)
     {
-        var reply = composeBody.GetMessageContent();
-        return composeSession.HtmlQuote?.WithReply(reply, forDraft) ?? reply;
+        string rtf = composeBody.Rtf ?? "";
+        string body = composeBody.GetVisibleText();
+        var original = composeSession.HtmlQuote;
+        var source = composeSession.QuoteImageSource;
+        bool showImages = ShowComposeQuoteImages;
+        return Task.Run(() =>
+        {
+            var reply = MailBodyEditor.GetMessageContent(rtf, body);
+            var quote = original is null ? null : BuildComposeQuote(original, source, showImages);
+            return (quote?.WithReply(reply, forDraft) ?? reply, quote);
+        }, mailboxLifetime.Token);
     }
+
+    private void RefreshComposeQuoteSource(MailSummary mail, MailContent content)
+    {
+        if (composeWindow is not { Visible: true } || composeSession.QuoteImageSource is not { } source ||
+            composeSession.Response is not { } response || response.MessageId != mail.Id ||
+            SelectedFolder is not { } folder || response.AccountId != folder.Account.Id ||
+            response.Folder != folder.Folder || response.ConnectionKey != folder.Account.ConnectionKey() ||
+            string.IsNullOrEmpty(content.Html) || content.PreviewTooLarge ||
+            content.InlineImages is null && source.Message.InlineImages is not null)
+            return;
+
+        composeSession.QuoteImageSource = (source.Header, content);
+        if (ShowComposeQuoteImages)
+            DisplayComposeQuote();
+    }
+
+    private bool ShowComposeQuoteImages =>
+        composeSession.QuoteImageSource is not null &&
+        (composeSession.ShowQuoteImages || automaticRemoteContent.Checked);
+
+    private static ComposeHtmlQuote BuildComposeQuote(ComposeHtmlQuote quote,
+        (string Header, MailContent Message)? source, bool showImages, bool allowRemoteContent = false) =>
+        source is { } original
+            ? ComposeHtmlQuote.Create(original.Header, original.Message, includeImages: showImages,
+                approvedImage: url => quote.Images.FirstOrDefault(image => image.ContentLocation == url),
+                allowRemoteContent: showImages && allowRemoteContent)
+            : quote;
 
     private void SetComposeQuoteVisible(bool visible)
     {
@@ -1195,15 +1253,12 @@ public partial class MailForm
             return;
         }
 
+        int attempt = ++composeQuoteDisplayAttempt;
         SetComposeQuoteVisible(true);
         var source = composeSession.QuoteImageSource;
-        bool showImages = composeSession.ShowQuoteImages && source is not null;
+        bool showImages = ShowComposeQuoteImages;
         showComposeQuoteImages.Visible = !showImages && source is not null;
-        var displayQuote = showImages && source is { } original
-            ? ComposeHtmlQuote.Create(original.Header, original.Message, includeImages: true,
-                approvedImage: url => quote.Images.FirstOrDefault(image => image.ContentLocation == url),
-                allowRemoteContent: true)
-            : quote;
+        var displayQuote = BuildComposeQuote(quote, source, showImages, allowRemoteContent: true);
         composeQuoteFallback.Text = quote.Body;
         composeQuoteFallback.Show();
         if (composeQuotePreview is null)
@@ -1221,8 +1276,9 @@ public partial class MailForm
         async Task ShowQuoteAsync()
         {
             var quotedContent = new MailContent(displayQuote.Body, Html: displayQuote.HtmlForPreview(), InlineImages: displayQuote.Images);
-            bool loaded = await composeQuotePreview.DisplayAsync(quotedContent, showRemoteImages: showImages, showInlineImages: true);
-            if (!ReferenceEquals(composeSession.HtmlQuote, quote) || !composePage.Visible)
+            bool loaded = await composeQuotePreview.DisplayAsync(quotedContent, showRemoteImages: showImages,
+                showInlineImages: source is null || showImages);
+            if (attempt != composeQuoteDisplayAttempt || !ReferenceEquals(composeSession.HtmlQuote, quote) || !composePage.Visible)
                 return;
             if (loaded)
                 composeQuoteFallback.Hide();
@@ -1231,11 +1287,11 @@ public partial class MailForm
         }
     }
 
-    private DraftEditorState? ReadDraftEditorState(MailAccount account, Guid draft)
+    private DraftEditorState? ReadDraftEditorState(Guid account, string key, Guid draft)
     {
         try
         {
-            return database?.LoadDraftEditorState(account.Id, account.ConnectionKey(), draft);
+            return database?.LoadDraftEditorState(account, key, draft);
         }
         catch (Exception error) when (error is Microsoft.Data.Sqlite.SqliteException or System.Text.Json.JsonException)
         {
@@ -1243,15 +1299,11 @@ public partial class MailForm
         }
     }
 
-    private void CacheDraftEditorState(MailAccount account, MailSummary summary, DraftEditorState state, MailContent content)
+    private void CacheDraftEditorState(Guid account, string key, Guid draft, DraftEditorState state)
     {
-        if (database is null)
-            return;
-        string key = account.ConnectionKey();
         try
         {
-            database.SaveDraftEditorState(account.Id, key, summary.Id, state);
-            WriteCachedBody(account, summary, key, content);
+            database?.SaveDraftEditorState(account, key, draft, state);
         }
         catch (Microsoft.Data.Sqlite.SqliteException)
         {
@@ -1259,11 +1311,11 @@ public partial class MailForm
         }
     }
 
-    private void ClearDraftCache(MailAccount account, Guid draft)
+    private void ClearDraftCache(Guid account, string key, Guid draft)
     {
         try
         {
-            database?.RemoveMessageCaches(account.Id, "Drafts", account.ConnectionKey(), [draft]);
+            database?.RemoveMessageCaches(account, "Drafts", key, [draft]);
         }
         catch (Microsoft.Data.Sqlite.SqliteException) { }
     }
@@ -1279,7 +1331,8 @@ public partial class MailForm
             if (!IsDisposed)
             {
                 draft.Account.CountsUpdatedAt = default;
-                ClearDraftCache(draft.Account, draft.Id);
+                string key = draft.Account.ConnectionKey();
+                await Task.Run(() => ClearDraftCache(draft.Account.Id, key, draft.Id));
             }
         }
         catch (Exception)
@@ -1290,13 +1343,13 @@ public partial class MailForm
         }
     }
 
-    private void CacheRecipientAddresses(MailAccount account, string to, string cc, string bcc)
+    private void CacheRecipientAddresses(Guid account, string key, string to, string cc, string bcc)
     {
         if (database is null)
             return;
         try
         {
-            database.SaveKnownAddresses(account.Id, account.ConnectionKey(), [to, cc, bcc]);
+            database.SaveKnownAddresses(account, key, [to, cc, bcc]);
         }
         catch (Microsoft.Data.Sqlite.SqliteException)
         {
@@ -1304,16 +1357,15 @@ public partial class MailForm
         }
     }
 
-    private void CacheSentMessage(FolderEntry folder, IMailbox mailbox, MailSummary summary, MailContent content)
+    private void CacheOutgoingMessage(FolderEntry folder, string key, MailSummary summary, MailContent content)
     {
-        if (database is null || mailbox is not ServerMailbox)
+        if (database is null || folder.Folder is not { } name)
             return;
 
-        const string name = "Sent";
-        var key = folder.Account.ConnectionKey();
+        string? revision = ReadFolderCacheRevision(folder.Account.Id, name);
         var cached = ReadCachedFolder(folder, name, key);
         var rows = cached.Where(mail => mail.Id != summary.Id).Append(summary).ToArray();
-        WriteCachedFolder(folder, name, key, rows);
+        WriteCachedFolder(folder, name, key, rows, onlyIfUnchanged: true, expectedRevision: revision);
         WriteCachedBody(folder.Account, summary, key, content);
     }
 

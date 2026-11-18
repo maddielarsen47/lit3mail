@@ -36,7 +36,7 @@ public partial class MailForm
     };
     private readonly Label previewAttachmentsLoading = new()
     {
-        Text = "Attachments loading...", AutoSize = true, Visible = false
+        Text = "Loading attachments...", AutoSize = true, Visible = false
     };
     private Label previewAttachmentLabel = null!;
     private readonly Label previewAttachmentStatus = new() { AutoSize = true, Visible = false };
@@ -132,18 +132,26 @@ public partial class MailForm
                 string name = Path.GetFileName(path);
                 try
                 {
-                    await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
-                        81920, FileOptions.Asynchronous | FileOptions.SequentialScan);
-                    long length = input.Length;
-                    if (length > ComposeAttachmentLimits.RemainingFileBytes(totalBytes))
+                    int remaining = ComposeAttachmentLimits.RemainingFileBytes(totalBytes);
+                    var file = await Task.Run(async () =>
+                    {
+                        await using var input = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
+                            81920, FileOptions.Asynchronous | FileOptions.SequentialScan);
+                        long length = input.Length;
+                        if (length > remaining)
+                            return null;
+                        byte[] bytes = new byte[(int)length];
+                        await input.ReadExactlyAsync(bytes, token);
+                        return new MailFileAttachment(name, MimeKit.MimeTypes.GetMimeType(name), bytes);
+                    }, token);
+                    token.ThrowIfCancellationRequested();
+                    if (file is null)
                     {
                         oversized.Add(name);
                         continue;
                     }
-                    byte[] bytes = new byte[(int)length];
-                    await input.ReadExactlyAsync(bytes, token);
-                    totalBytes += bytes.Length;
-                    composeFiles.Add(new(name, MimeKit.MimeTypes.GetMimeType(name), bytes));
+                    totalBytes += file.Bytes.Length;
+                    composeFiles.Add(file);
                 }
                 catch (Exception error) when (error is IOException or UnauthorizedAccessException or NotSupportedException)
                 {
@@ -333,7 +341,7 @@ public partial class MailForm
         else
         {
             using var picker = new SaveFileDialog { FileName = name, Title = "Save attachment", RestoreDirectory = true };
-            if (picker.ShowDialog(this) != DialogResult.OK)
+            if (picker.ShowDialog(ComposeDialogOwner) != DialogResult.OK)
                 return;
             path = picker.FileName;
         }
@@ -379,7 +387,7 @@ public partial class MailForm
             Description = "Choose a folder to save all attachments",
             UseDescriptionForTitle = true
         };
-        if (attachments.Length == 0 || picker.ShowDialog(this) != DialogResult.OK)
+        if (attachments.Length == 0 || picker.ShowDialog(ComposeDialogOwner) != DialogResult.OK)
             return;
 
         openAttachment.Enabled = saveAttachment.Enabled = saveAllAttachments.Enabled = false;

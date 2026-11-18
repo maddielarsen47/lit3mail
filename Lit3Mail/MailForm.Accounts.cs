@@ -17,6 +17,7 @@ public partial class MailForm
         public bool IncomingUsesEmail { get; set; } = true;
         public bool OutgoingUsesEmail { get; set; } = true;
         public bool DesktopNotifications { get; set; } = true;
+        public bool EnableHtmlSignature { get; set; } = true;
         public string Email { get; set; } = email;
         public string ReplyTo { get; set; } = "";
         public string Organisation { get; set; } = "";
@@ -97,6 +98,7 @@ public partial class MailForm
                 IncomingUsesEmail = account.IncomingUsesEmail,
                 OutgoingUsesEmail = account.OutgoingUsesEmail,
                 DesktopNotifications = account.DesktopNotifications,
+                EnableHtmlSignature = account.EnableHtmlSignature,
                 ReplyTo = account.ReplyTo,
                 Organisation = account.Organisation,
                 Signature = account.Signature,
@@ -144,7 +146,7 @@ public partial class MailForm
             account.IncomingHost, account.IncomingPort, account.IncomingUser, account.IncomingStartTls,
             account.OutgoingHost, account.OutgoingPort, account.OutgoingUser, account.OutgoingStartTls, account.Expanded,
             position, account.ProfileName, account.ProfileUsesAccountName, account.IncomingUsesEmail, account.OutgoingUsesEmail,
-            account.DesktopNotifications))
+            account.DesktopNotifications, account.EnableHtmlSignature))
             .ToDictionary(account => account.Id);
         var updated = current.Values.Where(account =>
             !savedAccounts.TryGetValue(account.Id, out var previous) || previous != account).ToArray();
@@ -173,6 +175,10 @@ public partial class MailForm
     private const string AccountDragFormat = "Lit3Mail.AccountTab";
     private RadioButton? draggedAccountTab;
     private readonly Panel accountPages = new() { Dock = DockStyle.Fill, Padding = new Padding(1) };
+    private readonly FlowLayoutPanel settingsActions = new()
+    {
+        Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(0, 10, 0, 0)
+    };
     private Action? removeSelectedAccount;
     private readonly Button removeAccount = new()
     {
@@ -286,17 +292,13 @@ public partial class MailForm
 
     private void InitializeAccountSettings()
     {
-        var actions = new FlowLayoutPanel
-        {
-            Dock = DockStyle.Bottom, AutoSize = true, Padding = new Padding(0, 10, 0, 0)
-        };
-        actions.Controls.Add(backToMail);
-        actions.Controls.Add(addAccount);
-        actions.Controls.Add(removeAccount);
+        settingsActions.Controls.Add(backToMail);
+        settingsActions.Controls.Add(addAccount);
+        settingsActions.Controls.Add(removeAccount);
         removeAccount.Click += (_, _) => removeSelectedAccount?.Invoke();
         settingsPage.Controls.Add(accountPages);
         settingsPage.Controls.Add(accountTabs);
-        settingsPage.Controls.Add(actions);
+        settingsPage.Controls.Add(settingsActions);
         settingsPage.Controls.Add(settingsHeading);
         AddGeneralSettingsTab();
         foreach (var account in accounts)
@@ -351,17 +353,44 @@ public partial class MailForm
     {
         var page = new Panel
         {
-            Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(14), Visible = false
+            Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(14),
+            AutoScrollMargin = new Size(0, 14), Visible = false
         };
         var tab = new RadioButton
         {
             Text = title, Appearance = Appearance.Button, AutoSize = true,
             Padding = new Padding(8, 3, 8, 3), Margin = new Padding(0, 0, 4, 3)
         };
-        var fields = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2 };
+        var fields = new TableLayoutPanel
+        {
+            Location = new Point(page.Padding.Left, page.Padding.Top),
+            AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, ColumnCount = 2
+        };
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 180));
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         page.Controls.Add(fields);
+        // Let the table's actual bounds determine the scroll range.
+        page.SizeChanged += (_, _) => FitFields();
+        page.Layout += (_, _) => FitFields();
+        FitFields();
+
+        void FitFields()
+        {
+            // The client width can still reflect the old scrollbar state during a window restore.
+            int width = Math.Max(1, page.Width - page.Padding.Horizontal - SystemInformation.VerticalScrollBarWidth);
+            var size = new Size(width, 0);
+            if (fields.MinimumSize != size || fields.MaximumSize != size)
+            {
+                fields.SuspendLayout();
+                fields.MaximumSize = size;
+                fields.MinimumSize = size;
+                fields.Width = width;
+                fields.ResumeLayout();
+            }
+
+            if (page.AutoScrollPosition.X != 0)
+                page.AutoScrollPosition = new Point(0, -page.AutoScrollPosition.Y);
+        }
         accountPages.Controls.Add(page);
         accountTabs.Controls.Add(tab);
         tab.CheckedChanged += (_, _) => page.Visible = tab.Checked;
@@ -538,7 +567,7 @@ public partial class MailForm
                     UseDescriptionForTitle = true,
                     SelectedPath = location.Text
                 };
-                if (picker.ShowDialog(this) == DialogResult.OK)
+                if (picker.ShowDialog(ComposeDialogOwner) == DialogResult.OK)
                     SetDataFolder(picker.SelectedPath);
             };
             resetFolder.Click += (_, _) => SetDataFolder(LocalDatabase.DefaultFolder);
@@ -721,6 +750,9 @@ public partial class MailForm
         AddText("Reply-To Address", account.ReplyTo, value => account.ReplyTo = value);
         AddText("Organisation", account.Organisation, value => account.Organisation = value);
         AddText("Signature Text/HTML", account.Signature, value => account.Signature = value, multiline: true);
+        var enableHtmlSignature = new CheckBox { Text = "Written in HTML code", AutoSize = true, Checked = account.EnableHtmlSignature };
+        enableHtmlSignature.CheckedChanged += (_, _) => account.EnableHtmlSignature = enableHtmlSignature.Checked;
+        AddRow("", enableHtmlSignature);
         var notifications = new CheckBox
         {
             Text = "Notify me when new mail arrives", AutoSize = true, Checked = account.DesktopNotifications
@@ -744,6 +776,7 @@ public partial class MailForm
                 ? account.Mailbox is null ? "Saved sign-in unavailable. Sign in again or forget it." : "Using a saved Windows sign-in."
                 : ""
         };
+        AddRow("", status);
         var gmailHelp = new Label
         {
             AutoSize = true,
@@ -760,8 +793,6 @@ public partial class MailForm
             int width = Math.Max(1, fields.ClientSize.Width - (int)fields.ColumnStyles[0].Width);
             gmailHelp.MaximumSize = new Size(width, 0);
         }
-        AddRow("", status);
-
         var imapServer = AddText("IMAP Server", account.IncomingHost, value => account.IncomingHost = value);
         var imapPort = AddPort("IMAP Port", account.IncomingPort, value => account.IncomingPort = value);
         var imapUser = AddLinkedText("IMAP Username", email, "Same as Email Address", account.IncomingUsesEmail,
@@ -995,12 +1026,11 @@ public partial class MailForm
                 return;
             CancelBackgroundCache(account);
             accounts.Remove(account);
+            ((RadioButton)accountTabs.Controls[0]).Checked = true;
             accountTabs.Controls.Remove(tab);
             tab.Dispose();
             accountPages.Controls.Remove(page);
             page.Dispose();
-            if (accountTabs.Controls.Count > 0)
-                ((RadioButton)accountTabs.Controls[0]).Checked = true;
             bool keepSelection = selected is not null && selected.Account != account;
             RebuildFolders(keepSelection ? selected!.Account : null, keepSelection ? selected!.Folder! : "Inbox");
             ApplyTheme();
@@ -1031,7 +1061,7 @@ public partial class MailForm
         {
             page.BackColor = surface;
             page.ForeColor = ink;
-            foreach (Control field in page.Controls[0].Controls)
+            foreach (Control field in page.Controls.OfType<TableLayoutPanel>().Single().Controls)
             {
                 if (field is Panel { Controls.Count: 1 } frame && frame.Controls[0] is TextBox input)
                 {

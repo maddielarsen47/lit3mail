@@ -11,8 +11,11 @@ public partial class MailForm
         Text = "Local Drafts", Dock = DockStyle.Bottom, Height = 30, FlatStyle = FlatStyle.Flat
     };
 
-    private Guid? ChooseLocalDraft(LocalDatabase store)
+    private async Task<Guid?> ChooseLocalDraftAsync(LocalDatabase store)
     {
+        var drafts = await Task.Run(store.ListLocalDrafts, mailboxLifetime.Token);
+        if (IsDisposed || Disposing)
+            return null;
         using var picker = new Form
         {
             Text = "Local Drafts", StartPosition = FormStartPosition.CenterParent,
@@ -33,7 +36,7 @@ public partial class MailForm
         ThemedPopup.ApplyTo(picker);
         picker.AcceptButton = open;
         picker.CancelButton = close;
-        list.Items.AddRange(store.ListLocalDrafts().Cast<object>().ToArray());
+        list.Items.AddRange(drafts.Cast<object>().ToArray());
         if (list.Items.Count == 0)
         {
             ThemedPopup.Show(this, "There are no drafts saved on this computer.", Text);
@@ -45,26 +48,38 @@ public partial class MailForm
             if (list.SelectedItem is LocalDraftEntry)
                 picker.DialogResult = DialogResult.OK;
         };
-        delete.Click += (_, _) =>
+        delete.Click += async (_, _) =>
         {
             if (list.SelectedItem is not LocalDraftEntry draft ||
                 ThemedPopup.Show(picker, "Delete this local draft?", picker.Text, MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
                 return;
+            int index = list.SelectedIndex;
+            list.Enabled = open.Enabled = delete.Enabled = false;
             try
             {
-                int index = list.SelectedIndex;
-                store.DeleteLocalDraft(draft.Id);
+                await Task.Run(() => store.DeleteLocalDraft(draft.Id));
+                if (picker.IsDisposed)
+                    return;
                 list.Items.RemoveAt(index);
                 list.SelectedIndex = Math.Min(index, list.Items.Count - 1);
             }
             catch (SqliteException)
             {
-                ThemedPopup.Show(picker, "Could not delete the local draft. Try again.", picker.Text);
+                if (!picker.IsDisposed)
+                    ThemedPopup.Show(picker, "Could not delete the local draft. Try again.", picker.Text);
+            }
+            finally
+            {
+                if (!picker.IsDisposed)
+                {
+                    list.Enabled = true;
+                    open.Enabled = delete.Enabled = list.SelectedItem is LocalDraftEntry;
+                }
             }
         };
         list.SelectedIndex = 0;
-        return picker.ShowDialog(this) == DialogResult.OK && list.SelectedItem is LocalDraftEntry selected ? selected.Id : null;
+        return picker.ShowDialog(ComposeDialogOwner) == DialogResult.OK && list.SelectedItem is LocalDraftEntry selected ? selected.Id : null;
     }
 
     private static bool NetworkUnavailable() => !System.Net.NetworkInformation.NetworkInterface.GetIsNetworkAvailable();

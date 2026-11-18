@@ -64,7 +64,7 @@ public partial class MailForm
             Filter = "ZIP archive (*.zip)|*.zip", DefaultExt = "zip", AddExtension = true,
             FileName = $"{ExportFileNames.SafeStem(entry.Account.Counts.GetValueOrDefault(folder)?.LabelName ?? folder, "Mail")}.zip", RestoreDirectory = true
         };
-        if (picker.ShowDialog(this) != DialogResult.OK)
+        if (picker.ShowDialog(ComposeDialogOwner) != DialogResult.OK)
             return;
 
         string target = picker.FileName;

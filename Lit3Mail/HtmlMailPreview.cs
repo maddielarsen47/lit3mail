@@ -438,7 +438,7 @@ internal sealed class HtmlMailPreview : WebView2
                     Title = "Save image", FileName = "image.png", Filter = "PNG image (*.png)|*.png",
                     RestoreDirectory = true
                 };
-                if (dialog.ShowDialog(this) == DialogResult.OK)
+                if (dialog.ShowDialog(ThemedPopup.GetDialogOwner(FindForm())) == DialogResult.OK)
                     image.Save(dialog.FileName, System.Drawing.Imaging.ImageFormat.Png);
             }
             else
