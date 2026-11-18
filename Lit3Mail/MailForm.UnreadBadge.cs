@@ -28,10 +28,7 @@ public partial class MailForm
     private void OnMailWindowActivated()
     {
         if (unfocusedSince is not null)
-        {
-            TryScrollMessagesTo(0);
             mailFocusGeneration++;
-        }
         mailIndicatorTimer.Interval = 60_000;
         unfocusedSince = null;
         badgeCheck?.Cancel();

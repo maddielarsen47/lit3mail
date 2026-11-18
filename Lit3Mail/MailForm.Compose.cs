@@ -218,7 +218,7 @@ public partial class MailForm
             StartPosition = FormStartPosition.CenterScreen, MinimumSize = MinimumSize,
             Size = WindowState == FormWindowState.Normal ? Size : RestoreBounds.Size,
             WindowState = WindowState == FormWindowState.Maximized ? FormWindowState.Maximized : FormWindowState.Normal,
-            Icon = Icon, TopMost = true
+            Icon = Icon
         };
         window.Activated += async (_, _) =>
         {

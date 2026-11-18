@@ -1080,7 +1080,8 @@ public partial class MailForm : Form, IMessageFilter
                 if (readCachedRows && (cached.Count > 0 || clearingSearch))
                 {
                     SetCachedFolder(cached.Count > 0);
-                    RenderFolder(cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
+                    RenderFolder(cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected,
+                        preserveScrollAnchor: !debounce && !clearingSearch);
                     _ = ShowPreview();
                 }
             }
@@ -1115,8 +1116,6 @@ public partial class MailForm : Form, IMessageFilter
                 batchBar.Hide();
             var current = SelectedMessage;
             bool wasCached = showingCachedFolder;
-            int firstRow = messages.FirstDisplayedScrollingRowIndex;
-            var scrollAnchor = backgroundRefresh && firstRow > 0 ? messages.Rows[firstRow].Tag as MailSummary : null;
             selected = current;
             if (mailbox is not null && string.IsNullOrWhiteSpace(query) && !IsPendingMoveSource())
                 SetFolderCount(entry.Account, folder, folderMail.Count(mail => !mail.Read), folderMail.Count);
@@ -1125,14 +1124,8 @@ public partial class MailForm : Form, IMessageFilter
                 SortPublishedRows();
             else
                 RenderFolder(folderMail
-                    .Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
-            if (scrollAnchor is not null)
-            {
-                var row = messages.Rows.Cast<DataGridViewRow>()
-                    .FirstOrDefault(row => row.Tag is MailSummary mail && mail.Id == scrollAnchor.Id);
-                if (row is not null)
-                    TryScrollMessagesTo(row.Index);
-            }
+                    .Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected,
+                    preserveScrollAnchor: (!debounce && !clearingSearch) || receivedBatch || seededSearch);
             loadedUnfilteredFolder = string.IsNullOrWhiteSpace(query) ? entry : null;
             var displayed = SelectedMessage;
             bool keepPreview = !seededSearch && !wasCached && current?.Id == displayed?.Id &&
@@ -1198,7 +1191,7 @@ public partial class MailForm : Form, IMessageFilter
             SetCachedFolder(seededSearch);
             foreach (var mail in rows)
                 publishedIds.Add(mail.Id);
-            RenderFolder(rows, SelectedMessage);
+            RenderFolder(rows, SelectedMessage, preserveScrollAnchor: !debounce);
             _ = ShowPreview();
         }
 
@@ -1226,7 +1219,7 @@ public partial class MailForm : Form, IMessageFilter
                         return;
                     }
                     SetCachedFolder(false);
-                    RenderFolder(newRows, selected);
+                    RenderFolder(newRows, selected, preserveScrollAnchor: !debounce && !clearingSearch);
                     _ = ShowPreview();
                     return;
                 }
@@ -1467,7 +1460,7 @@ public partial class MailForm : Form, IMessageFilter
             _ => descending ? folderMail.OrderByDescending(mail => mail.Date) : folderMail.OrderBy(mail => mail.Date)
         };
 
-    private void RenderFolder(IReadOnlyList<MailSummary> folderMail, MailSummary? selected)
+    private void RenderFolder(IReadOnlyList<MailSummary> folderMail, MailSummary? selected, bool preserveScrollAnchor = true)
     {
         var selectedIds = selectionMade
             ? messages.SelectedRows.Cast<DataGridViewRow>().Select(row => ((MailSummary)row.Tag!).Id).ToHashSet()
@@ -1475,26 +1468,40 @@ public partial class MailForm : Form, IMessageFilter
         if (selectedIds.Count == 0 && selected is not null)
             selectedIds.Add(selected.Id);
 
+        int firstRow = preserveScrollAnchor ? messages.FirstDisplayedScrollingRowIndex : -1;
+        var anchor = firstRow >= 0 ? messages.Rows[firstRow].Tag as MailSummary : null;
+
         rebuildingRows = true;
-        messages.Rows.Clear();
-        var selectedRows = new List<DataGridViewRow>();
-        foreach (var mail in SortFolder(folderMail))
+        try
         {
-            int index = AddMessageRow(mail);
-            if (selectedIds.Contains(mail.Id))
-                selectedRows.Add(messages.Rows[index]);
+            messages.Rows.Clear();
+            var selectedRows = new List<DataGridViewRow>();
+            int anchorIndex = -1;
+            foreach (var mail in SortFolder(folderMail))
+            {
+                int index = AddMessageRow(mail);
+                if (selectedIds.Contains(mail.Id))
+                    selectedRows.Add(messages.Rows[index]);
+                if (mail.Id == anchor?.Id)
+                    anchorIndex = index;
+            }
+
+            messages.Columns[sortColumn].HeaderCell.SortGlyphDirection =
+                descending ? SortOrder.Descending : SortOrder.Ascending;
+            messages.CurrentCell = selectedRows.Count > 0 ? selectedRows[0].Cells[3] : null;
+            messages.ClearSelection();
+            foreach (var row in selectedRows)
+                row.Selected = true;
+            selectionMade = selectedRows.Count > 0;
+            selectedMessageId = SelectedMessage?.Id;
+
+            if (firstRow >= 0)
+                TryScrollMessagesTo(anchorIndex >= 0 ? anchorIndex : Math.Min(firstRow, messages.Rows.Count - 1));
         }
-
-        messages.Columns[sortColumn].HeaderCell.SortGlyphDirection =
-            descending ? SortOrder.Descending : SortOrder.Ascending;
-        messages.CurrentCell = selectedRows.Count > 0 ? selectedRows[0].Cells[3] : null;
-        messages.ClearSelection();
-        foreach (var row in selectedRows)
-            row.Selected = true;
-        selectionMade = selectedRows.Count > 0;
-        selectedMessageId = SelectedMessage?.Id;
-
-                rebuildingRows = false;
+        finally
+        {
+            rebuildingRows = false;
+        }
     }
 
     private string GridCorrespondents(MailSummary mail) =>
