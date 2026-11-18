@@ -23,7 +23,7 @@ public partial class MailForm : Form, IMessageFilter
     private readonly SplitContainer mailPane = new()
     {
         Dock = DockStyle.Fill, Orientation = Orientation.Horizontal,
-        Size = new Size(866, 650), SplitterDistance = 280, Panel2Collapsed = true
+        Size = new Size(866, 650), SplitterDistance = 280, FixedPanel = FixedPanel.Panel1
     };
     private CancellationTokenSource? previewLoad;
     private int previewRequest;
@@ -64,8 +64,15 @@ public partial class MailForm : Form, IMessageFilter
     private readonly SelectionCountLabel messageSelectionCount = new()
     {
         Text = "0 selected", AccessibleName = "Message selection count",
-        Dock = DockStyle.Bottom, AutoSize = false, Height = 26,
+        Dock = DockStyle.Fill, AutoSize = false,
         TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 12, 0)
+    };
+    private readonly Panel messageSelectionBar = new() { Dock = DockStyle.Bottom, Height = 26 };
+    private readonly Button toggleMessageList = new()
+    {
+        Text = "▴", AccessibleName = "Hide email list",
+        Dock = DockStyle.Right, Width = 28, FlatStyle = FlatStyle.Flat,
+        UseVisualStyleBackColor = false, Margin = Padding.Empty
     };
     private readonly Label searchStatus = new()
     {
@@ -78,7 +85,7 @@ public partial class MailForm : Form, IMessageFilter
     };
     private readonly SplitContainer mailLayout;
     private readonly Panel sidebar = new() { Dock = DockStyle.Fill, Padding = new Padding(14, 16, 14, 16) };
-    private readonly Panel preview = new() { Dock = DockStyle.Fill, Padding = new Padding(24, 10, 24, 10) };
+    private readonly Panel preview = new() { Dock = DockStyle.Fill, Padding = new Padding(24, 10, 24, 10), Visible = false };
     private readonly Panel settingsPage = new() { Dock = DockStyle.Fill, Padding = new Padding(24), Visible = false };
     private readonly Button editDraft = new()
     {
@@ -274,7 +281,9 @@ public partial class MailForm : Form, IMessageFilter
         mailPane.Panel1.Controls.Add(messageViewport);
         mailPane.Panel1.Controls.Add(batchBar);
         mailPane.Panel1.Controls.Add(composeOperationBar);
-        mailPane.Panel1.Controls.Add(messageSelectionCount);
+        messageSelectionBar.Controls.Add(messageSelectionCount);
+        messageSelectionBar.Controls.Add(toggleMessageList);
+        mailPane.Panel1.Controls.Add(messageSelectionBar);
         messages.SelectionChanged += (_, _) =>
             messageSelectionCount.Text = $"{messages.SelectedRows.Count:N0} selected";
         searchBar.Controls.Add(CreateTextField(search));
@@ -642,7 +651,7 @@ public partial class MailForm : Form, IMessageFilter
                 }
             }
         };
-        InitializeWindowLayout(mailLayout);
+        InitializeWindowLayout(mailLayout, hints);
         InitializeUnreadBadge();
         InitializeDesktopNotifications();
         InitializeAutoRefresh();
@@ -727,7 +736,7 @@ public partial class MailForm : Form, IMessageFilter
         automaticRemoteContent.FlatAppearance.CheckedBackColor = selectedBackground;
         folderHeading.ForeColor = folders.ForeColor = theme.ForeColor = composeFrom.ForeColor = ink;
         UpdateRemoteContentToggleAppearance();
-        preview.BackColor = previewBody.BackColor = messages.BackgroundColor = surface;
+        mailPane.Panel2.BackColor = preview.BackColor = previewBody.BackColor = messages.BackgroundColor = surface;
         previewSubject.BackColor = previewDetails.BackColor = surface;
         previewSubject.ForeColor = previewBody.ForeColor = ink;
         previewDetails.ForeColor = muted;
@@ -739,7 +748,9 @@ public partial class MailForm : Form, IMessageFilter
         composePage.ForeColor = ink;
         recipientAutocomplete?.SetColors(surface, ink);
         ApplyAttachmentTheme(surface, chrome, ink, border, selectedBackground);
-        messageSelectionCount.BackColor = searchStatus.BackColor = surface;
+        messageSelectionBar.BackColor = messageSelectionCount.BackColor = searchStatus.BackColor = surface;
+        StyleButton(toggleMessageList, chrome, ink, border, selectedBackground, autoSize: false);
+        toggleMessageList.TextAlign = ContentAlignment.MiddleCenter;
         batchBar.BackColor = batchStatus.BackColor = surface;
         composeOperationBar.BackColor = composeOperationStatus.BackColor = surface;
         batchStatus.ForeColor = composeOperationStatus.ForeColor = ink;
@@ -1765,13 +1776,13 @@ public partial class MailForm : Form, IMessageFilter
         UpdateImagePreview(selected);
         if (SelectedFolder is not { Account.Mailbox: { } mailbox } entry || selected is not { } mail)
         {
-            mailPane.Panel2Collapsed = true;
+            preview.Hide();
             previewSubject.Text = "";
             previewDetails.Text = "";
             previewBody.Clear();
             return;
         }
-        mailPane.Panel2Collapsed = false;
+        preview.Show();
         editDraft.Visible = entry.Folder == "Drafts" && !showingCachedFolder;
         moveMail.Enabled = deleteMail.Enabled = true;
 

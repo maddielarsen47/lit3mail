@@ -84,7 +84,7 @@ draft on the server.
 
 ### Build
 
-Build on Windows with the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
+Built in C#, for Windows, using the [.NET 10 SDK](https://dotnet.microsoft.com/download/dotnet/10.0).
 The [WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/)
 provides HTML previews. Lit3Mail can display the plain-text version if the
 runtime is unavailable.
