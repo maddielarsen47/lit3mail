@@ -33,7 +33,7 @@ internal sealed class LocalDatabase(string path)
 {
     internal const int FolderCacheLimit = 1000;
     private const int MaxCachedBodyPartBytes = 4 * 1024 * 1024;
-    private const int SchemaVersion = 13;
+    private const int SchemaVersion = 14;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
@@ -318,6 +318,19 @@ internal sealed class LocalDatabase(string path)
             command.ExecuteNonQuery();
         }
 
+        if (version < 14)
+        {
+            command.CommandText = """
+                CREATE TABLE update_check (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    last_checked_utc INTEGER NOT NULL,
+                    available_version TEXT
+                );
+                PRAGMA user_version = 14;
+                """;
+            command.ExecuteNonQuery();
+        }
+
         command.CommandText = """
             SELECT id, name, email, reply_to, organisation, signature,
                    incoming_host, incoming_port, incoming_user, incoming_starttls,
@@ -338,6 +351,33 @@ internal sealed class LocalDatabase(string path)
         }
         transaction.Commit();
         return accounts;
+    }
+
+    public (DateTimeOffset LastChecked, Version? AvailableVersion) LoadUpdateCheck()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT last_checked_utc, available_version FROM update_check WHERE id = 1";
+        using var reader = command.ExecuteReader();
+        if (!reader.Read())
+            return (DateTimeOffset.MinValue, null);
+        var checkedAt = DateTimeOffset.FromUnixTimeSeconds(reader.GetInt64(0));
+        Version? version = !reader.IsDBNull(1) && Version.TryParse(reader.GetString(1), out var parsed) ? parsed : null;
+        return (checkedAt, version);
+    }
+
+    public void SaveUpdateCheck(DateTimeOffset checkedAt, Version? availableVersion)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = """
+            INSERT INTO update_check (id, last_checked_utc, available_version) VALUES (1, $checked, $version)
+            ON CONFLICT(id) DO UPDATE SET last_checked_utc = excluded.last_checked_utc,
+                                          available_version = excluded.available_version
+            """;
+        command.Parameters.AddWithValue("$checked", checkedAt.ToUnixTimeSeconds());
+        command.Parameters.AddWithValue("$version", (object?)availableVersion?.ToString() ?? DBNull.Value);
+        command.ExecuteNonQuery();
     }
 
     public void SaveAccounts(IEnumerable<AccountSettings> updated, IEnumerable<Guid> removed)

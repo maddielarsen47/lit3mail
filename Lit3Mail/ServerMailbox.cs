@@ -41,8 +41,15 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     private async Task ConnectAsync(MailService client, MailEndpoint endpoint, CancellationToken token)
     {
         client.Timeout = 30000;
-        await client.ConnectAsync(endpoint.Host, endpoint.Port,
-            endpoint.StartTls ? SecureSocketOptions.StartTls : SecureSocketOptions.SslOnConnect, token);
+        try
+        {
+            await client.ConnectAsync(endpoint.Host, endpoint.Port,
+                endpoint.StartTls ? SecureSocketOptions.StartTls : SecureSocketOptions.SslOnConnect, token);
+        }
+        catch (OperationCanceledException error) when (!token.IsCancellationRequested)
+        {
+            throw new TimeoutException("The mail server connection timed out.", error);
+        }
         client.AuthenticationMechanisms.Remove("XOAUTH2");
         client.AuthenticationMechanisms.Remove("OAUTHBEARER");
         await client.AuthenticateAsync(endpoint.User, endpoint.Password, token);
@@ -213,11 +220,9 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             if (summary is null)
                 return null;
 
-            string? text = await ReadSnippetAsync(summary.TextBody);
-            if (text?.Contains('<') == true)
-                text = ReadHtmlAsText(text, stripNonVisibleContent: true);
-            if (string.IsNullOrWhiteSpace(text) && await ReadSnippetAsync(summary.HtmlBody) is { } html)
-                text = ReadHtmlAsText(html, stripNonVisibleContent: true);
+            string text = ReadReminderText(await ReadSnippetAsync(summary.TextBody));
+            if (string.IsNullOrWhiteSpace(text))
+                text = ReadReminderText(await ReadSnippetAsync(summary.HtmlBody));
             return new(summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, text);
         }
         catch (Exception error) when (error is IOException or CommandException or ProtocolException or
@@ -712,6 +717,25 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         _ => ContentEncoding.Default
     };
 
+    internal static string ReadReminderText(string? value)
+    {
+        string text = value ?? "";
+        for (int pass = 0; pass < 3; pass++)
+        {
+            string decoded = System.Net.WebUtility.HtmlDecode(text);
+            if (decoded == text)
+                break;
+            text = decoded;
+        }
+
+        if (text.Contains('<'))
+            text = ReadHtmlAsText(text, stripNonVisibleContent: true);
+
+        // A byte-limited excerpt can end mid-tag or contain a bare stylesheet.
+        return Regex.IsMatch(text, @"<\s*(?:[!/?]|[a-z][\w:-]*(?=\s|[/>]|$))|&(?:lt|#0*60|#x0*3c);|/\*|@(?:media|font-face|import|supports)\b|\{\s*[-\w]+\s*:",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant) ? "" : text;
+    }
+
     private static string ReadHtmlAsText(string html, bool stripNonVisibleContent = false)
     {
         using var reader = new StringReader(html);
@@ -728,7 +752,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 continue;
             }
             if (stripNonVisibleContent && part is HtmlTagToken { IsEndTag: false, IsEmptyElement: false } open &&
-                open.Name.ToLowerInvariant() is "head" or "style" or "script" or "title" or "template")
+                open.Name.ToLowerInvariant() is "head" or "style" or "script" or "title" or "template" or "noscript" or "xml")
             {
                 hiddenTag = open.Name;
                 continue;
@@ -997,6 +1021,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 message.Date.LocalDateTime, mail.From, Addresses(message.To), Addresses(message.Cc), mail.ReplyTo,
                 BccAddresses: Addresses(message.Bcc), ExplicitReplyToAddresses: Addresses(message.ReplyTo))
             : null;
+        if (summary is null)
+            warning ??= "The server accepted the draft, but Lit3Mail could not locate it in Drafts yet.";
         return new(summary, replaced, warning);
     }
 

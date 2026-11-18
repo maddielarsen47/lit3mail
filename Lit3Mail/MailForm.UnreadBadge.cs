@@ -8,43 +8,58 @@ public partial class MailForm
     private bool unreadBadgeVisible;
     private bool checkingMailIndicators;
     private int mailFocusGeneration;
+    private System.Windows.Forms.Timer mailIndicatorTimer = null!;
 
     private void InitializeUnreadBadge()
     {
-        var timer = new System.Windows.Forms.Timer(components!) { Interval = 60_000 };
-        timer.Tick += async (_, _) => await CheckMailIndicatorsAsync();
-        Activated += (_, _) =>
-        {
-            if (unfocusedSince is not null && messages.Visible && messages.Rows.Count > 0)
-                messages.FirstDisplayedScrollingRowIndex = 0;
-            if (unfocusedSince is not null)
-                mailFocusGeneration++;
-            timer.Interval = 60_000;
-            unfocusedSince = null;
-            badgeCheck?.Cancel();
-            accountsWithNewUnread.Clear();
-            SetUnreadBadge(false);
-        };
-        Deactivate += (_, _) => BeginUnfocused();
+        mailIndicatorTimer = new System.Windows.Forms.Timer(components!) { Interval = 60_000 };
+        mailIndicatorTimer.Tick += async (_, _) => await CheckMailIndicatorsAsync();
+        Activated += (_, _) => OnMailWindowActivated();
+        Deactivate += (_, _) => CheckMailWindowFocus();
         Shown += (_, _) =>
         {
             if (ActiveForm != this)
                 BeginUnfocused();
             else
-                timer.Start();
+                mailIndicatorTimer.Start();
         };
+    }
 
-        void BeginUnfocused()
+    private void OnMailWindowActivated()
+    {
+        if (unfocusedSince is not null)
         {
-            unfocusedSince ??= DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
-            timer.Interval = 30_000;
-            timer.Start();
+            TryScrollMessagesTo(0);
+            mailFocusGeneration++;
         }
+        mailIndicatorTimer.Interval = 60_000;
+        unfocusedSince = null;
+        badgeCheck?.Cancel();
+        accountsWithNewUnread.Clear();
+        SetUnreadBadge(false);
+    }
+
+    private void CheckMailWindowFocus()
+    {
+        if (choosingComposeFiles)
+            return;
+        this.PostIfHandleAvailable(() =>
+        {
+            if (!choosingComposeFiles && ActiveForm != this && (composeWindow is null || ActiveForm != composeWindow))
+                BeginUnfocused();
+        });
+    }
+
+    private void BeginUnfocused()
+    {
+        unfocusedSince ??= DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+        mailIndicatorTimer.Interval = 30_000;
+        mailIndicatorTimer.Start();
     }
 
     private async Task CheckMailIndicatorsAsync()
     {
-        if (checkingMailIndicators || IsDisposed || Disposing)
+        if (choosingComposeFiles || checkingMailIndicators || IsDisposed || Disposing)
             return;
 
         checkingMailIndicators = true;
@@ -60,6 +75,10 @@ public partial class MailForm
             SetUnreadBadge(unfocusedSince is not null && accountsWithNewUnread.Count > 0);
             if (unfocusedSince is not null)
                 ShowMailReminders(await reminders);
+        }
+        catch (OperationCanceledException)
+        {
+            // A canceled background check can be retried on the next tick.
         }
         finally
         {

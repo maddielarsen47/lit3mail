@@ -5,6 +5,8 @@ using System.Net.Sockets;
 
 namespace Lit3Mail;
 
+internal enum RemoteMailResource { Image, Stylesheet, Font }
+
 internal static class RemoteMailImages
 {
     private static ReadOnlySpan<byte> PngSignature => [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
@@ -22,14 +24,14 @@ internal static class RemoteMailImages
         uri.IsAbsoluteUri && uri.Scheme is "http" or "https" && uri.UserInfo.Length == 0 &&
         uri.IsDefaultPort;
 
-    internal static async Task<(MemoryStream Body, string MediaType)?> DownloadAsync(Uri uri)
+    internal static async Task<(MemoryStream Body, string MediaType)?> DownloadAsync(Uri uri, RemoteMailResource resource)
     {
         using var queueTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(30));
         await DownloadSlots.WaitAsync(queueTimeout.Token).ConfigureAwait(false);
         try
         {
             using var downloadTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
-            return await DownloadCoreAsync(uri, downloadTimeout.Token).ConfigureAwait(false);
+            return await DownloadCoreAsync(uri, resource, downloadTimeout.Token).ConfigureAwait(false);
         }
         finally
         {
@@ -37,7 +39,7 @@ internal static class RemoteMailImages
         }
     }
 
-    private static async Task<(MemoryStream Body, string MediaType)?> DownloadCoreAsync(Uri uri, CancellationToken token)
+    private static async Task<(MemoryStream Body, string MediaType)?> DownloadCoreAsync(Uri uri, RemoteMailResource resource, CancellationToken token)
     {
         for (int redirects = 0; redirects <= 4 && IsWebImageUrl(uri); redirects++)
         {
@@ -51,8 +53,7 @@ internal static class RemoteMailImages
             }
 
             var mediaType = response.Content.Headers.ContentType?.MediaType;
-            if (!response.IsSuccessStatusCode || (mediaType is not null &&
-                !mediaType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)) ||
+            if (!response.IsSuccessStatusCode || !MatchesResourceType(resource, mediaType) ||
                 response.Content.Headers.ContentLength > MaxImageBytes)
                 return null;
 
@@ -92,6 +93,16 @@ internal static class RemoteMailImages
         }
         return null;
     }
+
+    private static bool MatchesResourceType(RemoteMailResource resource, string? mediaType) =>
+        resource switch
+        {
+            RemoteMailResource.Image => mediaType is null || mediaType.StartsWith("image/", StringComparison.OrdinalIgnoreCase),
+            RemoteMailResource.Stylesheet => string.Equals(mediaType, "text/css", StringComparison.OrdinalIgnoreCase),
+            RemoteMailResource.Font => mediaType?.StartsWith("font/", StringComparison.OrdinalIgnoreCase) == true ||
+                mediaType?.ToLowerInvariant() is "application/font-woff" or "application/font-woff2" or "application/vnd.ms-fontobject",
+            _ => false
+        };
 
     private static async ValueTask<Stream> ConnectPublicAsync(SocketsHttpConnectionContext context, CancellationToken token)
     {

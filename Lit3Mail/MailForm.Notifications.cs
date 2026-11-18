@@ -81,13 +81,23 @@ public partial class MailForm
     {
         Guid? accountId = args.Arguments.TryGetValue("account", out string? value) && Guid.TryParse(value, out var id)
             ? id : null;
-        this.PostIfHandleAvailable(() =>
+        this.PostIfHandleAvailable(async () =>
         {
             if (WindowState == FormWindowState.Minimized)
                 WindowState = FormWindowState.Normal;
             Activate();
             var account = accounts.FirstOrDefault(item => item.Id == accountId && item.DesktopNotifications && item.Mailbox is not null);
-            if (!composePage.Visible && !settingsPage.Visible && account is not null)
+            if (!mailLayout.Visible || settingsPage.Visible || account is null)
+                return;
+
+            suppressSearchReload = true;
+            try { search.Clear(); }
+            finally { suppressSearchReload = false; }
+
+            var inbox = new FolderEntry(account, "Inbox");
+            if (SelectedFolder == inbox)
+                await ShowFolder(SelectedMessage, showRefreshStatus: true, prioritizeCurrentFolder: true);
+            else
                 SelectFolder(account, "Inbox");
         });
     }
@@ -144,7 +154,7 @@ public partial class MailForm
                 .OrderByDescending(item => item.ArrivalTime).FirstOrDefault();
             if (preview is not null)
             {
-                string subject = LimitNotificationText(preview.Subject, 48);
+                string subject = LimitNotificationText(ServerMailbox.ReadReminderText(preview.Subject), 48);
                 if (subject.Length > 0)
                     text += "\n" + subject;
                 string excerpt = LimitNotificationText(preview.Text, 199 - text.Length);

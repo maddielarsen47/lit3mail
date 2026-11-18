@@ -173,6 +173,11 @@ public partial class MailForm
     private const string AccountDragFormat = "Lit3Mail.AccountTab";
     private RadioButton? draggedAccountTab;
     private readonly Panel accountPages = new() { Dock = DockStyle.Fill, Padding = new Padding(1) };
+    private Action? removeSelectedAccount;
+    private readonly Button removeAccount = new()
+    {
+        Text = "Remove Account", Height = 36, FlatStyle = FlatStyle.Flat, Enabled = false
+    };
     private readonly Button addAccount = new() { Text = "Add Account", Height = 36, FlatStyle = FlatStyle.Flat, };
     private bool rebuildingFolders;
 
@@ -287,6 +292,8 @@ public partial class MailForm
         };
         actions.Controls.Add(backToMail);
         actions.Controls.Add(addAccount);
+        actions.Controls.Add(removeAccount);
+        removeAccount.Click += (_, _) => removeSelectedAccount?.Invoke();
         settingsPage.Controls.Add(accountPages);
         settingsPage.Controls.Add(accountTabs);
         settingsPage.Controls.Add(actions);
@@ -372,9 +379,131 @@ public partial class MailForm
         fields.Controls.Add(field, 1, row);
     }
 
+    private ReleaseUpdate.StagedRelease? pendingUpdate;
+    private DateTimeOffset lastUpdateCheck;
+    private Version? availableUpdate;
+    private bool checkingForUpdate;
+    private readonly Button checkForUpdates = new() { Text = "Check for Updates…", AutoSize = true };
+    private readonly Button updateNotice = new()
+    {
+        Text = "Update available", Dock = DockStyle.Bottom, Height = 36, FlatStyle = FlatStyle.Flat, Visible = false
+    };
+
+    private void InitializeUpdateChecks()
+    {
+        try
+        {
+            if (database is { } store)
+                (lastUpdateCheck, availableUpdate) = store.LoadUpdateCheck();
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException error)
+        {
+            Debug.WriteLine($"Could not load update history. {error.Message}");
+        }
+
+        UpdateAvailableNotice();
+        updateNotice.Click += async (_, _) => await CheckForUpdateAsync();
+        var timer = new System.Windows.Forms.Timer(components!) { Interval = (int)TimeSpan.FromMinutes(15).TotalMilliseconds };
+        timer.Tick += async (_, _) => await CheckForUpdateAsync(automatic: true);
+        Shown += async (_, _) =>
+        {
+            timer.Start();
+            await CheckForUpdateAsync(automatic: true);
+        };
+    }
+
+    private void UpdateAvailableNotice() =>
+        updateNotice.Visible = availableUpdate is { } version && version > ReleaseUpdate.InstalledVersion;
+
+    private async Task<ReleaseUpdate.Release?> CheckAndRecordUpdateAsync()
+    {
+        lastUpdateCheck = DateTimeOffset.UtcNow;
+        try
+        {
+            var release = await ReleaseUpdate.CheckAsync(mailboxLifetime.Token);
+            availableUpdate = release?.Version;
+            if (!IsDisposed)
+                UpdateAvailableNotice();
+            return release;
+        }
+        finally
+        {
+            if (!IsDisposed)
+            {
+                try { database?.SaveUpdateCheck(lastUpdateCheck, availableUpdate); }
+                catch (Microsoft.Data.Sqlite.SqliteException error)
+                {
+                    Debug.WriteLine($"Could not save update history. {error.Message}");
+                }
+            }
+        }
+    }
+
+    private async Task CheckForUpdateAsync(bool automatic = false)
+    {
+        if (IsDisposed || Disposing || checkingForUpdate ||
+            automatic && DateTimeOffset.UtcNow - lastUpdateCheck < TimeSpan.FromDays(1))
+            return;
+
+        checkingForUpdate = true;
+        checkForUpdates.Enabled = updateNotice.Enabled = false;
+        ReleaseUpdate.StagedRelease? staging = null;
+        try
+        {
+            var release = await CheckAndRecordUpdateAsync();
+            if (IsDisposed || automatic)
+                return;
+            if (release is null)
+            {
+                ThemedPopup.Show(this, "Lit3Mail is up to date.", "Updates");
+                return;
+            }
+            if (ThemedPopup.Show(this, $"Download and install Lit3Mail {release.Version}? The app will restart.",
+                    "Updates", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+                return;
+
+            checkForUpdates.Text = "Downloading update…";
+            staging = await ReleaseUpdate.StageAsync(release, mailboxLifetime.Token);
+            if (IsDisposed)
+                return;
+            pendingUpdate = staging;
+            Close();
+            if (IsDisposed)
+                staging = null; // The updater owns the staged files after a successful close.
+        }
+        catch (OperationCanceledException) when (IsDisposed || Disposing) { }
+        catch (Exception error)
+        {
+            if (automatic)
+                Debug.WriteLine($"Automatic update check failed. {error.Message}");
+            else if (!IsDisposed)
+                ThemedPopup.Show(this, $"Could not prepare the update. {error.Message}", "Updates",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+        finally
+        {
+            pendingUpdate = null;
+            staging?.Dispose();
+            checkingForUpdate = false;
+            if (!IsDisposed)
+            {
+                checkForUpdates.Text = "Check for Updates…";
+                checkForUpdates.Enabled = updateNotice.Enabled = true;
+            }
+        }
+    }
+
     private void AddGeneralSettingsTab()
     {
-        var (_, _, fields) = AddSettingsTab("General");
+        var (_, tab, fields) = AddSettingsTab("General");
+        tab.CheckedChanged += (_, _) =>
+        {
+            if (tab.Checked)
+            {
+                removeSelectedAccount = null;
+                removeAccount.Enabled = false;
+            }
+        };
         AddSettingsRow(fields, "App theme", theme);
 
         if (database is { } store)
@@ -437,6 +566,8 @@ public partial class MailForm
 
         string version = typeof(MailForm).Assembly.GetName().Version?.ToString(3) ?? Application.ProductVersion;
         AddSettingsRow(fields, "App version", new Label { AutoSize = true, Text = version });
+        AddSettingsRow(fields, "", checkForUpdates);
+        checkForUpdates.Click += async (_, _) => await CheckForUpdateAsync();
 
         const string repositoryUrl = "https://github.com/maddielarsen47/lit3mail/";
         var repository = new LinkLabel { AutoSize = true, Text = repositoryUrl };
@@ -666,10 +797,6 @@ public partial class MailForm
         var forget = new Button { Text = "Forget saved sign-in", AutoSize = true, Enabled = account.HasSavedSignIn };
         AddRow("", forget);
 
-        AddSection("Data");
-        var remove = new Button { Text = "Remove Account", AutoSize = true, FlatStyle = FlatStyle.Flat };
-        AddRow("", remove);
-
         string? activeKey = account.Mailbox is null ? null : account.ConnectionKey();
 
         SavedSignIn? sessionSignIn = null;
@@ -830,7 +957,7 @@ public partial class MailForm
             }
 
             var signIn = new SavedSignIn(key, incomingPassword, outgoingPassword);
-            connect.Enabled = remove.Enabled = forget.Enabled = false;
+            connect.Enabled = forget.Enabled = false;
             try
             {
                 await ConnectAccountAsync(signIn, mailboxLifetime.Token);
@@ -844,13 +971,24 @@ public partial class MailForm
             {
                 if (!IsDisposed)
                 {
-                    connect.Enabled = remove.Enabled = true;
+                    connect.Enabled = true;
                     forget.Enabled = account.HasSavedSignIn;
                 }
             }
         };
 
-        remove.Click += (_, _) =>
+        tab.CheckedChanged += (_, _) => UpdateRemoveAccountAction();
+        connect.EnabledChanged += (_, _) => UpdateRemoveAccountAction();
+
+        void UpdateRemoveAccountAction()
+        {
+            if (!tab.Checked)
+                return;
+            removeSelectedAccount = connect.Enabled ? RemoveAccount : null;
+            removeAccount.Enabled = connect.Enabled;
+        }
+
+        void RemoveAccount()
         {
             var selected = SelectedFolder;
             if (!ForgetSignIn())
@@ -866,7 +1004,7 @@ public partial class MailForm
             bool keepSelection = selected is not null && selected.Account != account;
             RebuildFolders(keepSelection ? selected!.Account : null, keepSelection ? selected!.Folder! : "Inbox");
             ApplyTheme();
-        };
+        }
     }
 
     private static string ConnectionError(Exception error) => error switch
@@ -888,6 +1026,7 @@ public partial class MailForm
             tab.FlatAppearance.CheckedBackColor = hover;
         }
         StyleButton(addAccount, chrome, ink, border, hover);
+        StyleButton(removeAccount, chrome, ink, border, hover);
         foreach (Panel page in accountPages.Controls)
         {
             page.BackColor = surface;

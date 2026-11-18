@@ -51,7 +51,19 @@ public partial class MailForm
         Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
         AccessibleName = "Original message"
     };
+    private readonly Button showComposeQuoteImages = new()
+    {
+        Text = "⚠ Show images", AccessibleName = "Show images in quoted message", AutoSize = true,
+        Margin = new Padding(0, 3, 3, 3), FlatStyle = FlatStyle.Flat, Visible = false
+    };
     private HtmlMailPreview? composeQuotePreview;
+    private Form? composeWindow;
+    private Form ComposeDialogOwner => composeWindow is { Visible: true } window ? window : this;
+    private readonly Button popOutCompose = new()
+    {
+        Text = "Pop Out", AutoSize = true, FlatStyle = FlatStyle.Flat,
+        Tag = ToolbarIcon.PopOut, Padding = new Padding(22, 0, 0, 0)
+    };
     private readonly Button backFromCompose = new()
     {
         Text = "Back to Mail", AutoSize = true, FlatStyle = FlatStyle.Flat,
@@ -89,6 +101,8 @@ public partial class MailForm
         public bool ChangingReplyTo;
         public bool UsesDefaultReplyTo = true;
         public ComposeHtmlQuote? HtmlQuote;
+        public (string Header, MailContent Message)? QuoteImageSource;
+        public bool ShowQuoteImages;
     }
 
     private readonly ComposeSession composeSession = new();
@@ -127,6 +141,7 @@ public partial class MailForm
         replyAll.Click += async (_, _) => await OpenResponseAsync(isReply: true, includeOtherRecipients: true);
         forward.Click += async (_, _) => await OpenResponseAsync(isReply: false);
         backFromCompose.Click += (_, _) => LeaveCompose();
+        popOutCompose.Click += (_, _) => ToggleComposeWindow();
         localDrafts.Click += async (_, _) => await OpenLocalDraftAsync();
 
         editDraft.Click += async (_, _) => await OpenServerDraftAsync();
@@ -178,14 +193,82 @@ public partial class MailForm
         composeStatus.Text = "";
         sendMail.Enabled = ComposeSender?.Mailbox is not null;
         saveDraft.Enabled = database is not null || sendMail.Enabled;
-        mailLayout.Hide();
+        if (composeWindow is null)
+            mailLayout.Hide();
         composeAddressDetails.Checked = false;
         if (resetBaseline)
             composeSession.Baseline = CaptureDraft();
         composePage.Show();
+        if (composeWindow is { Visible: false } window)
+            window.Show();
         DisplayComposeQuote();
         UpdateRecipientAccount();
         focus.Focus();
+    }
+
+    private bool FocusComposeWindow()
+    {
+        if (composeWindow is not { Visible: true } window)
+            return false;
+        if (window.WindowState == FormWindowState.Minimized)
+            window.WindowState = FormWindowState.Normal;
+        window.Activate();
+        return true;
+    }
+
+    private void ToggleComposeWindow()
+    {
+        if (composeWindow is not null)
+        {
+            if (settingsPage.Visible)
+                return;
+            mailLayout.Hide();
+            RestoreComposeToMainWindow();
+            composeBody.Focus();
+            return;
+        }
+
+        var window = new Form
+        {
+            Text = "New Mail", Font = Font, AutoScaleMode = AutoScaleMode.Dpi,
+            StartPosition = FormStartPosition.CenterScreen, MinimumSize = MinimumSize,
+            Size = new Size(Math.Max(720, Math.Min(Width, 860)), Math.Max(520, Math.Min(Height, 800))),
+            Icon = Icon, TopMost = true
+        };
+        window.Activated += async (_, _) =>
+        {
+            OnMailWindowActivated();
+            await DismissMailRemindersAsync();
+        };
+        window.Deactivate += (_, _) => CheckMailWindowFocus();
+        window.FormClosing += (_, args) =>
+        {
+            if (args.CloseReason != CloseReason.UserClosing)
+                return;
+            args.Cancel = true;
+            this.PostIfHandleAvailable(() =>
+            {
+                if (ReferenceEquals(composeWindow, window))
+                    LeaveCompose();
+            });
+        };
+        composeWindow = window;
+        window.Controls.Add(composePage);
+        popOutCompose.Text = "Dock";
+        mailLayout.Show();
+        window.Show();
+        composeBody.Focus();
+    }
+
+    private void RestoreComposeToMainWindow()
+    {
+        if (composeWindow is not { } window)
+            return;
+        composeWindow = null;
+        Controls.Add(composePage);
+        composePage.BringToFront();
+        popOutCompose.Text = "Pop Out";
+        window.Dispose();
     }
 
     private ComposeDraft CaptureDraft()
@@ -201,7 +284,7 @@ public partial class MailForm
     private bool HasUnsavedDrafts() =>
         composeSession.Baseline is { } baseline && !SameDraft(CaptureDraft(), baseline);
 
-    private bool ConfirmDiscardDrafts() => ThemedPopup.Show(this,
+    private bool ConfirmDiscardDrafts() => ThemedPopup.Show(ComposeDialogOwner,
         "Discard unsaved draft changes?", "Unsaved drafts", MessageBoxButtons.YesNo,
         MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes;
 
@@ -236,10 +319,13 @@ public partial class MailForm
         bool wasVisible = composePage.Visible;
         recipientAutocomplete?.SetAccount(null, null);
         composePage.Hide();
+        RestoreComposeToMainWindow();
         composeQuotePreview?.ClearDisplay();
         composeQuoteFallback.Clear();
         SetComposeQuoteVisible(false);
         composeSession.HtmlQuote = null;
+        composeSession.QuoteImageSource = null;
+        composeSession.ShowQuoteImages = false;
         composeSession.Response = null;
         composeSession.Baseline = null;
         composeSession.EditingServerDraft = null;
@@ -299,6 +385,10 @@ public partial class MailForm
             composeSession.HtmlQuote = quoteHeader is not null && quotedMessage?.Html is { Length: > 0 }
                 ? ComposeHtmlQuote.Create(quoteHeader, quotedMessage,
                     includeQuotedImages, includeQuotedImages ? source => htmlPreview?.GetInlineQuoteImage(source) : null)
+                : null;
+            composeSession.ShowQuoteImages = includeQuotedImages;
+            composeSession.QuoteImageSource = composeSession.HtmlQuote is not null && quoteHeader is not null && quotedMessage is not null
+                ? (quoteHeader, quotedMessage)
                 : null;
             composeBody.SetPlainText(quoteHeader is null || composeSession.HtmlQuote is not null ? "" : "\r\n\r\n" + quoteHeader);
             if (quotedMessage is not null && composeSession.HtmlQuote is null)
@@ -372,7 +462,7 @@ public partial class MailForm
 
     private async Task OpenResponseAsync(bool isReply, bool includeOtherRecipients = false)
     {
-        if (composeSession.OperationPending || SelectedFolder is not { } folder || SelectedMessage is not { } mail ||
+        if (FocusComposeWindow() || composeSession.OperationPending || SelectedFolder is not { } folder || SelectedMessage is not { } mail ||
             previewContent is not { } content)
             return;
 
@@ -395,7 +485,7 @@ public partial class MailForm
             .Where(field => !string.IsNullOrWhiteSpace(field.Value))
             .Select(field => $"{field.Label}: {field.Value}\r\n"));
         SetComposeBody(folder.Account,
-            $"--- Original Message ---\r\n{addressLines}"
+            $"{ComposeHtmlQuote.OriginalHeader}\r\n{addressLines}"
             + $"Date: {mail.Date.ToString(DateFormat)}\r\nSubject: {mail.Subject}\r\n\r\n", quotedContent,
             includeQuotedImages: imagePermission == mail.Id);
         if (folder.Folder is { } sourceFolder)
@@ -404,7 +494,7 @@ public partial class MailForm
         OpenCompose(isReply ? composeBody : composeTo);
         if ((mail.Attachments || content.AttachmentList is { Count: > 0 }) &&
             folder.Account.Mailbox is { } mailbox &&
-            ThemedPopup.Show(this, "Include attachments from the original email?", Text,
+            ThemedPopup.Show(ComposeDialogOwner, "Include attachments from the original email?", Text,
                 MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
         {
             await IncludeOriginalAttachmentsAsync(mailbox, mail.Id, content.AttachmentList);
@@ -460,24 +550,15 @@ public partial class MailForm
         }
     }
 
-    private void BeginComposeOperation(FolderEntry? target, string status)
+    private void BeginComposeOperation(string status)
     {
         composeSession.OperationPending = true;
         recipientAutocomplete?.SetAccount(null, null);
         composePage.Hide();
+        composeWindow?.Hide();
         composeQuotePreview?.ClearDisplay();
-        mailLayout.Show();
-        if (target is { Folder: { } folder })
-        {
-            bool hadSearch = search.TextLength > 0;
-            suppressSearchReload = true;
-            search.Clear();
-            suppressSearchReload = false;
-            if (SelectedFolder != target)
-                SelectFolder(target.Account, folder);
-            else if (hadSearch)
-                _ = ShowFolder();
-        }
+        if (!settingsPage.Visible)
+            mailLayout.Show();
         ShowComposeOperationStatus(status, inProgress: true);
     }
 
@@ -488,6 +569,22 @@ public partial class MailForm
         composeSession.OperationFailure = null;
         OpenCompose(composeBody, resetBaseline: false);
         composeStatus.Text = failure;
+    }
+
+    private bool NewMessageMentionsAttachments()
+    {
+        string body = composeBody.GetVisibleText();
+        if (composeSession.HtmlQuote is null)
+        {
+            string header = ComposeHtmlQuote.OriginalHeader;
+            if (body.StartsWith(header + "\n", StringComparison.Ordinal))
+                return false;
+
+            int quoteStart = body.IndexOf("\n" + header + "\n", StringComparison.Ordinal);
+            if (quoteStart >= 0)
+                body = body[..quoteStart];
+        }
+        return body.Contains("attach", StringComparison.OrdinalIgnoreCase);
     }
 
     private async Task SendComposeAsync()
@@ -526,16 +623,16 @@ public partial class MailForm
         }
         string subject = composeSubject.Text.Trim();
         string confirmation = "Send this email?";
-        if (composeBody.GetVisibleText().Contains("attach", StringComparison.OrdinalIgnoreCase))
+        if (composeFiles.Count == 0 && NewMessageMentionsAttachments())
             confirmation += "\r\n\r\nDon\'t forget attachments.";
-        if (ThemedPopup.Show(this, confirmation, sendMail.Text, MessageBoxButtons.YesNo,
+        if (ThemedPopup.Show(ComposeDialogOwner, confirmation, sendMail.Text, MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
             return;
 
         var sourceDraft = composeSession.EditingServerDraft;
         var originalMessage = composeSession.Response;
         var sentFolder = new FolderEntry(sender, "Sent");
-        BeginComposeOperation(null, SendingMailStatus);
+        BeginComposeOperation(SendingMailStatus);
         await Task.Yield();
 
         try
@@ -616,7 +713,7 @@ public partial class MailForm
 
     private void OpenNewCompose()
     {
-        if (composeSession.OperationPending || SelectedFolder is not { } entry)
+        if (FocusComposeWindow() || composeSession.OperationPending || SelectedFolder is not { } entry)
             return;
         (composeTo.Text, composeCc.Text, composeBcc.Text, composeSubject.Text) = ("", "", "", "");
         SetComposeBody(entry.Account);
@@ -625,7 +722,7 @@ public partial class MailForm
 
     private async Task OpenLocalDraftAsync()
     {
-        if (database is null || composeSession.LoadingDraft || composeSession.OperationPending)
+        if (FocusComposeWindow() || database is null || composeSession.LoadingDraft || composeSession.OperationPending)
             return;
         composeSession.LoadingDraft = true;
         localDrafts.Enabled = false;
@@ -672,7 +769,7 @@ public partial class MailForm
 
     private async Task OpenServerDraftAsync()
     {
-        if (composeSession.LoadingDraft || composeSession.OperationPending || showingCachedFolder || SelectedMessage is not { } summary ||
+        if (FocusComposeWindow() || composeSession.LoadingDraft || composeSession.OperationPending || showingCachedFolder || SelectedMessage is not { } summary ||
             SelectedFolder is not { Folder: "Drafts", Account.Mailbox: { } mailbox } folder)
             return;
         composeSession.LoadingDraft = true;
@@ -720,7 +817,7 @@ public partial class MailForm
         var mailbox = sender?.Mailbox;
         Guid? replacing = mailbox is not null && ReferenceEquals(composeSession.EditingServerDraft?.Mailbox, mailbox) ? composeSession.EditingServerDraft?.Id : null;
         var target = sender is null ? null : new FolderEntry(sender, "Drafts");
-        BeginComposeOperation(target, SavingDraftStatus);
+        BeginComposeOperation(SavingDraftStatus);
         await Task.Yield();
 
         try
@@ -739,8 +836,7 @@ public partial class MailForm
             MailContent content;
             try
             {
-                if (replacing is not null)
-                    CancelBackgroundCache(sender);
+                CancelBackgroundCache(sender);
                 content = GetComposeMessageContent(forDraft: true);
                 saved = await mailbox.SaveDraftAsync(new(sender.Email.Trim(), snapshot.ReplyTo.Trim(),
                     snapshot.To, snapshot.Cc, snapshot.Subject, content.Body, content.Html, content.InlineImages,
@@ -763,13 +859,32 @@ public partial class MailForm
             {
                 if (saved.Replaced && replacing is { } oldId)
                     ClearDraftCache(sender, oldId);
-                if (saved.Summary is { } summary && database is not null)
-                    CacheDraftEditorState(sender, summary, new DraftEditorState(snapshot.To, snapshot.Cc, snapshot.Bcc,
-                        snapshot.ReplyTo, snapshot.Subject, snapshot.UsesDefaultReplyTo, snapshot.BodyRtf,
-                        snapshot.Signature, snapshot.HtmlQuote, snapshot.Response), content);
+                if (saved.Summary is { } summary && target is not null)
+                {
+                    if (database is not null)
+                    {
+                        if (mailbox is ServerMailbox)
+                        {
+                            string key = sender.ConnectionKey();
+                            var cached = ReadCachedFolder(target, "Drafts", key);
+                            WriteCachedFolder(target, "Drafts", key, cached.Where(mail => mail.Id != summary.Id)
+                                .Prepend(summary).ToArray());
+                        }
+                        CacheDraftEditorState(sender, summary, new DraftEditorState(snapshot.To, snapshot.Cc, snapshot.Bcc,
+                            snapshot.ReplyTo, snapshot.Subject, snapshot.UsesDefaultReplyTo, snapshot.BodyRtf,
+                            snapshot.Signature, snapshot.HtmlQuote, snapshot.Response), content);
+                    }
+                    if (SelectedFolder == target && string.IsNullOrWhiteSpace(search.Text))
+                    {
+                        var current = SelectedMessage;
+                        var rows = messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!)
+                            .Where(mail => mail.Id != summary.Id && (!saved.Replaced || mail.Id != replacing));
+                        RenderFolder(rows.Prepend(summary).ToArray(), current?.Id == replacing && saved.Replaced ? summary : current);
+                    }
+                }
                 sender.CountsUpdatedAt = default;
                 if (SelectedFolder == target)
-                    _ = ShowFolder(SelectedMessage, refreshCounts: true, backgroundRefresh: true);
+                    _ = ShowFolder(SelectedMessage, refreshCounts: true, backgroundRefresh: true, prioritizeCurrentFolder: true);
             }
 
             FinishCompose();
@@ -837,7 +952,7 @@ public partial class MailForm
         {
             Color selected = composeBody.SelectionColor;
             using var picker = new ColorDialog { Color = selected.IsEmpty ? composeBody.ForeColor : selected, FullOpen = true };
-            if (picker.ShowDialog(this) == DialogResult.OK)
+            if (picker.ShowDialog(ComposeDialogOwner) == DialogResult.OK)
                 composeBody.SelectionColor = picker.Color;
         }, ToolbarIcon.Palette);
         AddFormattingAction("↑", "Increase font size", () => composeBody.ChangeFontSize(1));
@@ -907,6 +1022,8 @@ public partial class MailForm
                 fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 fields.Controls.Add(CreateActionRow(copy: true), 1, fields.RowCount++);
                 fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                fields.Controls.Add(composeAttachmentPanel, 1, fields.RowCount++);
+                fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
                 fields.Controls.Add(composeFormatting, 1, fields.RowCount++);
             }
             int row = fields.RowCount++;
@@ -933,6 +1050,17 @@ public partial class MailForm
             {
                 composeQuoteHost.Margin = fieldFrame.Margin;
                 composeQuoteHost.Controls.Add(composeQuoteFallback);
+                var quoteActions = new FlowLayoutPanel
+                {
+                    Dock = DockStyle.Top, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink
+                };
+                quoteActions.Controls.Add(showComposeQuoteImages);
+                composeQuoteHost.Controls.Add(quoteActions);
+                showComposeQuoteImages.Click += (_, _) =>
+                {
+                    composeSession.ShowQuoteImages = true;
+                    DisplayComposeQuote();
+                };
                 fields.RowStyles.Add(composeQuoteRow);
                 composeQuoteLabel.Margin = label.Margin;
                 fields.Controls.Add(composeQuoteLabel, 0, fields.RowCount);
@@ -963,8 +1091,6 @@ public partial class MailForm
         }
 
         fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
-        fields.Controls.Add(composeAttachmentPanel, 1, fields.RowCount++);
-        fields.RowStyles.Add(new RowStyle(SizeType.AutoSize));
         var actions = CreateActionRow(copy: false);
         fields.Controls.Add(actions, 1, fields.RowCount++);
         composeStatus.TextChanged += (_, _) => composeStatus.Visible = composeStatus.Text.Length > 0;
@@ -987,7 +1113,8 @@ public partial class MailForm
             };
             AddButton(backFromCompose, new Padding(0, 0, 8, 0));
             AddButton(saveDraft, new Padding(0, 0, 8, 0));
-            AddButton(attachFiles, Padding.Empty);
+            AddButton(attachFiles, new Padding(0, 0, 8, 0));
+            AddButton(popOutCompose, Padding.Empty);
             row.Controls.Add(new Label
             {
                 Text = "·", AutoSize = true, Anchor = AnchorStyles.None,
@@ -1008,6 +1135,7 @@ public partial class MailForm
                     };
                     button.Click += (_, _) => original.PerformClick();
                     original.EnabledChanged += (_, _) => button.Enabled = original.Enabled;
+                    original.TextChanged += (_, _) => button.Text = original.Text;
                     composeActionCopies.Add(button);
                 }
                 button.Margin = margin;
@@ -1068,6 +1196,14 @@ public partial class MailForm
         }
 
         SetComposeQuoteVisible(true);
+        var source = composeSession.QuoteImageSource;
+        bool showImages = composeSession.ShowQuoteImages && source is not null;
+        showComposeQuoteImages.Visible = !showImages && source is not null;
+        var displayQuote = showImages && source is { } original
+            ? ComposeHtmlQuote.Create(original.Header, original.Message, includeImages: true,
+                approvedImage: url => quote.Images.FirstOrDefault(image => image.ContentLocation == url),
+                allowRemoteContent: true)
+            : quote;
         composeQuoteFallback.Text = quote.Body;
         composeQuoteFallback.Show();
         if (composeQuotePreview is null)
@@ -1080,14 +1216,18 @@ public partial class MailForm
             composeQuoteHost.Controls.Add(composeQuotePreview);
             composeQuotePreview.BringToFront();
         }
-        _ = ShowQuoteAsync(quote);
+        _ = ShowQuoteAsync();
 
-        async Task ShowQuoteAsync(ComposeHtmlQuote quote)
+        async Task ShowQuoteAsync()
         {
-            var quotedContent = new MailContent(quote.Body, Html: quote.Html, InlineImages: quote.Images);
-            if (await composeQuotePreview.DisplayAsync(quotedContent, showRemoteImages: false, showInlineImages: true) &&
-                ReferenceEquals(composeSession.HtmlQuote, quote) && composePage.Visible)
+            var quotedContent = new MailContent(displayQuote.Body, Html: displayQuote.HtmlForPreview(), InlineImages: displayQuote.Images);
+            bool loaded = await composeQuotePreview.DisplayAsync(quotedContent, showRemoteImages: showImages, showInlineImages: true);
+            if (!ReferenceEquals(composeSession.HtmlQuote, quote) || !composePage.Visible)
+                return;
+            if (loaded)
                 composeQuoteFallback.Hide();
+            else if (showImages)
+                showComposeQuoteImages.Show();
         }
     }
 

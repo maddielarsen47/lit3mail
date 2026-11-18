@@ -24,7 +24,7 @@ public partial class MailForm
     private async Task RefreshMailAsync(bool fullRefresh, bool manual = false)
     {
         if ((!manual && (refreshingAutomatically || updatingMessageFolders || exportCancellation is not null)) ||
-            IsDisposed || Disposing ||
+            choosingComposeFiles || IsDisposed || Disposing ||
             !accounts.Any(account => account.Mailbox is not null))
             return;
 
@@ -36,10 +36,11 @@ public partial class MailForm
         {
             var current = SelectedFolder;
             bool refreshList = current?.Account.Mailbox is not null && (manual || folderLoad is null) &&
-                !composePage.Visible && !settingsPage.Visible;
+                mailLayout.Visible && !settingsPage.Visible;
             var activeInbox = refreshList && current?.Folder == "Inbox" && string.IsNullOrWhiteSpace(search.Text)
                 ? current.Account : null;
-            bool reloadCurrent = refreshList && (fullRefresh || activeInbox is not null);
+            bool reloadCurrent = refreshList && (manual || string.IsNullOrWhiteSpace(search.Text)) &&
+                (fullRefresh || activeInbox is not null);
             if (reloadCurrent)
                 await ShowFolder(SelectedMessage, refreshCounts: fullRefresh, showRefreshStatus: manual,
                     backgroundRefresh: !manual, prioritizeCurrentFolder: true);

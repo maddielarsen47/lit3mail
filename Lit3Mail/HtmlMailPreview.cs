@@ -121,7 +121,7 @@ internal sealed class HtmlMailPreview : WebView2
                     return url;
                 }) ?? html;
             }
-            navigationDocument = Encoding.UTF8.GetBytes(BuildDocument(html, useDarkScrollbars));
+            navigationDocument = Encoding.UTF8.GetBytes(BuildDocument(html, useDarkScrollbars, allowRemoteImages));
             documentReady = new(TaskCreationOptions.RunContinuationsAsynchronously);
             CoreWebView2.Navigate(navigationTarget);
             bool loaded = await documentReady.Task.WaitAsync(TimeSpan.FromSeconds(10));
@@ -136,6 +136,8 @@ internal sealed class HtmlMailPreview : WebView2
             System.Runtime.InteropServices.COMException or WebView2RuntimeNotFoundException or
             IOException or UnauthorizedAccessException or TimeoutException)
         {
+            if (initialization?.IsFaulted == true)
+                initialization = null;
             return false;
         }
         finally
@@ -245,18 +247,41 @@ internal sealed class HtmlMailPreview : WebView2
                         }
                     });
                     """);
+                if (await HasVisibleBodyAsync())
+                    ready.TrySetResult(true);
             }
             catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException)
             {
-                // Continue showing the message if the shortcut cannot be installed.
+                ready.TrySetResult(false);
             }
-            ready.TrySetResult(true);
         };
-        core.NavigationCompleted += (_, e) =>
+        core.NavigationCompleted += async (_, e) =>
         {
-            if (e.NavigationId == navigationId && !e.IsSuccess)
-                documentReady?.TrySetResult(false);
+            if (e.NavigationId != navigationId || documentReady is not { } ready || ready.Task.IsCompleted)
+                return;
+            try
+            {
+                ready.TrySetResult(e.IsSuccess && await HasVisibleBodyAsync());
+            }
+            catch (Exception error) when (error is InvalidOperationException or System.Runtime.InteropServices.COMException)
+            {
+                ready.TrySetResult(false);
+            }
         };
+
+        async Task<bool> HasVisibleBodyAsync() => await core.ExecuteScriptAsync("""
+            (() => {
+                const body = document.body;
+                const visible = element => element.checkVisibility?.({ opacityProperty: true, visibilityProperty: true })
+                    ?? element.getClientRects().length > 0;
+                if (!body)
+                    return false;
+                return Boolean((visible(body) && body.innerText.trim()) ||
+                    [...body.querySelectorAll('img, svg, table, hr')].some(element => visible(element) &&
+                        element.getBoundingClientRect().height > 0 &&
+                        (element.tagName !== 'IMG' || element.naturalWidth > 0)));
+            })()
+            """) == "true";
         core.FrameNavigationStarting += (_, e) => e.Cancel = true;
         core.NewWindowRequested += (_, e) =>
         {
@@ -275,7 +300,10 @@ internal sealed class HtmlMailPreview : WebView2
                 string imageSources = allowRemoteImages ? "data: https: http:" : allowInlineImages ? "data:" : "'none'";
                 if (inlineResources.Count > 0)
                     imageSources += " 'self'";
-                string policy = $"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'; img-src {imageSources}; " +
+                string remoteSources = allowRemoteImages ? " https: http:" : "";
+                string fontSources = allowRemoteImages ? "https: http:" : "'none'";
+                string policy = $"default-src 'none'; script-src 'none'; style-src 'unsafe-inline'{remoteSources}; " +
+                    $"font-src {fontSources}; img-src {imageSources}; " +
                     "base-uri 'none'; form-action 'none'; frame-src 'none'";
                 e.Response = environment.CreateWebResourceResponse(new MemoryStream(document, writable: false), 200, "OK",
                     $"Content-Type: text/html; charset=utf-8\r\nContent-Security-Policy: {policy}\r\n" +
@@ -289,7 +317,8 @@ internal sealed class HtmlMailPreview : WebView2
             }
             else if (!CanLoadResource(e.Request.Uri, e.ResourceContext, allowRemoteImages, allowInlineImages))
                 e.Response = environment.CreateWebResourceResponse(null, 403, "Blocked", "");
-            else if (Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri) && RemoteMailImages.IsWebImageUrl(uri))
+            else if (GetRemoteResourceType(e.ResourceContext) is { } resource &&
+                Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out var uri) && RemoteMailImages.IsWebImageUrl(uri))
             {
                 int version = displayVersion;
                 var deferral = e.GetDeferral();
@@ -297,17 +326,19 @@ internal sealed class HtmlMailPreview : WebView2
                 try
                 {
                     e.Response = environment.CreateWebResourceResponse(null, 403, "Blocked", "");
-                    if (await RemoteMailImages.DownloadAsync(uri) is { } image)
+                    if (await RemoteMailImages.DownloadAsync(uri, resource) is { } download)
                     {
-                        pendingBody = image.Body;
+                        pendingBody = download.Body;
                         if (!IsDisposed && version == displayVersion && allowRemoteImages)
                         {
-                            e.Response = environment.CreateWebResourceResponse(image.Body, 200, "OK",
-                                $"Content-Type: {image.MediaType}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff");
-                            if (!quoteImages.ContainsKey(uri) && image.Body.Length <= MaxQuoteImageBytes - quoteImageBytes)
+                            e.Response = environment.CreateWebResourceResponse(download.Body, 200, "OK",
+                                $"Content-Type: {download.MediaType}\r\nCache-Control: no-store\r\n" +
+                                "X-Content-Type-Options: nosniff\r\nAccess-Control-Allow-Origin: *");
+                            if (resource == RemoteMailResource.Image && !quoteImages.ContainsKey(uri) &&
+                                download.Body.Length <= MaxQuoteImageBytes - quoteImageBytes)
                             {
-                                byte[] bytes = image.Body.ToArray();
-                                quoteImages.Add(uri, (bytes, image.MediaType));
+                                byte[] bytes = download.Body.ToArray();
+                                quoteImages.Add(uri, (bytes, download.MediaType));
                                 quoteImageBytes += bytes.Length;
                             }
                             pendingBody = null;
@@ -428,16 +459,29 @@ internal sealed class HtmlMailPreview : WebView2
     {
         if (address == "about:blank")
             return true;
-        if (context != CoreWebView2WebResourceContext.Image ||
-            !Uri.TryCreate(address, UriKind.Absolute, out var uri))
+        if (GetRemoteResourceType(context) is null || !Uri.TryCreate(address, UriKind.Absolute, out var uri))
             return false;
 
-        return uri.Scheme == "data" ? allowInlineImages || allowRemoteImages :
+        return uri.Scheme == "data" ? context == CoreWebView2WebResourceContext.Image && (allowInlineImages || allowRemoteImages) :
             allowRemoteImages && !uri.Host.Equals(PreviewHost, StringComparison.OrdinalIgnoreCase) &&
             RemoteMailImages.IsWebImageUrl(uri);
     }
 
-    internal static string BuildDocument(string html, bool darkScrollbars = false)
+    private static RemoteMailResource? GetRemoteResourceType(CoreWebView2WebResourceContext context) =>
+        context switch
+        {
+            CoreWebView2WebResourceContext.Image => RemoteMailResource.Image,
+            CoreWebView2WebResourceContext.Stylesheet => RemoteMailResource.Stylesheet,
+            CoreWebView2WebResourceContext.Font => RemoteMailResource.Font,
+            _ => null
+        };
+
+    internal static bool IsStylesheetLink(HtmlTagToken tag) =>
+        tag.Id == HtmlTagId.Link && !tag.IsEndTag &&
+        tag.Attributes.Any(attribute => attribute.Name.Equals("rel", StringComparison.OrdinalIgnoreCase) &&
+            string.Equals(attribute.Value?.Trim(), "stylesheet", StringComparison.OrdinalIgnoreCase));
+
+    internal static string BuildDocument(string html, bool darkScrollbars = false, bool allowRemoteContent = false)
     {
         using var writer = new StringWriter();
         writer.Write("""
@@ -454,7 +498,8 @@ internal sealed class HtmlMailPreview : WebView2
         while (tokenizer.ReadNextToken(out var token))
         {
             // Remove sender directives such as preconnect, refresh, and base URL changes.
-            if (token is HtmlTagToken { Id: HtmlTagId.Link or HtmlTagId.Meta or HtmlTagId.Base })
+            if (token is HtmlTagToken { Id: HtmlTagId.Link or HtmlTagId.Meta or HtmlTagId.Base } tag &&
+                !(allowRemoteContent && IsStylesheetLink(tag)))
                 continue;
             token.WriteTo(writer);
         }

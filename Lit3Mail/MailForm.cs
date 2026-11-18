@@ -215,6 +215,7 @@ public partial class MailForm : Form, IMessageFilter
         {
             Disposed -= releaseResources;
             Application.RemoveMessageFilter(this);
+            composeWindow?.Dispose();
             envelopeIcon.Dispose();
             uiFont.Dispose();
             headingFont.Dispose();
@@ -248,6 +249,7 @@ public partial class MailForm : Form, IMessageFilter
         sidebar.Controls.Add(localDrafts);
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(settings);
+        sidebar.Controls.Add(updateNotice);
         mailLayout.Panel1.Controls.Add(sidebar);
         mailLayout.Panel2.Controls.Add(mailPane);
         // Give the grid its own viewport between the docked search and status controls.
@@ -406,11 +408,14 @@ public partial class MailForm : Form, IMessageFilter
 
         messages.ColumnHeaderMouseClick += (_, e) =>
         {
-            var selected = SelectedMessage;
+            if (e.ColumnIndex < 0)
+                return;
             messages.Columns[sortColumn].HeaderCell.SortGlyphDirection = SortOrder.None;
             descending = e.ColumnIndex == sortColumn ? !descending : e.ColumnIndex is 1 or 2 or 5;
             sortColumn = e.ColumnIndex;
-            RenderFolder(messages.Rows.Cast<DataGridViewRow>().Select(row => (MailSummary)row.Tag!).ToArray(), selected);
+            SortPublishedRows(preserveScrollAnchor: false);
+            messages.Columns[sortColumn].HeaderCell.SortGlyphDirection =
+                descending ? SortOrder.Descending : SortOrder.Ascending;
         };
         HashSet<Guid>? flagSelection = null;
         int flagColumn = -1;
@@ -570,18 +575,28 @@ public partial class MailForm : Form, IMessageFilter
         {
             if (!e.Cancel && e.CloseReason == CloseReason.UserClosing)
             {
+                var operations = new List<string>();
                 if (composeSession.OperationPending)
+                    operations.Add("sending mail or saving a draft");
+                if (updatingMessageFolders)
+                    operations.Add("moving or deleting messages");
+                if (exportCancellation is not null)
+                    operations.Add("exporting mail");
+
+                if (operations.Count > 0 && ThemedPopup.Show(this,
+                        $"Lit3Mail is still {string.Join(", ", operations)}. Closing now may interrupt this work. Close anyway?",
+                        Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
                 {
                     e.Cancel = true;
                     return;
                 }
-                if (composePage.Visible)
+                if (composePage.Visible && composeWindow is null)
                 {
                     e.Cancel = true;
                     LeaveCompose();
                     return;
                 }
-                if (settingsPage.Visible)
+                if (settingsPage.Visible && pendingUpdate is null)
                 {
                     e.Cancel = true;
                     LeaveSettings();
@@ -601,14 +616,26 @@ public partial class MailForm : Form, IMessageFilter
                     "Could not save account settings. Select Yes to retry, No to close without saving, or Cancel to keep Lit3Mail open.",
                     Text, MessageBoxButtons.YesNoCancel, MessageBoxIcon.Error, MessageBoxDefaultButton.Button3);
                 if (choice == DialogResult.No)
-                    return;
+                    break;
                 e.Cancel = choice != DialogResult.Yes;
+            }
+
+            if (!e.Cancel && pendingUpdate is { } update)
+            {
+                try { update.Start(); }
+                catch (Exception error) when (error is System.ComponentModel.Win32Exception or InvalidOperationException)
+                {
+                    e.Cancel = true;
+                    ThemedPopup.Show(this, $"Could not start the updater. {error.Message}", "Updates",
+                        MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
             }
         };
         InitializeWindowLayout(mailLayout);
         InitializeUnreadBadge();
         InitializeDesktopNotifications();
         InitializeAutoRefresh();
+        InitializeUpdateChecks();
         InitializeMessageMove();
         Application.AddMessageFilter(this);
     }
@@ -712,8 +739,8 @@ public partial class MailForm : Form, IMessageFilter
             field.Parent!.BackColor = field.BackColor = surface;
             field.ForeColor = ink;
         }
-        foreach (var button in new[] { newEmail, checkMail, localDrafts, settings, backToMail, addAccount, backFromCompose,
-            sendMail, saveDraft, editDraft, reply, replyAll, forward, moveMail, deleteMail, showImages }.Concat(composeActionCopies))
+        foreach (var button in new[] { newEmail, checkMail, localDrafts, settings, updateNotice, backToMail, addAccount, backFromCompose,
+            sendMail, saveDraft, popOutCompose, attachFiles, editDraft, reply, replyAll, forward, moveMail, deleteMail, showImages, showComposeQuoteImages }.Concat(composeActionCopies))
         {
             StyleButton(button, chrome, ink, border, selectedBackground);
         }
@@ -841,7 +868,7 @@ public partial class MailForm : Form, IMessageFilter
             ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(bounds, -4, -4), ink, background);
     }
 
-    private enum ToolbarIcon { Palette, NumberedList, BulletedList, Back, Send, Save, PaperClip }
+    private enum ToolbarIcon { Palette, NumberedList, BulletedList, Back, Send, Save, PaperClip, PopOut }
 
     private static void DrawToolbarIcon(Graphics graphics, Rectangle bounds, Color ink, ToolbarIcon icon)
     {
@@ -870,6 +897,13 @@ public partial class MailForm : Form, IMessageFilter
                     new Point(14, 15), new Point(2, 15)]);
                 graphics.DrawRectangle(pen, 5, 1, 5, 5);
                 graphics.DrawRectangle(pen, 5, 9, 6, 6);
+            }
+            else if (icon == ToolbarIcon.PopOut)
+            {
+                graphics.DrawLines(pen, [new Point(14, 8), new Point(14, 14), new Point(2, 14),
+                    new Point(2, 2), new Point(8, 2)]);
+                graphics.DrawLine(pen, 7, 9, 14, 2);
+                graphics.DrawLines(pen, [new Point(10, 2), new Point(14, 2), new Point(14, 6)]);
             }
             else if (icon == ToolbarIcon.PaperClip)
             {
@@ -1017,6 +1051,7 @@ public partial class MailForm : Form, IMessageFilter
         searchStatus.Hide();
         bool receivedBatch = false;
         bool seededSearch = false;
+        IReadOnlyList<MailSummary> cachedSearchMatches = [];
         bool mergedFirstBatch = false;
         Task cachedSearch = Task.CompletedTask;
         var publishedIds = new HashSet<Guid>();
@@ -1075,16 +1110,17 @@ public partial class MailForm : Form, IMessageFilter
             if (mailbox is not null && string.IsNullOrWhiteSpace(query) && !IsPendingMoveSource())
                 SetFolderCount(entry.Account, folder, folderMail.Count(mail => !mail.Read), folderMail.Count);
             SetCachedFolder(false);
-            if (receivedBatch && !seededSearch && !mergedFirstBatch)
+            if (receivedBatch && cachedSearchMatches.Count == 0 && !mergedFirstBatch)
                 SortPublishedRows();
             else
-                RenderFolder(folderMail.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
+                RenderFolder(folderMail.Concat(cachedSearchMatches).DistinctBy(mail => mail.Id)
+                    .Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected);
             if (scrollAnchor is not null)
             {
                 var row = messages.Rows.Cast<DataGridViewRow>()
                     .FirstOrDefault(row => row.Tag is MailSummary mail && mail.Id == scrollAnchor.Id);
                 if (row is not null)
-                    messages.FirstDisplayedScrollingRowIndex = row.Index;
+                    TryScrollMessagesTo(row.Index);
             }
             loadedUnfilteredFolder = string.IsNullOrWhiteSpace(query) ? entry : null;
             var displayed = SelectedMessage;
@@ -1137,7 +1173,11 @@ public partial class MailForm : Form, IMessageFilter
                 cached = [];
             }
 
-            if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry || receivedBatch)
+            if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry)
+                return;
+
+            cachedSearchMatches = cached;
+            if (receivedBatch)
                 return;
 
             var rows = cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray();
@@ -1221,7 +1261,24 @@ public partial class MailForm : Form, IMessageFilter
         }
     }
 
-    private void SortPublishedRows()
+    private void TryScrollMessagesTo(int index)
+    {
+        if (!messages.Visible || index < 0 || index >= messages.Rows.Count ||
+            messages.DisplayedRowCount(includePartialRow: true) == 0 ||
+            messages.Rows[index] is not { Visible: true, Frozen: false })
+            return;
+
+        try
+        {
+            messages.FirstDisplayedScrollingRowIndex = index;
+        }
+        catch (InvalidOperationException)
+        {
+            // WinForms can reject scrolling while the grid is being laid out.
+        }
+    }
+
+    private void SortPublishedRows(bool preserveScrollAnchor = true)
     {
         var rows = messages.Rows.Cast<DataGridViewRow>().ToArray();
         var ordered = SortFolder(rows.Select(row => (MailSummary)row.Tag!).ToArray()).ToArray();
@@ -1231,7 +1288,7 @@ public partial class MailForm : Form, IMessageFilter
         var selected = selectionMade ? rows.Where(row => row.Selected).ToArray() : [];
         var current = messages.CurrentCell;
         int firstRow = messages.FirstDisplayedScrollingRowIndex;
-        var top = firstRow >= 0 ? rows[firstRow] : null;
+        var top = preserveScrollAnchor && firstRow >= 0 ? rows[firstRow] : null;
         var positions = ordered.Select((mail, index) => (mail.Id, index))
             .ToDictionary(item => item.Id, item => item.index);
         rebuildingRows = true;
@@ -1243,7 +1300,7 @@ public partial class MailForm : Form, IMessageFilter
             foreach (var row in selected)
                 row.Selected = true;
             if (top is not null)
-                messages.FirstDisplayedScrollingRowIndex = top.Index;
+                TryScrollMessagesTo(top.Index);
         }
         finally
         {
@@ -1375,7 +1432,7 @@ public partial class MailForm : Form, IMessageFilter
             2 => Sort(folderMail, mail => mail.Attachments),
             3 => Sort(folderMail, mail => mail.Subject),
             4 => Sort(folderMail, GridCorrespondents),
-            _ => Sort(folderMail, mail => mail.Date)
+            _ => descending ? folderMail.OrderByDescending(mail => mail.Date) : folderMail.OrderBy(mail => mail.Date)
         };
 
     private void RenderFolder(IReadOnlyList<MailSummary> folderMail, MailSummary? selected)
@@ -1695,7 +1752,8 @@ public partial class MailForm : Form, IMessageFilter
         {
             try
             {
-                if (database!.LoadMessageBody(entry.Account.Id, mail.Folder, connectionKey, mail.Id) is { } cached)
+                if (database!.LoadMessageBody(entry.Account.Id, mail.Folder, connectionKey, mail.Id) is { } cached &&
+                    (!string.IsNullOrWhiteSpace(cached.Body) || !string.IsNullOrWhiteSpace(cached.Html)))
                 {
                     DisplayMessageBody(mail, cached);
                     displayedCachedBody = true;
@@ -1764,7 +1822,8 @@ public partial class MailForm : Form, IMessageFilter
         {
             if (previous is null || !string.IsNullOrEmpty(previous.Html) || previous.Body != content.Body ||
                 previous.PreviewTooLarge != content.PreviewTooLarge)
-                SetPreviewBody(content.PreviewTooLarge ? "This message body is too large to preview." : content.Body);
+                SetPreviewBody(content.PreviewTooLarge ? "This message body is too large to preview." :
+                    string.IsNullOrWhiteSpace(content.Body) ? "No message body was available to preview." : content.Body);
         }
         else if (content.Html != previous?.Html || previous?.Body != content.Body && previewBody.Visible ||
             showImagesForMessage && !(content.InlineImages ?? []).SequenceEqual(previous?.InlineImages ?? []))
@@ -1806,12 +1865,19 @@ public partial class MailForm : Form, IMessageFilter
             preview.Controls.Add(htmlPreview);
             preview.Controls.SetChildIndex(htmlPreview, preview.Controls.GetChildIndex(previewBody));
         }
-        previewBody.Hide();
+        SetPreviewBody("Loading...", italic: true);
         bool loaded = await htmlPreview.DisplayAsync(content, showRemoteImages);
-        if (!loaded && !IsDisposed && request == previewRequest && attempt == htmlDisplayAttempt &&
-            previewContent is { Html.Length: > 0 } currentContent)
+        if (IsDisposed || request != previewRequest || attempt != htmlDisplayAttempt ||
+            previewContent is not { Html.Length: > 0 } currentContent)
+            return;
+
+        if (loaded)
+            previewBody.Hide();
+        else
         {
-            SetPreviewBody(currentContent.Body);
+            SetPreviewBody(string.IsNullOrWhiteSpace(currentContent.Body)
+                ? "The HTML body could not be displayed. Try Show images if the message uses remote content."
+                : currentContent.Body);
             if (showRemoteImages)
             {
                 imagePermission = null;

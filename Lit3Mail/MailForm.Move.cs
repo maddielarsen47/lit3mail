@@ -397,8 +397,8 @@ public partial class MailForm
                 selectionMade = messages.SelectedRows.Count > 0;
                 selectedMessageId = SelectedMessage?.Id;
                 if (messages.Rows.Count > 0 && topIndex >= 0)
-                    messages.FirstDisplayedScrollingRowIndex = top?.DataGridView == messages
-                        ? top.Index : Math.Min(topIndex, messages.Rows.Count - 1);
+                    TryScrollMessagesTo(top?.DataGridView == messages
+                        ? top.Index : Math.Min(topIndex, messages.Rows.Count - 1));
             }
             finally
             {

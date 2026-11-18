@@ -7,6 +7,7 @@ public partial class MailForm
     private readonly List<MailFileAttachment> composeFiles = [];
     private readonly List<string> openedAttachmentFiles = [];
     private CancellationTokenSource? previewAttachmentLoad;
+    private bool choosingComposeFiles;
 
     private readonly Button attachFiles = new()
     {
@@ -108,8 +109,16 @@ public partial class MailForm
         {
             Title = "Attach files", Multiselect = true, CheckFileExists = true, RestoreDirectory = true
         };
-        if (picker.ShowDialog(this) != DialogResult.OK)
-            return;
+        choosingComposeFiles = true;
+        try
+        {
+            if (picker.ShowDialog(ComposeDialogOwner) != DialogResult.OK)
+                return;
+        }
+        finally
+        {
+            choosingComposeFiles = false;
+        }
 
         composePage.Enabled = false;
         var failed = new List<string>();
