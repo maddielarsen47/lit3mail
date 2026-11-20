@@ -49,16 +49,19 @@ public partial class MailForm : Form, IMessageFilter
     };
     private readonly TextBox search = new()
     {
-        PlaceholderText = "Search this folder", AccessibleName = "Search this folder"
+        PlaceholderText = "Search this folder", AccessibleName = "Search this folder",
+        AccessibleDescription = "Filter messages in this folder. Press Escape to clear the search."
     };
     private readonly Button clearSearch = new()
     {
-        Text = "Clear", AccessibleName = "Clear search", Dock = DockStyle.Right,
+        Text = "Clear search", AccessibleName = "Clear search", Dock = DockStyle.Right,
         AutoSize = true, FlatStyle = FlatStyle.Flat, Visible = false
     };
     private readonly CheckBox exact = new()
     {
-        Text = "Exact", Appearance = Appearance.Button, AutoCheck = false, Dock = DockStyle.Right,
+        Text = "Exact", AccessibleName = "Exact phrase search",
+        AccessibleDescription = "Match the search words together as an exact phrase.",
+        Appearance = Appearance.Button, AutoCheck = false, Dock = DockStyle.Right,
         FlatStyle = FlatStyle.Flat, TextAlign = ContentAlignment.MiddleCenter
     };
     private sealed class SelectionCountLabel : Label
@@ -78,6 +81,12 @@ public partial class MailForm : Form, IMessageFilter
         Text = "▴", AccessibleName = "Hide email list",
         Dock = DockStyle.Right, Width = 28, FlatStyle = FlatStyle.Flat,
         UseVisualStyleBackColor = false, Margin = Padding.Empty
+    };
+    private readonly Label activeSearch = new()
+    {
+        Dock = DockStyle.Top, AutoSize = false, Height = 32, AutoEllipsis = true,
+        TextAlign = ContentAlignment.MiddleLeft, Padding = new Padding(12, 0, 12, 0),
+        UseMnemonic = false, AccessibleName = "Active search filter", Visible = false
     };
     private readonly Label searchStatus = new()
     {
@@ -233,6 +242,9 @@ public partial class MailForm : Form, IMessageFilter
         folderHeading.Font = headingFont;
         previewSubject.Font = subjectFont;
         settingsHeading.Font = subjectFont;
+        var activeSearchFont = new Font(uiFont, FontStyle.Bold);
+        activeSearch.Font = activeSearchFont;
+        activeSearch.Disposed += (_, _) => activeSearchFont.Dispose();
         var searchStatusFont = new Font(uiFont, FontStyle.Italic);
         searchStatus.Font = searchStatusFont;
         searchStatus.Disposed += (_, _) => searchStatusFont.Dispose();
@@ -263,6 +275,7 @@ public partial class MailForm : Form, IMessageFilter
         };
         folders.AccessibleName = "Folders";
         messages.AccessibleName = "Email list";
+        messages.AccessibleDescription = "Press Control+Shift+S to sort by the current column; press again to reverse the order.";
         previewBody.AccessibleName = "Email body";
         var mailActions = new Panel { Dock = DockStyle.Top, Height = 52, Padding = new Padding(0, 0, 0, 14) };
         mailActions.Controls.Add(newEmail);
@@ -303,8 +316,10 @@ public partial class MailForm : Form, IMessageFilter
         searchBar.Controls.Add(CreateTextField(search));
         searchBar.Controls.Add(clearSearch);
         searchBar.Controls.Add(exact);
-        hints.SetToolTip(clearSearch, "Clear search");
+        hints.SetToolTip(clearSearch, "Clear search (Escape in the search box)");
+        hints.SetToolTip(exact, "Match an exact phrase");
         mailPane.Panel1.Controls.Add(searchStatus);
+        mailPane.Panel1.Controls.Add(activeSearch);
         mailPane.Panel1.Controls.Add(searchBar);
         var previewMenu = new ContextMenuStrip();
         var copyPreview = previewMenu.Items.Add("Copy", null, (_, _) => previewBody.Copy());
@@ -450,12 +465,7 @@ public partial class MailForm : Form, IMessageFilter
         {
             if (e.ColumnIndex < 0)
                 return;
-            messages.Columns[sortColumn].HeaderCell.SortGlyphDirection = SortOrder.None;
-            descending = e.ColumnIndex == sortColumn ? !descending : e.ColumnIndex is 1 or 2 or 5;
-            sortColumn = e.ColumnIndex;
-            SortPublishedRows(preserveScrollAnchor: false);
-            messages.Columns[sortColumn].HeaderCell.SortGlyphDirection =
-                descending ? SortOrder.Descending : SortOrder.Ascending;
+            SortMessagesByColumn(e.ColumnIndex);
         };
         HashSet<Guid>? flagSelection = null;
         int flagColumn = -1;
@@ -554,6 +564,8 @@ public partial class MailForm : Form, IMessageFilter
         {
             exact.Checked = IsQuoted(search.Text.Trim());
             clearSearch.Visible = search.TextLength > 0;
+            activeSearch.Text = $"Search filter active: {search.Text.Trim()}";
+            activeSearch.Visible = !string.IsNullOrWhiteSpace(search.Text);
             if (!suppressSearchReload)
                 await ShowFolder(SelectedMessage, debounce: search.TextLength > 0, clearingSearch: search.TextLength == 0);
         };
@@ -857,6 +869,8 @@ public partial class MailForm : Form, IMessageFilter
         messages.ColumnHeadersDefaultCellStyle.SelectionBackColor = chrome;
         messages.ColumnHeadersDefaultCellStyle.SelectionForeColor = ink;
         searchBar.BackColor = searchStatus.BackColor = chrome;
+        activeSearch.BackColor = selectedBackground;
+        activeSearch.ForeColor = selectedText;
         mailPane.Panel1.BackColor = surface;
         if (messages.Parent is { } messageViewport)
             messageViewport.BackColor = surface;
@@ -1050,6 +1064,16 @@ public partial class MailForm : Form, IMessageFilter
         }
         if (keyData == (Keys.Control | Keys.F) && FocusFolderSearch())
             return true;
+        if (keyData == Keys.Escape && search.Focused && search.TextLength > 0)
+        {
+            search.Clear();
+            return true;
+        }
+        if (keyData == (Keys.Control | Keys.Shift | Keys.S) && messages.ContainsFocus)
+        {
+            SortMessagesByColumn(messages.CurrentCell?.ColumnIndex ?? sortColumn);
+            return true;
+        }
         if (keyData == Keys.Delete && (messages.ContainsFocus || preview.ContainsFocus))
         {
             _ = DeleteSelectedMessages();
@@ -1326,8 +1350,14 @@ public partial class MailForm : Form, IMessageFilter
             rebuildingRows = true;
             try
             {
+                // Other operations can insert rows while this load is awaiting the next batch.
+                var present = messages.Rows.Cast<DataGridViewRow>()
+                    .Select(row => ((MailSummary)row.Tag!).Id).ToHashSet();
                 foreach (var mail in SortFolder(newRows))
-                    AddMessageRow(mail);
+                {
+                    if (present.Add(mail.Id))
+                        AddMessageRow(mail);
+                }
                 if (!selectionMade)
                     messages.ClearSelection();
             }
@@ -1386,19 +1416,30 @@ public partial class MailForm : Form, IMessageFilter
         }
     }
 
+    private void SortMessagesByColumn(int column)
+    {
+        messages.Columns[sortColumn].HeaderCell.SortGlyphDirection = SortOrder.None;
+        descending = column == sortColumn ? !descending : column is 1 or 2 or 5;
+        sortColumn = column;
+        SortPublishedRows(preserveScrollAnchor: false);
+        messages.Columns[sortColumn].HeaderCell.SortGlyphDirection =
+            descending ? SortOrder.Descending : SortOrder.Ascending;
+    }
+
     private void SortPublishedRows(bool preserveScrollAnchor = true)
     {
         var rows = messages.Rows.Cast<DataGridViewRow>().ToArray();
-        var ordered = SortFolder(rows.Select(row => (MailSummary)row.Tag!).ToArray()).ToArray();
-        if (rows.Select(row => ((MailSummary)row.Tag!).Id).SequenceEqual(ordered.Select(mail => mail.Id)))
+        var ordered = SortFolder(rows, row => (MailSummary)row.Tag!).ToArray();
+        if (rows.SequenceEqual(ordered))
             return;
 
         var selected = selectionMade ? rows.Where(row => row.Selected).ToArray() : [];
         var current = messages.CurrentCell;
         int firstRow = messages.FirstDisplayedScrollingRowIndex;
         var top = preserveScrollAnchor && firstRow >= 0 ? rows[firstRow] : null;
-        var positions = ordered.Select((mail, index) => (mail.Id, index))
-            .ToDictionary(item => item.Id, item => item.index);
+        // Row identity remains unique even when multiple rows have the same message ID.
+        var positions = ordered.Select((row, index) => (row, index))
+            .ToDictionary(item => item.row, item => item.index);
         rebuildingRows = true;
         try
         {
@@ -1418,13 +1459,11 @@ public partial class MailForm : Form, IMessageFilter
         }
     }
 
-    private sealed class PublishedRowOrder(Dictionary<Guid, int> positions) : System.Collections.IComparer
+    private sealed class PublishedRowOrder(Dictionary<DataGridViewRow, int> positions) : System.Collections.IComparer
     {
         public int Compare(object? left, object? right)
         {
-            var first = (MailSummary)((DataGridViewRow)left!).Tag!;
-            var second = (MailSummary)((DataGridViewRow)right!).Tag!;
-            return positions[first.Id].CompareTo(positions[second.Id]);
+            return positions[(DataGridViewRow)left!].CompareTo(positions[(DataGridViewRow)right!]);
         }
     }
 
@@ -1543,14 +1582,17 @@ public partial class MailForm : Form, IMessageFilter
         }
     }
 
-    private IEnumerable<MailSummary> SortFolder(IReadOnlyList<MailSummary> folderMail) => sortColumn switch
+    private IEnumerable<MailSummary> SortFolder(IReadOnlyList<MailSummary> folderMail) =>
+        SortFolder(folderMail, mail => mail);
+
+    private IEnumerable<T> SortFolder<T>(IReadOnlyList<T> rows, Func<T, MailSummary> summary) => sortColumn switch
         {
-            0 => Sort(folderMail, mail => mail.Read),
-            1 => Sort(folderMail, mail => mail.Star),
-            2 => Sort(folderMail, mail => mail.Attachments),
-            3 => Sort(folderMail, mail => mail.Subject),
-            4 => Sort(folderMail, GridCorrespondents),
-            _ => descending ? folderMail.OrderByDescending(mail => mail.Date) : folderMail.OrderBy(mail => mail.Date)
+            0 => Sort(rows, row => summary(row).Read, summary),
+            1 => Sort(rows, row => summary(row).Star, summary),
+            2 => Sort(rows, row => summary(row).Attachments, summary),
+            3 => Sort(rows, row => summary(row).Subject, summary),
+            4 => Sort(rows, row => GridCorrespondents(summary(row)), summary),
+            _ => descending ? rows.OrderByDescending(row => summary(row).Date) : rows.OrderBy(row => summary(row).Date)
         };
 
     private void RenderFolder(IReadOnlyList<MailSummary> folderMail, MailSummary? selected, bool preserveScrollAnchor = true)
@@ -1572,7 +1614,8 @@ public partial class MailForm : Form, IMessageFilter
             messages.Rows.Clear();
             var selectedRows = new List<DataGridViewRow>();
             int anchorIndex = -1;
-            foreach (var mail in SortFolder(folderMail))
+            // Cache and server results may contain the same message more than once.
+            foreach (var mail in SortFolder(folderMail.DistinctBy(mail => mail.Id).ToArray()))
             {
                 int index = AddMessageRow(mail);
                 if (selectedIds.Contains(mail.Id))
@@ -1825,10 +1868,10 @@ public partial class MailForm : Form, IMessageFilter
     private static bool IsQuoted(string query) =>
         query.Length >= 2 && query[0] == '"' && query[^1] == '"';
 
-    private IEnumerable<MailSummary> Sort<TKey>(IEnumerable<MailSummary> mail, Func<MailSummary, TKey> key)
+    private IEnumerable<T> Sort<T, TKey>(IEnumerable<T> mail, Func<T, TKey> key, Func<T, MailSummary> summary)
     {
         var ordered = descending ? mail.OrderByDescending(key) : mail.OrderBy(key);
-        return ordered.ThenByDescending(item => item.Date);
+        return ordered.ThenByDescending(item => summary(item).Date);
     }
 
     private async Task SelectCurrentMessage()
