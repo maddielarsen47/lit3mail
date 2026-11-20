@@ -22,6 +22,7 @@ public partial class MailForm
         public string ReplyTo { get; set; } = "";
         public string Organisation { get; set; } = "";
         public string Signature { get; set; } = "";
+        public string SignatureFilePath { get; set; } = "";
         public string IncomingHost { get; set; } = MailDefaults.IncomingHost;
         public string IncomingUser { get; set; } = "";
         public int IncomingPort { get; set; } = 993;
@@ -102,6 +103,7 @@ public partial class MailForm
                 ReplyTo = account.ReplyTo,
                 Organisation = account.Organisation,
                 Signature = account.Signature,
+                SignatureFilePath = account.SignatureFilePath,
                 IncomingHost = account.IncomingHost,
                 IncomingPort = account.IncomingPort,
                 IncomingUser = account.IncomingUser,
@@ -146,7 +148,7 @@ public partial class MailForm
             account.IncomingHost, account.IncomingPort, account.IncomingUser, account.IncomingStartTls,
             account.OutgoingHost, account.OutgoingPort, account.OutgoingUser, account.OutgoingStartTls, account.Expanded,
             position, account.ProfileName, account.ProfileUsesAccountName, account.IncomingUsesEmail, account.OutgoingUsesEmail,
-            account.DesktopNotifications, account.EnableHtmlSignature))
+            account.DesktopNotifications, account.EnableHtmlSignature, account.SignatureFilePath))
             .ToDictionary(account => account.Id);
         var updated = current.Values.Where(account =>
             !savedAccounts.TryGetValue(account.Id, out var previous) || previous != account).ToArray();
@@ -532,6 +534,43 @@ public partial class MailForm
         }
     }
 
+    private bool clearingLocalData;
+
+    private void ClearLocalData()
+    {
+        if (database is not { } store || clearingLocalData)
+            return;
+        if (composeSession.OperationPending || updatingMessageFolders || exportCancellation is not null || checkingForUpdate)
+        {
+            ThemedPopup.Show(this, "Wait for sending, saving, moving, exporting, or updating to finish before clearing local data.",
+                "Clear local data");
+            return;
+        }
+        if (ThemedPopup.Show(this,
+                "Clear all local data? This removes all accounts, saved sign-ins, settings, saved drafts, cached mail, " +
+                "and recipient suggestions. Unsaved drafts will also be discarded. Mail stored on your mail server is kept.\n\n" +
+                "Lit3Mail will close. The data will be cleared when you next open the app, and you will need to set up your accounts again.",
+                "Clear local data", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
+            return;
+        try
+        {
+            LocalDataReset.Schedule(store, accounts.Select(account => account.Id));
+            clearingLocalData = true;
+            Close();
+            if (!IsDisposed)
+            {
+                clearingLocalData = false;
+                LocalDataReset.Cancel();
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            clearingLocalData = false;
+            ThemedPopup.Show(this, $"Could not schedule clearing local data. {error.Message}",
+                "Clear local data", MessageBoxButtons.OK, MessageBoxIcon.Error);
+        }
+    }
+
     private void AddGeneralSettingsTab()
     {
         var (_, tab, fields) = AddSettingsTab("General");
@@ -549,8 +588,8 @@ public partial class MailForm
         {
             var location = new TextBox { ReadOnly = true, AccessibleName = "Local data folder" };
             AddSettingsRow(fields, "Local data folder", CreateTextField(location));
-            var changeFolder = new Button { Text = "Choose folder...", AutoSize = true };
-            var resetFolder = new Button { Text = "Reset to default", AutoSize = true };
+            var changeFolder = new Button { Text = "Choose folder...", AutoSize = true, Margin = new Padding(0, 0, 6, 0) };
+            var resetFolder = new Button { Text = "Reset to default", AutoSize = true, Margin = new Padding(0, 0, 6, 0) };
             var folderActions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
             folderActions.Controls.AddRange([changeFolder, resetFolder]);
             AddSettingsRow(fields, "", folderActions);
@@ -567,6 +606,11 @@ public partial class MailForm
                     ? "Shared by all accounts."
                     : "Shared by all accounts. Changes apply the next time Lit3Mail opens.";
             }
+
+            var clearData = new Button { Text = "Clear local data...", AutoSize = true,
+                AccessibleName = "Clear all local data" };
+            clearData.Click += (_, _) => ClearLocalData();
+            AddSettingsRow(fields, "Local data", clearData);
 
             RefreshDataFolder();
             changeFolder.Click += (_, _) =>
@@ -759,10 +803,54 @@ public partial class MailForm
         var email = AddText("Email Address", account.Email, value => account.Email = value);
         AddText("Reply-To Address", account.ReplyTo, value => account.ReplyTo = value);
         AddText("Organisation", account.Organisation, value => account.Organisation = value);
-        AddText("Signature Text/HTML", account.Signature, value => account.Signature = value, multiline: true);
+        var signatureText = AddText("Signature Text/HTML", account.Signature, value => account.Signature = value, multiline: true);
         var enableHtmlSignature = new CheckBox { Text = "Written in HTML code", AutoSize = true, Checked = account.EnableHtmlSignature };
         enableHtmlSignature.CheckedChanged += (_, _) => account.EnableHtmlSignature = enableHtmlSignature.Checked;
         AddRow("", enableHtmlSignature);
+        var signatureFile = new TextBox { ReadOnly = true, Text = account.SignatureFilePath,
+            AccessibleName = "Signature file", PlaceholderText = "None" };
+        AddRow("Signature file", CreateTextField(signatureFile));
+        var chooseSignature = new Button { Text = "Choose signature file...", AutoSize = true, Margin = new Padding(0, 0, 6, 0) };
+        var useTypedSignature = new Button { Text = "Use typed signature", AutoSize = true, Margin = new Padding(0, 0, 6, 0) };
+        var signatureActions = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill };
+        signatureActions.Controls.AddRange([chooseSignature, useTypedSignature]);
+        AddRow("", signatureActions);
+        AddRow("", new Label { AutoSize = true,
+            Text = "Linked files are read when inserting a signature. Keeps typed text as a fallback." });
+        void RefreshSignatureSource()
+        {
+            signatureFile.Text = account.SignatureFilePath;
+            useTypedSignature.Enabled = !string.IsNullOrWhiteSpace(account.SignatureFilePath);
+        }
+        RefreshSignatureSource();
+        chooseSignature.Click += (_, _) =>
+        {
+            using var picker = new OpenFileDialog
+            {
+                Title = "Choose a signature file",
+                Filter = "Signature files (*.txt;*.html;*.htm)|*.txt;*.html;*.htm|Text files (*.txt)|*.txt|HTML files (*.html;*.htm)|*.html;*.htm",
+                CheckFileExists = true, Multiselect = false
+            };
+            if (picker.ShowDialog(ComposeDialogOwner) != DialogResult.OK)
+                return;
+            try
+            {
+                SignatureFile.Read(picker.FileName);
+                account.SignatureFilePath = picker.FileName;
+                RefreshSignatureSource();
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                ThemedPopup.Show(this, $"Could not read the signature file. {error.Message}", "Signature file",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        };
+        useTypedSignature.Click += (_, _) =>
+        {
+            account.SignatureFilePath = "";
+            RefreshSignatureSource();
+            signatureText.Focus();
+        };
         var notifications = new CheckBox
         {
             Text = "Notify me when new mail arrives", AutoSize = true, Checked = account.DesktopNotifications
@@ -1090,6 +1178,11 @@ public partial class MailForm
                 }
                 else if (field is Button button)
                     StyleButton(button, chrome, ink, border, hover);
+                else if (field is FlowLayoutPanel actions)
+                {
+                    foreach (var action in actions.Controls.OfType<Button>())
+                        StyleButton(action, chrome, ink, border, hover);
+                }
             }
         }
 

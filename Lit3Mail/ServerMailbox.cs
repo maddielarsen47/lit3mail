@@ -170,7 +170,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     }
 
     internal readonly record struct InboxPosition(uint Validity, uint NextUid, DateTimeOffset CheckedAt);
-    internal sealed record InboxArrivalPreview(DateTimeOffset ArrivalTime, string? Subject, string? Text);
+    internal sealed record InboxArrivalPreview(Guid MessageId, DateTimeOffset ArrivalTime, string? Subject, string? Text);
 
     public async Task<(InboxPosition? Position, int Arrivals, InboxArrivalPreview? Preview)> CheckInboxArrivalsAsync(
         InboxPosition? previous, DateTimeOffset? notifyAfter, CancellationToken token)
@@ -223,13 +223,13 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             string text = ReadReminderText(await ReadSnippetAsync(summary.TextBody));
             if (string.IsNullOrWhiteSpace(text))
                 text = ReadReminderText(await ReadSnippetAsync(summary.HtmlBody));
-            return new(summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, text);
+            return new(MessageIdFor(inbox, uid), summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, text);
         }
         catch (Exception error) when (error is IOException or CommandException or ProtocolException or
             InvalidOperationException or OperationCanceledException or FormatException or ArgumentException)
         {
             // A missing excerpt must not prevent the arrival notification.
-            return summary is null ? null : new(summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, null);
+            return summary is null ? null : new(MessageIdFor(inbox, uid), summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, null);
         }
 
         async Task<string?> ReadSnippetAsync(BodyPartText? part)

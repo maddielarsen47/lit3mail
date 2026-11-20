@@ -321,6 +321,21 @@ public partial class MailForm
 
     private void ReplaceSignature(MailAccount sender)
     {
+        string signature = sender.Signature;
+        bool signatureIsHtml = sender.EnableHtmlSignature;
+        if (!string.IsNullOrWhiteSpace(sender.SignatureFilePath))
+        {
+            try
+            {
+                signature = SignatureFile.Read(sender.SignatureFilePath);
+                signatureIsHtml = SignatureFile.IsHtml(sender.SignatureFilePath);
+            }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+            {
+                ThemedPopup.Show(this, $"Could not read the linked signature file. The typed signature will be used instead.\n\n{error.Message}",
+                    "Signature file", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
         var oldRange = composeSession.Signature;
         int selectionStart = composeBody.SelectionStart;
         int selectionEnd = selectionStart + composeBody.SelectionLength;
@@ -330,13 +345,13 @@ public partial class MailForm
         {
             composeBody.Select(oldRange.Start, oldRange.Length);
             composeBody.SelectedText = "";
-            if (!string.IsNullOrWhiteSpace(sender.Signature))
+            if (!string.IsNullOrWhiteSpace(signature))
             {
                 composeBody.SelectedText = "\r\n\r\n";
-                if (sender.EnableHtmlSignature)
-                    composeBody.InsertHtmlOrText(sender.Signature);
+                if (signatureIsHtml)
+                    composeBody.InsertHtmlOrText(signature);
                 else
-                    composeBody.AppendPlainText(sender.Signature);
+                    composeBody.AppendPlainText(signature);
             }
 
             composeSession.Signature = new(oldRange.Start, composeBody.TextLength - originalLength + oldRange.Length);

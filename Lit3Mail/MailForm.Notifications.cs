@@ -18,6 +18,7 @@ public partial class MailForm
 
     private readonly Dictionary<MailAccount, InboxNotificationCursor> notificationCursors = new();
     private AppNotificationManager? notificationManager;
+    private (FolderEntry Folder, Guid MessageId)? pendingReminderMessage;
 
     private void InitializeDesktopNotifications()
     {
@@ -81,6 +82,8 @@ public partial class MailForm
     {
         Guid? accountId = args.Arguments.TryGetValue("account", out string? value) && Guid.TryParse(value, out var id)
             ? id : null;
+        Guid? messageId = args.Arguments.TryGetValue("message", out string? messageValue) && Guid.TryParse(messageValue, out var parsedMessage)
+            ? parsedMessage : null;
         this.PostIfHandleAvailable(async () =>
         {
             if (WindowState == FormWindowState.Minimized)
@@ -95,11 +98,41 @@ public partial class MailForm
             finally { suppressSearchReload = false; }
 
             var inbox = new FolderEntry(account, "Inbox");
+            pendingReminderMessage = messageId is { } target ? (inbox, target) : null;
+            if (messageId is not null)
+            {
+                messages.CurrentCell = null;
+                messages.ClearSelection();
+                selectionMade = false;
+                selectedMessageId = null;
+            }
             if (SelectedFolder == inbox)
                 await ShowFolder(SelectedMessage, showRefreshStatus: true, prioritizeCurrentFolder: true);
             else
                 SelectFolder(account, "Inbox");
         });
+    }
+
+    private async Task SelectReminderMessageAsync(Guid messageId)
+    {
+        var row = messages.Rows.Cast<DataGridViewRow>()
+            .FirstOrDefault(item => item.Tag is MailSummary mail && mail.Id == messageId);
+        if (row is null)
+            return;
+
+        if (mailPane.Panel1Collapsed)
+            toggleMessageList.PerformClick();
+        rebuildingRows = true;
+        try
+        {
+            messages.ClearSelection();
+            messages.CurrentCell = row.Cells[3];
+            row.Selected = true;
+            TryScrollMessagesTo(row.Index);
+        }
+        finally { rebuildingRows = false; }
+        messages.Focus();
+        await SelectCurrentMessage();
     }
 
     private void ResetDesktopNotificationCursor(MailAccount account)
@@ -150,8 +183,9 @@ public partial class MailForm
                 ? $"{messages} in {inbox.DisplayName}."
                 : $"{messages} across {arrivals.Length:N0} accounts.";
             text = LimitNotificationText(text, 80);
-            var preview = arrivals.Select(result => result.Preview).OfType<ServerMailbox.InboxArrivalPreview>()
-                .OrderByDescending(item => item.ArrivalTime).FirstOrDefault();
+            var previewArrival = arrivals.Where(result => result.Preview is not null)
+                .OrderByDescending(result => result.Preview!.ArrivalTime).FirstOrDefault();
+            var preview = previewArrival?.Preview;
             if (preview is not null)
             {
                 string subject = LimitNotificationText(ServerMailbox.ReadReminderText(preview.Subject), 48);
@@ -161,7 +195,7 @@ public partial class MailForm
                 if (excerpt.Length > 0)
                     text += "\n" + excerpt;
             }
-            var payload = CreateMailReminder(text, notificationAccount?.Id);
+            var payload = CreateMailReminder(text, previewArrival?.Account.Id ?? notificationAccount?.Id, preview?.MessageId);
             manager.Show(new AppNotification(payload));
         }
         catch (Exception error) when (error is COMException or InvalidOperationException or UnauthorizedAccessException)
@@ -170,9 +204,11 @@ public partial class MailForm
         }
     }
 
-    private static string CreateMailReminder(string summary, Guid? accountId)
+    private static string CreateMailReminder(string summary, Guid? accountId, Guid? messageId)
     {
         string arguments = accountId is { } id ? $"action=open&account={id:D}" : "action=open";
+        if (accountId is not null && messageId is { } message)
+            arguments += $"&message={message:D}";
         var visual = new XElement("binding", new XAttribute("template", "ToastGeneric"),
             summary.Split('\n').Select(line => new XElement("text", line)));
         return new XElement("toast", new XAttribute("scenario", "reminder"), new XAttribute("launch", arguments),

@@ -14,12 +14,14 @@ namespace Lit3Mail
             MailForm form;
             try
             {
+                LocalDataReset.ApplyPending();
                 form = new MailForm();
             }
             catch (Exception error) when (error is Microsoft.Data.Sqlite.SqliteException or
-                IOException or UnauthorizedAccessException or InvalidOperationException or FormatException)
+                IOException or UnauthorizedAccessException or InvalidOperationException or FormatException or
+                System.Text.Json.JsonException or System.ComponentModel.Win32Exception)
             {
-                ThemedPopup.Show($"Could not open the local account database. {error.Message}",
+                ThemedPopup.Show($"Could not prepare local data or open the account database. {error.Message}",
                     "Lit3Mail", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return;
             }

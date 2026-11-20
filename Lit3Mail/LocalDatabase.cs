@@ -14,7 +14,7 @@ internal sealed record AccountSettings(
     string IncomingHost, int IncomingPort, string IncomingUser, bool IncomingStartTls,
     string OutgoingHost, int OutgoingPort, string OutgoingUser, bool OutgoingStartTls, bool Expanded, int Position,
     string ProfileName, bool ProfileUsesAccountName, bool IncomingUsesEmail, bool OutgoingUsesEmail,
-    bool DesktopNotifications, bool EnableHtmlSignature);
+    bool DesktopNotifications, bool EnableHtmlSignature, string SignatureFilePath = "");
 
 internal sealed record DraftEditorState(string To, string Cc, string Bcc, string ReplyTo, string Subject,
     bool UsesDefaultReplyTo, string BodyRtf, ComposeSignatureRange Signature, ComposeHtmlQuote? HtmlQuote = null,
@@ -34,7 +34,7 @@ internal sealed class LocalDatabase(string path)
     internal const int FolderCacheLimit = 1000;
     private const int MaxCachedBodyPartBytes = 4 * 1024 * 1024;
     private const int MaxOpenedPreviewCacheBytes = 128 * 1024 * 1024;
-    private const int SchemaVersion = 19;
+    private const int SchemaVersion = 20;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
@@ -384,12 +384,21 @@ internal sealed class LocalDatabase(string path)
             command.ExecuteNonQuery();
         }
 
+        if (version < 20)
+        {
+            command.CommandText = """
+                ALTER TABLE accounts ADD COLUMN signature_file_path TEXT NOT NULL DEFAULT '';
+                PRAGMA user_version = 20;
+                """;
+            command.ExecuteNonQuery();
+        }
+
         command.CommandText = """
             SELECT id, name, email, reply_to, organisation, signature,
                    incoming_host, incoming_port, incoming_user, incoming_starttls,
                    outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
                    profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications,
-                   enable_html_signature
+                   enable_html_signature, signature_file_path
             FROM accounts ORDER BY position, rowid
             """;
         var accounts = new List<AccountSettings>();
@@ -401,7 +410,7 @@ internal sealed class LocalDatabase(string path)
                     reader.GetInt32(7), reader.GetString(8), reader.GetBoolean(9), reader.GetString(10),
                     reader.GetInt32(11), reader.GetString(12), reader.GetBoolean(13), reader.GetBoolean(14),
                     reader.GetInt32(15), reader.GetString(16), reader.GetBoolean(17),
-                    reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20), reader.GetBoolean(21)));
+                    reader.GetBoolean(18), reader.GetBoolean(19), reader.GetBoolean(20), reader.GetBoolean(21), reader.GetString(22)));
         }
         transaction.Commit();
         return accounts;
@@ -493,13 +502,13 @@ internal sealed class LocalDatabase(string path)
                     incoming_host, incoming_port, incoming_user, incoming_starttls,
                     outgoing_host, outgoing_port, outgoing_user, outgoing_starttls, expanded, position,
                     profile_name, profile_uses_account_name, incoming_uses_email, outgoing_uses_email, desktop_notifications,
-                   enable_html_signature
+                   enable_html_signature, signature_file_path
                 ) VALUES (
                     $id, $name, $email, $replyTo, $organisation, $signature,
                     $incomingHost, $incomingPort, $incomingUser, $incomingStartTls,
                     $outgoingHost, $outgoingPort, $outgoingUser, $outgoingStartTls, $expanded, $position,
                     $profileName, $profileUsesAccountName, $incomingUsesEmail, $outgoingUsesEmail, $desktopNotifications,
-                    $enableHtmlSignature
+                    $enableHtmlSignature, $signatureFilePath
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     name = excluded.name, email = excluded.email, reply_to = excluded.reply_to,
@@ -512,7 +521,8 @@ internal sealed class LocalDatabase(string path)
                     profile_name = excluded.profile_name, profile_uses_account_name = excluded.profile_uses_account_name,
                     incoming_uses_email = excluded.incoming_uses_email, outgoing_uses_email = excluded.outgoing_uses_email,
                     desktop_notifications = excluded.desktop_notifications,
-                    enable_html_signature = excluded.enable_html_signature
+                    enable_html_signature = excluded.enable_html_signature,
+                    signature_file_path = excluded.signature_file_path
                 """;
             command.Parameters.Clear();
             command.Parameters.AddWithValue("$id", account.Id.ToString());
@@ -537,6 +547,7 @@ internal sealed class LocalDatabase(string path)
             command.Parameters.AddWithValue("$outgoingUsesEmail", account.OutgoingUsesEmail);
             command.Parameters.AddWithValue("$desktopNotifications", account.DesktopNotifications);
             command.Parameters.AddWithValue("$enableHtmlSignature", account.EnableHtmlSignature);
+            command.Parameters.AddWithValue("$signatureFilePath", account.SignatureFilePath);
             command.ExecuteNonQuery();
         }
         transaction.Commit();

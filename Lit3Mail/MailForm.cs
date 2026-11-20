@@ -663,6 +663,8 @@ public partial class MailForm : Form, IMessageFilter
         };
         FormClosing += (_, e) =>
         {
+            if (clearingLocalData)
+                return;
             if (!e.Cancel && e.CloseReason == CloseReason.UserClosing)
             {
                 var operations = new List<string>();
@@ -1155,6 +1157,9 @@ public partial class MailForm : Form, IMessageFilter
         if (SelectedFolder is not { Folder: { } folder } entry || IsDisposed)
             return;
 
+        var reminderMessage = pendingReminderMessage is { } reminder && reminder.Folder == entry
+            ? reminder.MessageId : (Guid?)null;
+        pendingReminderMessage = null;
         folderLoad?.Cancel();
         using var load = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
         folderLoad = load;
@@ -1279,6 +1284,9 @@ public partial class MailForm : Form, IMessageFilter
                 if (!IsDisposed)
                     searchStatus.Hide();
             }
+            if (reminderMessage is { } target && !token.IsCancellationRequested && !IsDisposed &&
+                SelectedFolder == entry && string.IsNullOrWhiteSpace(search.Text))
+                await SelectReminderMessageAsync(target);
         }
 
         async Task PublishCachedSearchAsync(LocalDatabase store, string key, string query)
