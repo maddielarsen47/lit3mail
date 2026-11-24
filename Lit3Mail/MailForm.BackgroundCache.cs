@@ -11,6 +11,33 @@ public partial class MailForm
     private CancellationTokenSource? activeCacheCancellation;
     private bool processingCache;
 
+    private void QueueArrivalCache(MailAccount account, string folder = "Inbox")
+    {
+        if (database is null || IsDisposed || account.Mailbox is not ServerMailbox)
+            return;
+        // New arrivals should not wait for the older folder currently being downloaded.
+        PauseBackgroundCacheForFolderLoad();
+        QueueBackgroundCache(new FolderEntry(account, folder));
+    }
+
+    private void PauseBackgroundCacheForFolderLoad()
+    {
+        if (activeCacheWork is not { } work)
+            return;
+
+        // Resume from saved data after the interactive load; supplied summaries may be stale by then.
+        if (FindQueuedCacheWork(work.Mailbox, work.Folder) is null)
+            cacheQueue.AddFirst(work with { Summaries = null });
+        activeCacheCancellation?.Cancel();
+    }
+
+    private void ResumeBackgroundCache()
+    {
+        if (database is not null && !IsDisposed && folderLoad is null &&
+            cacheQueue.Count > 0 && !processingCache)
+            _ = ProcessCacheQueueAsync(database);
+    }
+
     private void QueueBackgroundCache(FolderEntry? current = null, IReadOnlyList<MailSummary>? summaries = null)
     {
         if (database is null || IsDisposed)
@@ -36,8 +63,7 @@ public partial class MailForm
             }
         }
 
-        if (!processingCache)
-            _ = ProcessCacheQueueAsync(database);
+        ResumeBackgroundCache();
     }
 
     private LinkedListNode<CacheWork>? FindQueuedCacheWork(ServerMailbox mailbox, string folder)
@@ -63,8 +89,7 @@ public partial class MailForm
                 cacheQueue.Remove(queued);
             cacheQueue.AddFirst(new CacheWork(account, mailbox, "Inbox", account.ConnectionKey(), null));
         }
-        if (cacheQueue.Count > 0 && !processingCache)
-            _ = ProcessCacheQueueAsync(database);
+        ResumeBackgroundCache();
     }
 
     private async Task ProcessCacheQueueAsync(LocalDatabase database)
@@ -74,7 +99,7 @@ public partial class MailForm
         {
             // Let startup and the first interactive preview finish before downloading more mail.
             await Task.Delay(750, mailboxLifetime.Token);
-            while (cacheQueue.First is { } node && !IsDisposed)
+            while (cacheQueue.First is { } node && !IsDisposed && folderLoad is null)
             {
                 var work = node.Value;
                 cacheQueue.RemoveFirst();
@@ -129,22 +154,17 @@ public partial class MailForm
         var missing = recent
             .Where(mail => !cachedBodies.Contains(mail.Id))
             .Select(mail => mail.Id).ToArray();
+        var dates = recent.ToDictionary(mail => mail.Id, mail => mail.Date);
 
-        const int bodyBatchSize = 4;
-        var batch = new List<(Guid Id, MailContent Content)>(bodyBatchSize);
         await foreach (var body in work.Mailbox.PrefetchContentsAsync(missing, token))
         {
             token.ThrowIfCancellationRequested();
-            batch.Add(body);
-            if (batch.Count == bodyBatchSize)
-            {
-                database.SaveMessageBodies(account, work.Folder, work.ConnectionKey, batch, onlyIfMissing: true);
-                batch.Clear();
-            }
+            // Persist each complete preview immediately, including embedded images and attachment metadata.
+            database.SaveMessageBodies(account, work.Folder, work.ConnectionKey, [body],
+                onlyIfMissing: true, completePreview: true,
+                // Filling an older backlog must not evict the newly arrived mail downloaded first.
+                cachePriority: new DateTimeOffset(dates[body.Id].ToUniversalTime()));
         }
-        token.ThrowIfCancellationRequested();
-        if (batch.Count > 0)
-            database.SaveMessageBodies(account, work.Folder, work.ConnectionKey, batch, onlyIfMissing: true);
     }
 
     private void CancelBackgroundCache(MailAccount account)

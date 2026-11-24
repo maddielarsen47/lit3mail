@@ -89,10 +89,21 @@ public partial class MailForm
             if (!IsDisposed && !timeout.IsCancellationRequested && !updatingMessageFolders &&
                 accounts.Contains(account) && ReferenceEquals(account.Mailbox, mailbox) &&
                 ReferenceEquals(previous, account.Counts.GetValueOrDefault("Inbox")))
+            {
+                account.ConnectionFailed = false;
+                UpdateOfflineIndicator();
                 SetFolderCount(account, "Inbox", count.Unread, count.Total);
+                if (previous is null || count.Total > previous.Total || count.Unread > previous.Unread)
+                    QueueArrivalCache(account);
+            }
         }
         catch (Exception)
         {
+            if (!token.IsCancellationRequested && !IsDisposed && ReferenceEquals(account.Mailbox, mailbox))
+            {
+                account.ConnectionFailed = true;
+                UpdateOfflineIndicator();
+            }
             // Keep the last count until the server responds.
         }
     }

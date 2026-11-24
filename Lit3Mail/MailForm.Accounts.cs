@@ -33,6 +33,8 @@ public partial class MailForm
         public bool OutgoingStartTls { get; set; }
         public IMailbox? Mailbox { get; set; } = mailbox;
         public bool HasSavedSignIn { get; set; }
+        public bool ConnectionFailed { get; set; }
+        public Action? PromptForPassword { get; set; }
 
         private static string Username(string user, string email) =>
             string.IsNullOrWhiteSpace(user) ? email.Trim() : user.Trim();
@@ -126,7 +128,7 @@ public partial class MailForm
             {
                 restored.HasSavedSignIn = true;
             }
-            if (restored.Mailbox is ServerMailbox)
+            if (restored.ValidateConnection() is null)
             {
                 try
                 {
@@ -255,6 +257,10 @@ public partial class MailForm
 
     private void UpdateSidebarCounts(MailAccount account, IReadOnlyDictionary<string, FolderCount> counts)
     {
+        var arrivals = counts.Where(pair => pair.Value.HasCounts &&
+            (!account.Counts.TryGetValue(pair.Key, out var previous) ||
+                pair.Value.Total > previous.Total || pair.Value.Unread > previous.Unread))
+            .Select(pair => pair.Key).ToArray();
         bool labelsChanged = !LabelFolders(account.Counts).Select(item => item.Key)
             .SequenceEqual(LabelFolders(counts).Select(item => item.Key));
         account.Counts = counts;
@@ -268,6 +274,8 @@ public partial class MailForm
                 RebuildFolders(selection?.Account, selection?.Folder, preserveMessageList: true);
         }
         folders.Invalidate();
+        foreach (string folder in arrivals)
+            QueueArrivalCache(account, folder);
     }
 
     private async Task RefreshOtherGmailFoldersAsync(MailAccount? selected)
@@ -932,6 +940,7 @@ public partial class MailForm
 
         void UpdateConnectionState()
         {
+            UpdateOfflineIndicator();
             connectionState.Text = account.Mailbox is null ? "Not connected" : $"Connected as {account.Email.Trim()}";
             connect.Text = account.Mailbox is null ? "Connect to mail servers" : "Reconnect to mail servers";
         }
@@ -1017,6 +1026,7 @@ public partial class MailForm
             activeKey = signIn.ConnectionKey;
             CancelBackgroundCache(account);
             account.Mailbox = mailbox;
+            account.ConnectionFailed = false;
             sessionSignIn = signIn;
             imapPassword.Text = smtpPassword.Text = passwordMask;
             UpdateConnectionState();
@@ -1039,6 +1049,8 @@ public partial class MailForm
             }
             RebuildFolders(account, "Inbox");
         }
+
+        account.PromptForPassword = () => PromptForStartupPassword(account, ConnectAccountAsync);
 
         connect.Click += async (_, _) =>
         {

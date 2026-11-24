@@ -307,6 +307,9 @@ public partial class MailForm : Form, IMessageFilter
         messageViewport.Controls.Add(messages);
         mailPane.Panel1.Controls.Add(messageViewport);
         mailPane.Panel1.Controls.Add(batchBar);
+        mailPane.Panel1.Controls.Add(offlineIndicator);
+        mailPane.Panel1.SizeChanged += (_, _) =>
+            offlineIndicator.MaximumSize = new Size(mailPane.Panel1.ClientSize.Width, 0);
         mailPane.Panel1.Controls.Add(composeOperationBar);
         messageSelectionBar.Controls.Add(messageSelectionCount);
         messageSelectionBar.Controls.Add(toggleMessageList);
@@ -654,6 +657,14 @@ public partial class MailForm : Form, IMessageFilter
         };
         Shown += (_, _) =>
         {
+            UpdateOfflineIndicator();
+            foreach (var account in accounts.Where(account => account.Mailbox is null).ToArray())
+            {
+                if (IsDisposed || Disposing)
+                    return;
+                account.PromptForPassword?.Invoke();
+            }
+            UpdateOfflineIndicator();
             openingApp = true;
             RebuildFolders(null, "Inbox");
             openingApp = false;
@@ -661,6 +672,9 @@ public partial class MailForm : Form, IMessageFilter
                 QueueBackgroundCache();
             _ = RefreshOtherGmailFoldersAsync(SelectedFolder?.Account);
         };
+        var connectionTimer = new System.Windows.Forms.Timer(components!) { Interval = 2_000 };
+        connectionTimer.Tick += (_, _) => UpdateOfflineIndicator();
+        Shown += (_, _) => connectionTimer.Start();
         FormClosing += (_, e) =>
         {
             if (clearingLocalData)
@@ -817,7 +831,8 @@ public partial class MailForm : Form, IMessageFilter
         automaticRemoteContent.FlatAppearance.CheckedBackColor = selectedBackground;
         folderHeading.ForeColor = folders.ForeColor = theme.ForeColor = sidebarTheme.ForeColor = composeFrom.ForeColor = ink;
         UpdateRemoteContentToggleAppearance();
-        mailPane.Panel2.BackColor = preview.BackColor = messages.BackgroundColor = surface;
+        // Theme the grid's control background too, including space outside its painted rows.
+        mailPane.Panel2.BackColor = preview.BackColor = messages.BackColor = messages.BackgroundColor = surface;
         previewSubject.BackColor = previewDetails.BackColor = surface;
         previewSubject.ForeColor = ink;
         previewBody.BackColor = composeQuoteFallback.BackColor = SystemInformation.HighContrast ? SystemColors.Window : Color.White;
@@ -836,6 +851,8 @@ public partial class MailForm : Form, IMessageFilter
         toggleMessageList.TextAlign = ContentAlignment.MiddleCenter;
         batchBar.BackColor = batchStatus.BackColor = surface;
         composeOperationBar.BackColor = composeOperationStatus.BackColor = surface;
+        offlineIndicator.BackColor = surface;
+        offlineIndicator.ForeColor = muted;
         batchStatus.ForeColor = composeOperationStatus.ForeColor = ink;
         searchStatus.ForeColor = messageSelectionCount.ForeColor = muted;
         StyleButton(exportMail, chrome, ink, border, selectedBackground);
@@ -1163,6 +1180,7 @@ public partial class MailForm : Form, IMessageFilter
         folderLoad?.Cancel();
         using var load = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
         folderLoad = load;
+        PauseBackgroundCacheForFolderLoad();
         var token = load.Token;
         var mailbox = entry.Account.Mailbox;
         var flagOverrides = flagUpdates.Where(pair => ReferenceEquals(pair.Key.Mailbox, mailbox))
@@ -1173,7 +1191,9 @@ public partial class MailForm : Form, IMessageFilter
         bool receivedBatch = false;
         bool seededSearch = false;
         bool mergedFirstBatch = false;
-        Task cachedSearch = Task.CompletedTask;
+        bool reminderSelected = false;
+        Task reminderPreview = Task.CompletedTask;
+        Task<IReadOnlyList<MailSummary>> cachedSearch = Task.FromResult<IReadOnlyList<MailSummary>>([]);
         var publishedIds = new HashSet<Guid>();
         try
         {
@@ -1181,7 +1201,7 @@ public partial class MailForm : Form, IMessageFilter
                 await Task.Delay(300, token);
 
             string query = search.Text;
-            bool cacheable = database is not null && mailbox is ServerMailbox && string.IsNullOrWhiteSpace(query);
+            bool cacheable = database is not null && (mailbox is ServerMailbox || mailbox is null) && string.IsNullOrWhiteSpace(query);
             string? connectionKey = cacheable ? entry.Account.ConnectionKey() : null;
             string? cacheRevision = null;
             if (connectionKey is not null)
@@ -1205,23 +1225,23 @@ public partial class MailForm : Form, IMessageFilter
                 }
             }
 
-            if (database is { } store && mailbox is ServerMailbox && !string.IsNullOrWhiteSpace(query))
+            if (database is { } store && (mailbox is ServerMailbox || mailbox is null) && !string.IsNullOrWhiteSpace(query))
                 cachedSearch = PublishCachedSearchAsync(store, entry.Account.ConnectionKey(), query);
 
-            if (mailbox is ServerMailbox && NetworkUnavailable())
+            if (mailbox is null || mailbox is ServerMailbox && NetworkUnavailable())
             {
                 await cachedSearch;
                 token.ThrowIfCancellationRequested();
-                ShowFolderLoadError("The computer appears to be offline. Reconnect to refresh mail.");
+                UpdateOfflineIndicator();
                 return;
             }
 
             searchStatus.Visible = mailbox is ServerMailbox && !string.IsNullOrWhiteSpace(query);
             var folderMail = mailbox switch
             {
-                ServerMailbox server when !string.IsNullOrWhiteSpace(query) ||
-                    messages.Rows.Count == 0 || showingCachedFolder || clearingSearch || prioritizeCurrentFolder =>
-                    await server.ListAsync(folder, query, token, PublishBatch),
+                ServerMailbox server =>
+                    await server.ListAsync(folder, query, token, PublishBatch, prioritizedMessage: reminderMessage,
+                        cachedSearchMatches: cachedSearch),
                 null => [],
                 _ => await mailbox.ListAsync(folder, query, token)
             };
@@ -1230,6 +1250,8 @@ public partial class MailForm : Form, IMessageFilter
             if (IsDisposed)
                 return;
 
+            entry.Account.ConnectionFailed = false;
+            UpdateOfflineIndicator();
             searchStatus.Hide();
             if (batchStatus.Text == SavedMessagesStatus)
                 batchBar.Hide();
@@ -1247,8 +1269,8 @@ public partial class MailForm : Form, IMessageFilter
                     preserveScrollAnchor: (!debounce && !clearingSearch) || receivedBatch || seededSearch);
             loadedUnfilteredFolder = string.IsNullOrWhiteSpace(query) ? entry : null;
             var displayed = SelectedMessage;
-            bool keepPreview = !seededSearch && !wasCached && current?.Id == displayed?.Id &&
-                (receivedBatch || backgroundRefresh || prioritizeCurrentFolder);
+            bool keepPreview = current?.Id == displayed?.Id && (reminderSelected || !seededSearch && !wasCached &&
+                (receivedBatch || backgroundRefresh || prioritizeCurrentFolder));
             var preview = keepPreview ? Task.CompletedTask : ShowPreview();
             if (connectionKey is not null && !IsPendingMoveSource())
             {
@@ -1260,13 +1282,15 @@ public partial class MailForm : Form, IMessageFilter
                 token.ThrowIfCancellationRequested();
                 QueueBackgroundCache(entry, cacheMail);
             }
-            await Task.WhenAll(preview, RefreshFolderCounts(entry.Account, mailbox, refreshCounts, token));
+            await Task.WhenAll(preview, reminderPreview, RefreshFolderCounts(entry.Account, mailbox, refreshCounts, token));
         }
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception error)
         {
             if (!token.IsCancellationRequested && !IsDisposed)
             {
+                entry.Account.ConnectionFailed = true;
+                UpdateOfflineIndicator();
                 await cachedSearch;
                 if (token.IsCancellationRequested || IsDisposed)
                     return;
@@ -1281,6 +1305,7 @@ public partial class MailForm : Form, IMessageFilter
             {
                 folderLoad = null;
                 folderLoadFlagOverrides = null;
+                ResumeBackgroundCache();
                 if (!IsDisposed)
                     searchStatus.Hide();
             }
@@ -1289,24 +1314,24 @@ public partial class MailForm : Form, IMessageFilter
                 await SelectReminderMessageAsync(target);
         }
 
-        async Task PublishCachedSearchAsync(LocalDatabase store, string key, string query)
+        async Task<IReadOnlyList<MailSummary>> PublishCachedSearchAsync(LocalDatabase store, string key, string query)
         {
             IReadOnlyList<MailSummary> cached;
             try
             {
                 cached = await Task.Run(() => store.SearchFolderCache(entry.Account.Id, folder, key, query, token), token);
             }
-            catch (OperationCanceledException) when (token.IsCancellationRequested) { return; }
+            catch (OperationCanceledException) when (token.IsCancellationRequested) { return []; }
             catch (Exception error) when (error is Microsoft.Data.Sqlite.SqliteException or System.Text.Json.JsonException)
             {
                 cached = [];
             }
 
             if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry)
-                return;
+                return [];
 
             if (receivedBatch)
-                return;
+                return cached;
 
             var rows = cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray();
             seededSearch = rows.Length > 0;
@@ -1315,9 +1340,23 @@ public partial class MailForm : Form, IMessageFilter
                 publishedIds.Add(mail.Id);
             RenderFolder(rows, SelectedMessage, preserveScrollAnchor: !debounce);
             _ = ShowPreview();
+            return cached;
         }
 
         void PublishBatch(IReadOnlyList<MailSummary> batch)
+        {
+            PublishBatchCore(batch);
+            if (reminderMessage is not { } target || token.IsCancellationRequested || IsDisposed ||
+                SelectedFolder != entry || !batch.Any(mail => mail.Id == target))
+                return;
+
+            // Select synchronously as soon as the target row exists; preview loading runs alongside the list.
+            reminderMessage = null;
+            reminderSelected = true;
+            reminderPreview = SelectReminderMessageAsync(target);
+        }
+
+        void PublishBatchCore(IReadOnlyList<MailSummary> batch)
         {
             if (token.IsCancellationRequested || IsDisposed || SelectedFolder != entry ||
                 mergedFirstBatch && !showingCachedFolder)
@@ -1350,7 +1389,7 @@ public partial class MailForm : Form, IMessageFilter
 
             if (mergedFirstBatch)
             {
-                if (showingCachedFolder && SelectedMessage is { } current && newRows.Any(mail => mail.Id == current.Id))
+                if (!reminderSelected && showingCachedFolder && SelectedMessage is { } current && newRows.Any(mail => mail.Id == current.Id))
                     _ = ShowPreview();
                 return;
             }
@@ -1570,6 +1609,8 @@ public partial class MailForm : Form, IMessageFilter
             var counts = await mailbox.GetFolderCountsAsync(token);
             if (!IsDisposed && !token.IsCancellationRequested && accounts.Contains(account) && ReferenceEquals(account.Mailbox, mailbox))
             {
+                account.ConnectionFailed = false;
+                UpdateOfflineIndicator();
                 account.CountsUpdatedAt = DateTimeOffset.UtcNow;
                 UpdateSidebarCounts(account, counts);
                 if (database is not null && mailbox is ServerMailbox)
@@ -1582,6 +1623,11 @@ public partial class MailForm : Form, IMessageFilter
         catch (OperationCanceledException) when (token.IsCancellationRequested) { }
         catch (Exception)
         {
+            if (!token.IsCancellationRequested && !IsDisposed && ReferenceEquals(account.Mailbox, mailbox))
+            {
+                account.ConnectionFailed = true;
+                UpdateOfflineIndicator();
+            }
             // Keep the last counts if STATUS fails. Folder contents remain usable.
         }
         finally
@@ -1917,7 +1963,7 @@ public partial class MailForm : Form, IMessageFilter
         reply.Enabled = replyAll.Enabled = forward.Enabled = false;
         var selected = SelectedMessage;
         UpdateImagePreview(selected);
-        if (SelectedFolder is not { Account.Mailbox: { } mailbox } entry || selected is not { } mail)
+        if (SelectedFolder is not { } entry || selected is not { } mail)
         {
             preview.Hide();
             previewSubject.Text = "";
@@ -1925,9 +1971,10 @@ public partial class MailForm : Form, IMessageFilter
             previewBody.Clear();
             return;
         }
+        var mailbox = entry.Account.Mailbox;
         preview.Show();
         editDraft.Visible = entry.Folder == "Drafts" && !showingCachedFolder;
-        moveMail.Enabled = deleteMail.Enabled = true;
+        moveMail.Enabled = deleteMail.Enabled = mailbox is not null;
 
         previewSubject.Text = mail.Subject;
         var details = new List<string>();
@@ -1945,9 +1992,9 @@ public partial class MailForm : Form, IMessageFilter
         if (mail.Attachments && !showingCachedFolder)
             ShowPreviewAttachmentsLoading();
 
-        string? connectionKey = database is not null && mailbox is ServerMailbox ? entry.Account.ConnectionKey() : null;
-        bool canLoadFromServer = !showingCachedFolder ||
-            mailbox is ServerMailbox server && server.KnowsMessage(mail.Id) && !NetworkUnavailable();
+        string? connectionKey = database is not null && (mailbox is ServerMailbox || mailbox is null) ? entry.Account.ConnectionKey() : null;
+        bool canLoadFromServer = mailbox is not null && !NetworkUnavailable() && (!showingCachedFolder ||
+            mailbox is ServerMailbox server && server.KnowsMessage(mail.Id));
         bool displayedCachedBody = false;
         SetPreviewBody("Loading mail...", italic: true);
         using var load = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
@@ -1962,7 +2009,8 @@ public partial class MailForm : Form, IMessageFilter
                         database!.LoadMessageBody(entry.Account.Id, mail.Folder, connectionKey, mail.Id), load.Token);
                     if (request != previewRequest || IsDisposed)
                         return;
-                    if (cached is not null && (!string.IsNullOrWhiteSpace(cached.Body) || !string.IsNullOrWhiteSpace(cached.Html)))
+                    if (cached is not null && (cached.InlineImages is not null ||
+                        !string.IsNullOrWhiteSpace(cached.Body) || !string.IsNullOrWhiteSpace(cached.Html)))
                     {
                         // A non-null image list marks a downloaded preview, even when there were no embedded images.
                         bool cacheIsComplete = cached.InlineImages is not null || !mail.HasStandaloneImages && cached.Html is { } html &&
@@ -1970,7 +2018,9 @@ public partial class MailForm : Form, IMessageFilter
                         if (!canLoadFromServer || cacheIsComplete)
                         {
                             DisplayMessageBody(mail, cached);
-                            if (mail.Attachments && !showingCachedFolder)
+                            if (cached.AttachmentList is { } cachedAttachments)
+                                DisplayPreviewAttachments(cachedAttachments);
+                            else if (mailbox is not null && mail.Attachments && !showingCachedFolder)
                                 _ = LoadPreviewAttachmentsAsync(mailbox, mail.Id, request);
                             return;
                         }
@@ -1985,7 +2035,7 @@ public partial class MailForm : Form, IMessageFilter
                 }
             }
 
-            if (!canLoadFromServer)
+            if (!canLoadFromServer || mailbox is null)
             {
                 SetPreviewBody("This message body is not saved on this computer. Connect to the mail server to read it.");
                 return;
@@ -2012,7 +2062,7 @@ public partial class MailForm : Form, IMessageFilter
 
             if (!displayedCachedBody)
                 SetPreviewBody(MailOperationError(error, "Could not load the message."));
-            if (mail.Attachments)
+            if (mailbox is not null && mail.Attachments)
                 _ = LoadPreviewAttachmentsAsync(mailbox, mail.Id, request);
         }
         finally

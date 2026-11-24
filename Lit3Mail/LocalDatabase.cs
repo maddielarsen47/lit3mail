@@ -34,7 +34,7 @@ internal sealed class LocalDatabase(string path)
     internal const int FolderCacheLimit = 1000;
     private const int MaxCachedBodyPartBytes = 4 * 1024 * 1024;
     private const int MaxOpenedPreviewCacheBytes = 128 * 1024 * 1024;
-    private const int SchemaVersion = 20;
+    private const int SchemaVersion = 21;
 
     private sealed record CachedMessage(Guid Id, bool Read, bool Star, bool Attachments,
         string Subject, string Correspondents, DateTime Date,
@@ -389,6 +389,15 @@ internal sealed class LocalDatabase(string path)
             command.CommandText = """
                 ALTER TABLE accounts ADD COLUMN signature_file_path TEXT NOT NULL DEFAULT '';
                 PRAGMA user_version = 20;
+                """;
+            command.ExecuteNonQuery();
+        }
+
+        if (version < 21)
+        {
+            command.CommandText = """
+                ALTER TABLE message_body_cache ADD COLUMN attachment_list TEXT;
+                PRAGMA user_version = 21;
                 """;
             command.ExecuteNonQuery();
         }
@@ -830,15 +839,15 @@ internal sealed class LocalDatabase(string path)
         {
             command.CommandText = """
                 INSERT INTO message_body_cache (account_id, folder, connection_key, message_id, body, html,
-                                                inline_images, preview_cached_at)
+                                                inline_images, preview_cached_at, attachment_list)
                 SELECT source.account_id, $destination, source.connection_key, moved.value, source.body, source.html,
-                       source.inline_images, source.preview_cached_at
+                       source.inline_images, source.preview_cached_at, source.attachment_list
                 FROM json_each($destinationIds) AS moved
                 JOIN message_body_cache AS source ON source.message_id = moved.key
                 WHERE source.account_id = $account AND source.folder = $folder AND source.connection_key = $connection
                 ON CONFLICT(account_id, folder, connection_key, message_id) DO UPDATE SET
                     body = excluded.body, html = excluded.html, inline_images = excluded.inline_images,
-                    preview_cached_at = excluded.preview_cached_at
+                    preview_cached_at = excluded.preview_cached_at, attachment_list = excluded.attachment_list
                 WHERE message_body_cache.inline_images IS NULL
                   AND (excluded.inline_images IS NOT NULL OR
                        (message_body_cache.html IS NULL AND excluded.html IS NOT NULL));
@@ -989,7 +998,8 @@ internal sealed class LocalDatabase(string path)
         command.CommandTimeout = 1;
         command.CommandText = """
             SELECT message_id FROM message_body_cache
-            WHERE account_id = $account AND folder = $folder AND connection_key = $connection AND html IS NOT NULL
+            WHERE account_id = $account AND folder = $folder AND connection_key = $connection
+              AND html IS NOT NULL AND inline_images IS NOT NULL AND attachment_list IS NOT NULL
             """;
         AddFolderParameters(command, account, folder, connectionKey);
         using var reader = command.ExecuteReader();
@@ -1008,7 +1018,7 @@ internal sealed class LocalDatabase(string path)
         using var command = connection.CreateCommand();
         command.CommandTimeout = 1;
         command.CommandText = """
-            SELECT body, html, inline_images FROM message_body_cache
+            SELECT body, html, inline_images, attachment_list FROM message_body_cache
             WHERE account_id = $account AND folder = $folder AND connection_key = $connection AND message_id = $message
               AND octet_length(body) <= $maxPartBytes AND (html IS NULL OR octet_length(html) <= $maxPartBytes)
             """;
@@ -1024,7 +1034,14 @@ internal sealed class LocalDatabase(string path)
             try { images = JsonSerializer.Deserialize<InlineMailImage[]>((byte[])reader.GetValue(2)); }
             catch (JsonException) { }
         }
-        return new MailContent(reader.GetString(0), Html: reader.IsDBNull(1) ? null : reader.GetString(1), InlineImages: images);
+        MailAttachmentInfo[]? attachments = null;
+        if (!reader.IsDBNull(3))
+        {
+            try { attachments = JsonSerializer.Deserialize<MailAttachmentInfo[]>(reader.GetString(3)); }
+            catch (JsonException) { }
+        }
+        return new MailContent(reader.GetString(0), Html: reader.IsDBNull(1) ? null : reader.GetString(1),
+            InlineImages: images, AttachmentList: attachments);
     }
 
     public void SaveMessageBody(Guid account, string folder, string connectionKey, Guid message, MailContent content,
@@ -1032,7 +1049,8 @@ internal sealed class LocalDatabase(string path)
         SaveMessageBodies(account, folder, connectionKey, [(message, content)], false, completePreview);
 
     public void SaveMessageBodies(Guid account, string folder, string connectionKey,
-        IReadOnlyList<(Guid Id, MailContent Content)> bodies, bool onlyIfMissing, bool completePreview = false)
+        IReadOnlyList<(Guid Id, MailContent Content)> bodies, bool onlyIfMissing, bool completePreview = false,
+        DateTimeOffset? cachePriority = null)
     {
         using var connection = Open();
         using var transaction = connection.BeginTransaction();
@@ -1059,11 +1077,11 @@ internal sealed class LocalDatabase(string path)
 
         command.CommandText = """
             INSERT INTO message_body_cache (account_id, folder, connection_key, message_id, body, html,
-                                            inline_images, preview_cached_at)
-            VALUES ($account, $folder, $connection, $message, $body, $html, $images, $cachedAt)
+                                            inline_images, preview_cached_at, attachment_list)
+            VALUES ($account, $folder, $connection, $message, $body, $html, $images, $cachedAt, $attachments)
             ON CONFLICT(account_id, folder, connection_key, message_id) DO UPDATE SET
                 body = excluded.body, html = excluded.html, inline_images = excluded.inline_images,
-                preview_cached_at = excluded.preview_cached_at
+                preview_cached_at = excluded.preview_cached_at, attachment_list = excluded.attachment_list
             WHERE excluded.inline_images IS NOT NULL OR
                 (message_body_cache.inline_images IS NULL AND (NOT $onlyIfMissing OR message_body_cache.html IS NULL))
             """;
@@ -1072,6 +1090,7 @@ internal sealed class LocalDatabase(string path)
         var html = command.Parameters.Add("$html", SqliteType.Text);
         var images = command.Parameters.Add("$images", SqliteType.Blob);
         var cachedAt = command.Parameters.Add("$cachedAt", SqliteType.Integer);
+        var attachmentsParameter = command.Parameters.Add("$attachments", SqliteType.Text);
         command.Parameters.AddWithValue("$onlyIfMissing", onlyIfMissing);
         foreach (var (id, content) in bodies)
         {
@@ -1081,7 +1100,9 @@ internal sealed class LocalDatabase(string path)
             body.Value = content.Body;
             html.Value = content.Html ?? "";
             images.Value = completePreview ? JsonSerializer.SerializeToUtf8Bytes(content.InlineImages ?? []) : DBNull.Value;
-            cachedAt.Value = completePreview ? DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() : DBNull.Value;
+            cachedAt.Value = completePreview ? (cachePriority ?? DateTimeOffset.UtcNow).ToUnixTimeMilliseconds() : DBNull.Value;
+            attachmentsParameter.Value = completePreview && content.AttachmentList is not null
+                ? JsonSerializer.Serialize(content.AttachmentList) : DBNull.Value;
             command.ExecuteNonQuery();
         }
         if (completePreview)

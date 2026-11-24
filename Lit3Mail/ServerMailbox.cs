@@ -206,13 +206,14 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         return (current, arrivals.Count, preview);
     }
 
-    private static async Task<InboxArrivalPreview?> ReadArrivalPreviewAsync(
+    private async Task<InboxArrivalPreview?> ReadArrivalPreviewAsync(
         IMailFolder inbox, UniqueId uid, CancellationToken token)
     {
         const int maxSnippetBytes = 8192;
         using var timeout = CancellationTokenSource.CreateLinkedTokenSource(token);
         timeout.CancelAfter(TimeSpan.FromSeconds(2));
         IMessageSummary? summary = null;
+        Guid messageId = RegisterMessage(inbox, uid);
         try
         {
             var items = MessageSummaryItems.Envelope | MessageSummaryItems.InternalDate | MessageSummaryItems.BodyStructure;
@@ -223,13 +224,13 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             string text = ReadReminderText(await ReadSnippetAsync(summary.TextBody));
             if (string.IsNullOrWhiteSpace(text))
                 text = ReadReminderText(await ReadSnippetAsync(summary.HtmlBody));
-            return new(MessageIdFor(inbox, uid), summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, text);
+            return new(messageId, summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, text);
         }
         catch (Exception error) when (error is IOException or CommandException or ProtocolException or
             InvalidOperationException or OperationCanceledException or FormatException or ArgumentException)
         {
             // A missing excerpt must not prevent the arrival notification.
-            return summary is null ? null : new(MessageIdFor(inbox, uid), summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, null);
+            return summary is null ? null : new(messageId, summary.InternalDate ?? DateTimeOffset.MinValue, summary.Envelope?.Subject, null);
         }
 
         async Task<string?> ReadSnippetAsync(BodyPartText? part)
@@ -269,7 +270,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         ListAsync(folder, query, token, null);
 
     public async Task<IReadOnlyList<MailSummary>> ListAsync(string folder, string query, CancellationToken token,
-        Action<IReadOnlyList<MailSummary>>? publishBatch, int? limit = null)
+        Action<IReadOnlyList<MailSummary>>? publishBatch, int? limit = null, Guid? prioritizedMessage = null,
+        Task<IReadOnlyList<MailSummary>>? cachedSearchMatches = null)
     {
         using var client = new ImapClient();
         await ConnectAsync(client, incoming, token);
@@ -289,6 +291,26 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         const MessageSummaryItems items = MessageSummaryItems.UniqueId | MessageSummaryItems.Envelope |
             MessageSummaryItems.Flags | MessageSummaryItems.InternalDate | MessageSummaryItems.BodyStructure;
         var request = new FetchRequest(items, [HeaderId.ReplyTo]);
+        if (terms.Length == 0 && publishBatch is not null && prioritizedMessage is { } target)
+        {
+            UniqueId uid;
+            if (messages.TryGetValue(target, out var location) && location.Folder == remote.FullName &&
+                location.Validity == remote.UidValidity)
+                uid = location.Uid;
+            else
+            {
+                // Notification activation can start a fresh process without an in-memory UID map.
+                var uids = await remote.SearchAsync(SearchQuery.All, token);
+                uid = uids.FirstOrDefault(candidate => MessageIdFor(remote, candidate) == target);
+            }
+            if (uid.IsValid)
+            {
+                var fetched = await remote.FetchAsync([uid], request, token);
+                var targetBatch = ConvertSummaries(remote, folder, fetched, 1);
+                if (targetBatch.Length > 0)
+                    publishBatch(targetBatch);
+            }
+        }
         const int FirstBatchSize = 50;
         if (terms.Length == 0 && publishBatch is not null && remote.Count > FirstBatchSize)
         {
@@ -324,7 +346,21 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         else
         {
             var criteria = terms.Select<string, SearchQuery>(SearchQuery.MessageContains).Aggregate((left, right) => left.And(right));
-            var uids = await remote.SearchAsync(criteria, token);
+            var uids = (await remote.SearchAsync(criteria, token)).ToList();
+            if (cachedSearchMatches is not null)
+            {
+                var cachedMatches = await cachedSearchMatches;
+                token.ThrowIfCancellationRequested();
+                var missing = cachedMatches.Select(mail => mail.Id).ToHashSet();
+                missing.ExceptWith(uids.Select(uid => MessageIdFor(remote, uid)));
+                if (missing.Count > 0)
+                {
+                    // Server text searches can tokenize docket codes differently from local substring searches.
+                    // Confirm cached-only matches against live UIDs so moved/deleted messages cannot linger.
+                    var live = await remote.SearchAsync(SearchQuery.All, token);
+                    uids.AddRange(live.Where(uid => missing.Contains(MessageIdFor(remote, uid))));
+                }
+            }
             if (uids.Count == 0)
                 return [];
             if (publishBatch is not null)
@@ -469,6 +505,11 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
     {
         using var client = new ImapClient();
         var (folder, uid) = await OpenMessageFolderAsync(client, id, FolderAccess.ReadOnly, token);
+        return await LoadContentAsync(folder, uid, id, token);
+    }
+
+    private async Task<MailContent> LoadContentAsync(IMailFolder folder, UniqueId uid, Guid id, CancellationToken token)
+    {
         var structure = await GetPreviewStructureAsync(folder, uid, id, token);
         var (text, textLimited) = await ReadTextPartAsync(folder, uid, structure.Text, token);
         var (html, htmlLimited) = await ReadTextPartAsync(folder, uid, structure.Html, token);
@@ -674,15 +715,15 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         foreach (var uids in known.Keys.Chunk(25))
         {
             var summaries = await folder.FetchAsync(uids, MessageSummaryItems.UniqueId | MessageSummaryItems.BodyStructure, token);
-            foreach (var item in summaries)
+            foreach (var item in summaries.OrderByDescending(item => item.UniqueId.Id))
             {
-                if (!known.TryGetValue(item.UniqueId, out Guid id) || item.TextBody is null && item.HtmlBody is null)
+                if (!known.TryGetValue(item.UniqueId, out Guid id))
                     continue;
 
-                var (text, _) = await ReadTextPartAsync(folder, item.UniqueId, item.TextBody, token);
-                var (html, _) = await ReadTextPartAsync(folder, item.UniqueId, item.HtmlBody, token);
-                if (text is not null || html is not null)
-                    yield return (id, new MailContent(text ?? ReadHtmlAsText(html!), Html: html ?? ""));
+                RememberPreviewStructure(id, item);
+                var content = await LoadContentAsync(folder, item.UniqueId, id, token);
+                if (!content.PreviewTooLarge)
+                    yield return (id, content);
 
                 // Give interactive mail operations time between background downloads.
                 await Task.Delay(35, token);

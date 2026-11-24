@@ -89,7 +89,9 @@ public partial class MailForm
             if (WindowState == FormWindowState.Minimized)
                 WindowState = FormWindowState.Normal;
             Activate();
-            var account = accounts.FirstOrDefault(item => item.Id == accountId && item.DesktopNotifications && item.Mailbox is not null);
+            var account = accounts.FirstOrDefault(item => item.Id == accountId);
+            if (account is not null && settingsPage.Visible)
+                backToMail.PerformClick();
             if (!mailLayout.Visible || settingsPage.Visible || account is null)
                 return;
 
@@ -132,6 +134,8 @@ public partial class MailForm
         }
         finally { rebuildingRows = false; }
         messages.Focus();
+        // Rendering cached or refreshed rows may already have recorded this ID without loading its live preview.
+        selectedMessageId = null;
         await SelectCurrentMessage();
     }
 
@@ -237,6 +241,8 @@ public partial class MailForm
                 (notifyAfter is not null || unfocusedSince is null))
             {
                 cursor.Position = position;
+                if (arrivals > 0)
+                    QueueArrivalCache(account);
                 return new(account, cursor, arrivals, preview);
             }
         }

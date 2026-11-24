@@ -87,6 +87,8 @@ lists it in the composer status. If a server draft exceeds either attachment lim
 its full message exceeds **80 MiB**, Lit3Mail shows an error and leaves the
 draft on the server.
 
+Up to 1,000 recent emails are cached per folder for quick access in the local data file.
+
 ## Technical details
 
 ### Build
