@@ -50,10 +50,10 @@ public partial class MailForm
         }
     }
 
-    private async Task ExportMessagesAsync(bool selectionOnly)
+    private async Task ExportMessagesAsync(bool selectionOnly, FolderEntry? targetFolder = null)
     {
         if (updatingMessageFolders || exportCancellation is not null ||
-            SelectedFolder is not { Account.Mailbox: { } mailbox, Folder: { } folder } entry)
+            (targetFolder ?? SelectedFolder) is not { Account.Mailbox: { } mailbox, Folder: { } folder } entry)
             return;
         var ids = selectionOnly ? SelectedMessageIds() : null;
         if (selectionOnly && (!selectionMade || ids?.Count == 0))

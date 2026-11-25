@@ -1,9 +1,13 @@
+using Microsoft.Win32;
+
 namespace Lit3Mail;
 
 public partial class MailForm
 {
     private const string CheckingForMailStatus = "Checking for mail...";
     private bool refreshingAutomatically;
+    private bool recoveringFromSleep;
+    private CancellationTokenSource? wakeRefresh;
 
     private void InitializeAutoRefresh()
     {
@@ -19,11 +23,76 @@ public partial class MailForm
             await RefreshMailAsync(fullRefresh);
         };
         Shown += (_, _) => timer.Start();
+        PowerModeChangedEventHandler powerChanged = (_, args) => this.PostIfHandleAvailable(async () =>
+        {
+            if (args.Mode == PowerModes.Suspend)
+            {
+                wakeRefresh?.Cancel();
+                wakeRefresh = null;
+                recoveringFromSleep = true;
+                folderLoad?.Cancel();
+                previewLoad?.Cancel();
+                PauseBackgroundCacheForFolderLoad();
+            }
+            else if (args.Mode == PowerModes.Resume)
+                await RefreshAfterSleepAsync();
+        });
+        SystemEvents.PowerModeChanged += powerChanged;
+        Disposed += (_, _) =>
+        {
+            SystemEvents.PowerModeChanged -= powerChanged;
+            wakeRefresh?.Cancel();
+        };
     }
 
-    private async Task RefreshMailAsync(bool fullRefresh, bool manual = false)
+    private async Task RefreshAfterSleepAsync()
     {
-        if ((!manual && (refreshingAutomatically || updatingMessageFolders || exportCancellation is not null)) ||
+        wakeRefresh?.Cancel();
+        using var recovery = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
+        wakeRefresh = recovery;
+        recoveringFromSleep = true;
+        folderLoad?.Cancel();
+        previewLoad?.Cancel();
+        PauseBackgroundCacheForFolderLoad();
+        try
+        {
+            // Wi-Fi and VPN connections often need a few seconds after Windows resumes.
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                await Task.Delay(TimeSpan.FromSeconds(attempt == 0 ? 3 : 5), recovery.Token);
+                if (NetworkUnavailable() || refreshingAutomatically || updatingMessageFolders ||
+                    exportCancellation is not null || choosingComposeFiles)
+                    continue;
+                await RefreshMailAsync(fullRefresh: true, resuming: true);
+                recovery.Token.ThrowIfCancellationRequested();
+                if (!accounts.Any(account => account.Mailbox is not null && account.ConnectionFailed))
+                    break;
+            }
+        }
+        catch (OperationCanceledException) when (recovery.IsCancellationRequested) { }
+        catch (Exception error)
+        {
+            System.Diagnostics.Debug.WriteLine($"Mail refresh after sleep failed ({error.GetType().Name}).");
+        }
+        finally
+        {
+            if (ReferenceEquals(wakeRefresh, recovery))
+            {
+                wakeRefresh = null;
+                recoveringFromSleep = false;
+                if (!IsDisposed && !Disposing)
+                {
+                    UpdateOfflineIndicator();
+                    ResumeBackgroundCache();
+                    await CheckMailIndicatorsAsync();
+                }
+            }
+        }
+    }
+
+    private async Task RefreshMailAsync(bool fullRefresh, bool manual = false, bool resuming = false)
+    {
+        if ((!manual && (recoveringFromSleep && !resuming || refreshingAutomatically || updatingMessageFolders || exportCancellation is not null)) ||
             choosingComposeFiles || IsDisposed || Disposing ||
             !accounts.Any(account => account.Mailbox is not null))
             return;
@@ -92,7 +161,7 @@ public partial class MailForm
             {
                 account.ConnectionFailed = false;
                 UpdateOfflineIndicator();
-                SetFolderCount(account, "Inbox", count.Unread, count.Total);
+                SetFolderCount(account, "Inbox", Math.Clamp(count.Unread + PendingUnreadDelta(account, "Inbox"), 0, count.Total), count.Total);
                 if (previous is null || count.Total > previous.Total || count.Unread > previous.Unread)
                     QueueArrivalCache(account);
             }

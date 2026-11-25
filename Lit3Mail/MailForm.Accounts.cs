@@ -231,6 +231,7 @@ public partial class MailForm
         else
         {
             selectedFolder = null;
+            UpdateFolderRemoteContentSetting();
             newEmail.Enabled = false;
             folderLoad?.Cancel();
             searchStatus.Hide();
@@ -257,6 +258,16 @@ public partial class MailForm
 
     private void UpdateSidebarCounts(MailAccount account, IReadOnlyDictionary<string, FolderCount> counts)
     {
+        counts = counts.ToDictionary(pair => pair.Key, pair => pair.Value with
+        {
+            Unread = Math.Clamp(pair.Value.Unread + PendingUnreadDelta(account, pair.Key), 0, pair.Value.Total)
+        });
+        if (pendingFolderRead is { Entry.Folder: { } pendingFolder } pending && pending.Entry.Account == account &&
+            ReferenceEquals(account.Mailbox, pending.Mailbox) && counts.TryGetValue(pendingFolder, out var pendingCount))
+        {
+            pending.OriginalCount = pendingCount;
+            counts = new Dictionary<string, FolderCount>(counts) { [pendingFolder] = pendingCount with { Unread = 0 } };
+        }
         var arrivals = counts.Where(pair => pair.Value.HasCounts &&
             (!account.Counts.TryGetValue(pair.Key, out var previous) ||
                 pair.Value.Total > previous.Total || pair.Value.Unread > previous.Unread))

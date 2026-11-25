@@ -4,6 +4,16 @@ namespace Lit3Mail;
 
 internal static class MailFolders
 {
+    public static bool IsSpamFolder(string name)
+    {
+        string leaf = name[(name.LastIndexOfAny(['/', '\\', ':']) + 1)..].Trim();
+        return leaf.Equals("Spam", StringComparison.OrdinalIgnoreCase) ||
+            leaf.Equals("Junk", StringComparison.OrdinalIgnoreCase) ||
+            leaf.Equals("Junk Email", StringComparison.OrdinalIgnoreCase) ||
+            leaf.Equals("Junk E-mail", StringComparison.OrdinalIgnoreCase) ||
+            leaf.Equals("Junk Mail", StringComparison.OrdinalIgnoreCase);
+    }
+
     public static bool MarksMovedMessagesRead(string name) =>
         name.Equals("Trash", StringComparison.OrdinalIgnoreCase) ||
         name.Equals("Bin", StringComparison.OrdinalIgnoreCase);
@@ -91,6 +101,7 @@ internal interface IMailbox
     Task<IReadOnlyList<MailAttachmentInfo>> GetAttachmentsAsync(Guid id, CancellationToken cancellationToken);
     Task DownloadAttachmentAsync(Guid id, string partId, Stream output, CancellationToken cancellationToken);
     Task UpdateFlagsAsync(string folder, Guid id, bool? read, bool? star, CancellationToken cancellationToken);
+    Task<IReadOnlyCollection<Guid>> MarkAllReadAsync(string folder, CancellationToken cancellationToken);
     Task<MessageMoveResult> DeleteAsync(string folder, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
     Task<MessageMoveResult> MoveAsync(string source, string destination, IReadOnlyCollection<Guid> ids, CancellationToken cancellationToken);
     Task ExportAsync(string folder, IReadOnlySet<Guid>? ids, System.IO.Compression.ZipArchive archive,

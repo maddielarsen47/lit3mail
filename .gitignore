@@ -1,5 +1,7 @@
 .gitconfig
 .vs/
+bin/
+obj/
 Lit3Mail/bin/
 Lit3Mail/obj/
 Lit3Mail/Lit3Mail.csproj.user

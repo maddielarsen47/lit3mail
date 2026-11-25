@@ -139,6 +139,11 @@ public partial class MailForm : Form, IMessageFilter
         TextAlign = ContentAlignment.MiddleLeft, UseMnemonic = false, UseVisualStyleBackColor = false
     };
     private Guid? imagePermission;
+    private bool preferredAutomaticRemoteContent;
+    private bool applyingFolderRemoteContent;
+    private bool savingRemoteContentPreference;
+    private bool IsSpamFolderSelected => SelectedFolder is { Folder: { } folder } entry &&
+        MailFolders.IsSpamFolder(entry.Account.Counts.GetValueOrDefault(folder)?.LabelName ?? folder);
     private bool previewRemoteContentFailed;
     private readonly Label settingsHeading = new() { Text = "Settings", Dock = DockStyle.Top, Height = 44 };
     private readonly Button newEmail = new() { Text = "New Email", Dock = DockStyle.Fill, FlatStyle = FlatStyle.Flat };
@@ -590,6 +595,7 @@ public partial class MailForm : Form, IMessageFilter
         folders.ClientSizeChanged += (_, _) => folders.Invalidate();
         InitializeStatusBars();
         InitializeExport();
+        InitializeFolderActions();
         theme.Items.AddRange(["System", "Light", "Dark"]);
         sidebarTheme.Items.AddRange(["System", "Light", "Dark"]);
         bool restoringTheme = true;
@@ -630,6 +636,7 @@ public partial class MailForm : Form, IMessageFilter
             UpdateMessageSelectionCount();
             ++emlOpenVersion;
             selectedFolder = entry;
+            UpdateFolderRemoteContentSetting();
             folders.Invalidate();
             loadedUnfilteredFolder = null;
             selectionMade = false;
@@ -858,6 +865,7 @@ public partial class MailForm : Form, IMessageFilter
         StyleButton(exportMail, chrome, ink, border, selectedBackground);
         exportMenu.Renderer = new ExportMenuRenderer(chrome, ink,
             SystemInformation.HighContrast ? SystemColors.GrayText : muted, border, selectedBackground, selectedText);
+        folderMenu.Renderer = exportMenu.Renderer;
         StyleButton(cancelExport, chrome, ink, border, selectedBackground);
         StyleButton(composeAddressDetails, chrome, ink, border, selectedBackground);
         foreach (var field in new[] { search, composeTo, composeCc, composeBcc, composeReplyTo, composeSubject })
@@ -1186,6 +1194,10 @@ public partial class MailForm : Form, IMessageFilter
         var flagOverrides = flagUpdates.Where(pair => ReferenceEquals(pair.Key.Mailbox, mailbox))
             .ToDictionary(pair => (pair.Key.Id, pair.Key.ReadFlag), pair => pair.Value.Value);
         folderLoadFlagOverrides = flagOverrides;
+        if (pendingFolderRead is { } pendingRead && pendingRead.Entry == entry &&
+            ReferenceEquals(pendingRead.Mailbox, mailbox))
+            foreach (Guid id in pendingRead.OriginalRead.Keys)
+                flagOverrides[(id, true)] = true;
         var activity = showRefreshStatus && mailbox is not null ? BeginBatchActivity(CheckingForMailStatus) : null;
         searchStatus.Hide();
         bool receivedBatch = false;
@@ -1206,7 +1218,7 @@ public partial class MailForm : Form, IMessageFilter
             string? cacheRevision = null;
             if (connectionKey is not null)
             {
-                bool readCachedRows = messages.Rows.Count == 0 || debounce || clearingSearch;
+                bool readCachedRows = messages.Rows.Count == 0 || debounce || clearingSearch || reminderMessage is not null;
                 var cache = await Task.Run(() =>
                 {
                     string? revision = ReadFolderCacheRevision(entry.Account.Id, folder);
@@ -1222,6 +1234,12 @@ public partial class MailForm : Form, IMessageFilter
                     RenderFolder(cached.Where(IsVisibleDuringMove).Select(mail => ApplyFlagOverrides(mail)).ToArray(), selected,
                         preserveScrollAnchor: !debounce && !clearingSearch);
                     _ = ShowPreview();
+                    if (reminderMessage is { } cachedTarget && cached.Any(mail => mail.Id == cachedTarget))
+                    {
+                        reminderMessage = null;
+                        reminderSelected = true;
+                        reminderPreview = SelectReminderMessageAsync(cachedTarget);
+                    }
                 }
             }
 
@@ -1259,7 +1277,7 @@ public partial class MailForm : Form, IMessageFilter
             bool wasCached = showingCachedFolder;
             selected = current;
             if (mailbox is not null && string.IsNullOrWhiteSpace(query) && !IsPendingMoveSource())
-                SetFolderCount(entry.Account, folder, folderMail.Count(mail => !mail.Read), folderMail.Count);
+                SetFolderCount(entry.Account, folder, folderMail.Count(mail => !ApplyFlagOverrides(mail).Read), folderMail.Count);
             SetCachedFolder(false);
             if (receivedBatch && !seededSearch && !mergedFirstBatch)
                 SortPublishedRows();
@@ -1441,8 +1459,11 @@ public partial class MailForm : Form, IMessageFilter
                 mail = mail with { Star = star };
             return mail;
 
-            bool CanApply(bool readFlag) => !confirmedOnly || mailbox is null ||
-                !flagUpdates.TryGetValue((mailbox, mail.Id, readFlag), out var update) || update.Save.IsCompletedSuccessfully;
+            bool CanApply(bool readFlag) => !confirmedOnly ||
+                (!(readFlag && pendingFolderRead is { } bulk && bulk.Entry == entry &&
+                    ReferenceEquals(bulk.Mailbox, mailbox) && bulk.OriginalRead.ContainsKey(mail.Id)) &&
+                (mailbox is null || !flagUpdates.TryGetValue((mailbox, mail.Id, readFlag), out var update) ||
+                    update.Save.IsCompletedSuccessfully));
         }
     }
 
@@ -1734,11 +1755,15 @@ public partial class MailForm : Form, IMessageFilter
     }
 
     private readonly Dictionary<(IMailbox Mailbox, Guid Id, bool ReadFlag),
-        (Task Save, bool Value, FlagUpdateBaseline Baseline)> flagUpdates = new();
+        (Task Save, bool Value, FlagUpdateBaseline Baseline, string Folder)> flagUpdates = new();
+
+    private int PendingUnreadDelta(MailAccount account, string folder) => flagUpdates
+        .Where(pair => ReferenceEquals(pair.Key.Mailbox, account.Mailbox) && pair.Key.ReadFlag && pair.Value.Folder == folder)
+        .Sum(pair => (pair.Value.Value ? 0 : 1) - (pair.Value.Baseline.ConfirmedValue ? 0 : 1));
 
     private void UpdateFlag(DataGridViewCellEventArgs e)
     {
-        if (rebuildingRows || e.RowIndex < 0 || e.ColumnIndex is not (0 or 1))
+        if (markingFolderRead || rebuildingRows || e.RowIndex < 0 || e.ColumnIndex is not (0 or 1))
             return;
 
         var row = messages.Rows[e.RowIndex];
@@ -1766,13 +1791,15 @@ public partial class MailForm : Form, IMessageFilter
         row.DefaultCellStyle.Font = updated.Read ? null : unreadFont;
         if (folderLoadFlagOverrides is { } overrides)
             overrides[(mail.Id, readFlag)] = value;
+        if (readFlag)
+            AdjustFolderCount(entry.Account, mail.Folder, value ? -1 : 1, 0);
         var key = (mailbox, mail.Id, readFlag);
         flagUpdates.TryGetValue(key, out var previous);
         var baseline = previous.Baseline ?? new FlagUpdateBaseline(readFlag ? mail.Read : mail.Star);
         string? connectionKey = database is not null && mailbox is ServerMailbox ? entry.Account.ConnectionKey() : null;
         var token = mailboxLifetime.Token;
         var update = SaveFlagAsync(previous.Save);
-        flagUpdates[key] = (update, value, baseline);
+        flagUpdates[key] = (update, value, baseline, mail.Folder);
         try
         {
             await update;
@@ -1785,6 +1812,8 @@ public partial class MailForm : Form, IMessageFilter
             if (!IsDisposed && IsLatestUpdate())
             {
                 flagUpdates.Remove(key);
+                if (readFlag && value != baseline.ConfirmedValue && ReferenceEquals(entry.Account.Mailbox, mailbox))
+                    AdjustFolderCount(entry.Account, mail.Folder, baseline.ConfirmedValue ? -1 : 1, 0);
                 bool originalFolderOpen = SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox);
                 if (originalFolderOpen)
                 {
@@ -2167,6 +2196,7 @@ public partial class MailForm : Form, IMessageFilter
             automaticRemoteContent.Checked = false;
         }
 
+        preferredAutomaticRemoteContent = automaticRemoteContent.Checked;
         automaticRemoteContent.Paint += PaintButton;
         sidebar.ClientSizeChanged += (_, _) => FitRemoteContentToggle();
         automaticRemoteContent.LocationChanged += (_, _) => automaticRemoteContent.Invalidate();
@@ -2176,7 +2206,10 @@ public partial class MailForm : Form, IMessageFilter
         FitRemoteContentToggle();
         automaticRemoteContent.CheckedChanged += async (_, _) =>
         {
+            if (applyingFolderRemoteContent)
+                return;
             bool enabled = automaticRemoteContent.Checked;
+            preferredAutomaticRemoteContent = enabled;
             UpdateRemoteContentToggleAppearance();
             imagePermission = null;
             if (previewContent is { Html.Length: > 0 } content)
@@ -2187,7 +2220,8 @@ public partial class MailForm : Form, IMessageFilter
 
             if (database is not { } store)
                 return;
-            automaticRemoteContent.Enabled = false;
+            savingRemoteContentPreference = true;
+            UpdateFolderRemoteContentSetting();
             try { await Task.Run(() => store.SaveAutomaticRemoteContent(enabled)); }
             catch (Microsoft.Data.Sqlite.SqliteException)
             {
@@ -2197,9 +2231,27 @@ public partial class MailForm : Form, IMessageFilter
             finally
             {
                 if (!IsDisposed)
-                    automaticRemoteContent.Enabled = true;
+                {
+                    savingRemoteContentPreference = false;
+                    UpdateFolderRemoteContentSetting();
+                }
             }
         };
+    }
+
+    private void UpdateFolderRemoteContentSetting()
+    {
+        bool spam = IsSpamFolderSelected;
+        applyingFolderRemoteContent = true;
+        try
+        {
+            automaticRemoteContent.Checked = !spam && preferredAutomaticRemoteContent;
+            automaticRemoteContent.Enabled = !spam && !savingRemoteContentPreference;
+            if (spam)
+                imagePermission = null;
+        }
+        finally { applyingFolderRemoteContent = false; }
+        UpdateRemoteContentToggleAppearance();
     }
 
     private void UpdateRemoteContentToggleAppearance()
@@ -2222,7 +2274,7 @@ public partial class MailForm : Form, IMessageFilter
     }
 
     private bool ShouldShowRemoteContent(Guid messageId) =>
-        imagePermission == messageId || automaticRemoteContent.Checked;
+        imagePermission == messageId || !IsSpamFolderSelected && automaticRemoteContent.Checked;
 
     private void UpdateImagePreview(MailSummary? mail)
     {

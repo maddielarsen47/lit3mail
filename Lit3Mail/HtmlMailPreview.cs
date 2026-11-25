@@ -170,10 +170,10 @@ internal sealed class HtmlMailPreview : WebView2
                 BeginInvoke(() => previewMenu?.Close());
             else if (message.StartsWith(menuPrefix, StringComparison.Ordinal))
             {
-                if (JsonSerializer.Deserialize<string?[]>(message[menuPrefix.Length..]) is [var selection, var source])
+                if (JsonSerializer.Deserialize<string?[]>(message[menuPrefix.Length..]) is [var selection, var source, var link])
                 {
                     Point location = Cursor.Position;
-                    BeginInvoke(() => ShowPreviewMenu(selection, source, version, location));
+                    BeginInvoke(() => ShowPreviewMenu(selection, source, link, version, location));
                 }
             }
             else if (allowRemoteImages)
@@ -181,7 +181,7 @@ internal sealed class HtmlMailPreview : WebView2
         };
         settings.AreDevToolsEnabled = false;
         settings.AreBrowserAcceleratorKeysEnabled = false;
-        settings.IsStatusBarEnabled = false;
+        settings.IsStatusBarEnabled = true;
         settings.IsBuiltInErrorPageEnabled = false;
         settings.IsPasswordAutosaveEnabled = false;
         settings.IsGeneralAutofillEnabled = false;
@@ -221,7 +221,8 @@ internal sealed class HtmlMailPreview : WebView2
                         const image = event.target.closest?.('img');
                         const selection = getSelection()?.toString() ?? '';
                         const source = image?.naturalWidth ? image.currentSrc : null;
-                        chrome.webview.postMessage('preview-menu:' + JSON.stringify([selection, source]));
+                        const link = event.target.closest?.('a[href], area[href]')?.href ?? null;
+                        chrome.webview.postMessage('preview-menu:' + JSON.stringify([selection, source, link]));
                     }, true);
                     document.addEventListener('click', event => {
                         const image = event.target.closest?.('img');
@@ -364,7 +365,7 @@ internal sealed class HtmlMailPreview : WebView2
         });
     }
 
-    private void ShowPreviewMenu(string? selection, string? source, int version, Point location)
+    private void ShowPreviewMenu(string? selection, string? source, string? link, int version, Point location)
     {
         if (IsDisposed || version != displayVersion)
             return;
@@ -382,6 +383,19 @@ internal sealed class HtmlMailPreview : WebView2
                 }
             }
         }).Enabled = !string.IsNullOrEmpty(selection);
+        if (!string.IsNullOrWhiteSpace(link))
+        {
+            menu.Items.Add("Copy link", null, (_, _) =>
+            {
+                if (version != displayVersion)
+                    return;
+                try { Clipboard.SetText(link); }
+                catch (System.Runtime.InteropServices.ExternalException)
+                {
+                    ThemedPopup.Show(FindForm(), "Could not copy the link.", "Lit3Mail");
+                }
+            });
+        }
         if (allowRemoteImages && source is not null)
         {
             menu.Items.Add("Copy image", null, (_, _) => BeginInvoke(() => UseImage(source, version, save: false)));

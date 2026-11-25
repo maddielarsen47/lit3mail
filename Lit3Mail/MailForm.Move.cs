@@ -4,7 +4,7 @@ public partial class MailForm
 {
     private const string MessageMoveFormat = "Lit3Mail.MessageMove";
     private readonly Button moveMail = new() { Text = "Move...", AutoSize = true, FlatStyle = FlatStyle.Flat, Enabled = false };
-    private bool updatingMessageFolders => pendingMoves.Count > 0;
+    private bool updatingMessageFolders => pendingMoves.Count > 0 || markingFolderRead;
     private readonly Dictionary<(FolderEntry Source, IMailbox Mailbox), HashSet<Guid>> pendingMoves = new();
     private Task messageFolderChange = Task.CompletedTask;
     private MessageDrag? pendingMessageDrag;
@@ -15,6 +15,27 @@ public partial class MailForm
 
     private sealed class MessageGrid : DataGridView
     {
+        public MessageGrid()
+        {
+            DoubleBuffered = true;
+            ResizeRedraw = true;
+        }
+
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            // DataGridView may leave space below the last scrolled row outside its row painting region.
+            // Always clear the invalidated area before painting rows, including after status bars disappear.
+            using var background = new SolidBrush(BackgroundColor);
+            e.Graphics.FillRectangle(background, e.ClipRectangle);
+            base.OnPaint(e);
+        }
+
+        protected override void OnScroll(ScrollEventArgs e)
+        {
+            base.OnScroll(e);
+            Invalidate();
+        }
+
         public event MouseEventHandler? BeforeMouseDown;
         public event MouseEventHandler? LeftMouseDrag;
 
@@ -185,7 +206,7 @@ public partial class MailForm
 
     private async Task ChangeMessageFolderAsync(FolderEntry entry, HashSet<Guid> ids, string? destination, bool deleting)
     {
-        if (SelectedFolder != entry || ids.Count == 0 ||
+        if (markingFolderRead || SelectedFolder != entry || ids.Count == 0 ||
             entry is not { Account.Mailbox: { } mailbox, Folder: { } folder } ||
             (!deleting && (destination is null || !CanMoveTo(entry, new FolderEntry(entry.Account, destination)))))
             return;

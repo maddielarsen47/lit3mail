@@ -10,7 +10,8 @@ other IMAP and SMTP servers that accept passwords.
   passwords. It does not support OAuth, so accounts such as Outlook.com cannot connect.
 - **No conversation view.** Messages appear individually in each folder, by design.
 - **Explicit read status.** Messages must be ticked as read explicitly, by design.
-- **No calendar/non-email integration.** Excluded to keep scope small, by design.
+- **No calendar/non-email integration.** Excluded to keep scope small.
+- **Preview/compose light-mode only.** To reduce issues and complexity.
 
 ### Licence &amp; Disclaimer
 

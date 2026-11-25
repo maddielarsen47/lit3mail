@@ -202,7 +202,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             // A move can assign a new UID while retaining the original delivery time.
             arrivals.AddRange(summaries.Where(item => item.InternalDate >= earliestArrival).Select(item => item.UniqueId));
         }
-        var preview = arrivals.Count == 0 ? null : await ReadArrivalPreviewAsync(inbox, arrivals.Max(), token);
+        var preview = arrivals.Count == 0 ? null : await ReadArrivalPreviewAsync(inbox, arrivals.Max(), token)
+            ?? new InboxArrivalPreview(RegisterMessage(inbox, arrivals.Max()), checkedAt, null, null);
         return (current, arrivals.Count, preview);
     }
 
@@ -844,6 +845,19 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         else
             await folder.AddFlagsAsync(uids, MessageFlags.None, [ForwardedKeyword], true, token);
         return true;
+    }
+
+    public async Task<IReadOnlyCollection<Guid>> MarkAllReadAsync(string folderName, CancellationToken token)
+    {
+        using var client = new ImapClient();
+        await ConnectAsync(client, incoming, token);
+        var folder = await ResolveFolderAsync(client, folderName, token)
+            ?? throw new InvalidOperationException("The folder is unavailable on this server.");
+        await folder.OpenAsync(FolderAccess.ReadWrite, token);
+        var unread = await folder.SearchAsync(SearchQuery.NotSeen, token);
+        foreach (var batch in unread.Chunk(1000))
+            await folder.AddFlagsAsync(batch, MessageFlags.Seen, true, token);
+        return unread.Select(uid => RegisterMessage(folder, uid)).ToArray();
     }
 
     public async Task UpdateFlagsAsync(string folderName, Guid id, bool? read, bool? star, CancellationToken token)

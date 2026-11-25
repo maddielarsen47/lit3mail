@@ -792,6 +792,28 @@ internal sealed class LocalDatabase(string path)
         transaction.Commit();
     }
 
+    public void MarkCachedMessagesRead(Guid account, string folder, string connectionKey, IReadOnlyCollection<Guid> ids)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandTimeout = 1;
+        command.CommandText = """
+            UPDATE folder_cache SET summaries = (
+                SELECT json_group_array(json(CASE
+                    WHEN json_extract(item.value, '$.Id') IN (SELECT value FROM json_each($ids))
+                    THEN json_set(item.value, '$.Read', json('true'))
+                    ELSE item.value END))
+                FROM json_each(summaries) AS item
+            ), revision = $revision
+            WHERE account_id = $account AND folder = $folder AND connection_key = $connection
+              AND json_valid(summaries)
+            """;
+        AddFolderParameters(command, account, folder, connectionKey);
+        command.Parameters.AddWithValue("$ids", JsonSerializer.Serialize(ids));
+        command.Parameters.AddWithValue("$revision", Guid.NewGuid().ToString());
+        command.ExecuteNonQuery();
+    }
+
     public void UpdateCachedMessageFlag(Guid account, string folder, string connectionKey, Guid id, bool readFlag, bool value) =>
         UpdateCachedMessageFlag(account, folder, connectionKey, id, readFlag ? "Read" : "Star", value);
 

@@ -33,7 +33,7 @@ public partial class MailForm
     {
         AccessibleName = "Message", Dock = DockStyle.Fill, Multiline = true, AcceptsTab = false,
         ScrollBars = RichTextBoxScrollBars.Vertical, HideSelection = false, DetectUrls = false,
-        Font = new Font("Segoe UI", 12), ForeColor = Color.Black, BackColor = Color.White, BulletIndent = 16
+        Font = new Font("Segoe UI", 10), ForeColor = Color.Black, BackColor = Color.White, BulletIndent = 16
     };
     private readonly FlowLayoutPanel composeFormatting = new()
     {

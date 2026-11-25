@@ -33,6 +33,7 @@ public partial class MailForm
         unfocusedSince = null;
         badgeCheck?.Cancel();
         accountsWithNewUnread.Clear();
+        pendingMailReminders.Clear();
         SetUnreadBadge(false);
     }
 
@@ -56,7 +57,7 @@ public partial class MailForm
 
     private async Task CheckMailIndicatorsAsync()
     {
-        if (choosingComposeFiles || checkingMailIndicators || IsDisposed || Disposing)
+        if (choosingComposeFiles || checkingMailIndicators || recoveringFromSleep || IsDisposed || Disposing)
             return;
 
         checkingMailIndicators = true;
@@ -71,7 +72,23 @@ public partial class MailForm
 
             SetUnreadBadge(unfocusedSince is not null && accountsWithNewUnread.Count > 0);
             if (unfocusedSince is not null)
-                ShowMailReminders(await reminders);
+            {
+                foreach (var check in (await reminders).Where(check => check.Count > 0 && IsCurrent(check.Account, check.Cursor)))
+                {
+                    var previous = pendingMailReminders.GetValueOrDefault(check.Account);
+                    pendingMailReminders[check.Account] = previous is not null && previous.Cursor == check.Cursor
+                        ? check with { Count = previous.Count + check.Count, Preview = check.Preview ?? previous.Preview }
+                        : check;
+                }
+                var ready = await PreparePendingMailRemindersAsync();
+                if (!IsDisposed && !recoveringFromSleep && generation == mailFocusGeneration && unfocusedSince is not null)
+                {
+                    ShowMailReminders(ready);
+                    foreach (var shown in ready)
+                        if (ReferenceEquals(pendingMailReminders.GetValueOrDefault(shown.Account), shown))
+                            pendingMailReminders.Remove(shown.Account);
+                }
+            }
         }
         catch (OperationCanceledException)
         {

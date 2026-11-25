@@ -33,7 +33,7 @@ public partial class MailForm
 
     private void ResumeBackgroundCache()
     {
-        if (database is not null && !IsDisposed && folderLoad is null &&
+        if (database is not null && !IsDisposed && folderLoad is null && !preparingMailReminders && !recoveringFromSleep &&
             cacheQueue.Count > 0 && !processingCache)
             _ = ProcessCacheQueueAsync(database);
     }
@@ -99,7 +99,7 @@ public partial class MailForm
         {
             // Let startup and the first interactive preview finish before downloading more mail.
             await Task.Delay(750, mailboxLifetime.Token);
-            while (cacheQueue.First is { } node && !IsDisposed && folderLoad is null)
+            while (cacheQueue.First is { } node && !IsDisposed && folderLoad is null && !preparingMailReminders && !recoveringFromSleep)
             {
                 var work = node.Value;
                 cacheQueue.RemoveFirst();

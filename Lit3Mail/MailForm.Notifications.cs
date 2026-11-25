@@ -17,6 +17,8 @@ public partial class MailForm
         ServerMailbox.InboxArrivalPreview? Preview = null);
 
     private readonly Dictionary<MailAccount, InboxNotificationCursor> notificationCursors = new();
+    private readonly Dictionary<MailAccount, NotificationCheck> pendingMailReminders = new();
+    private bool preparingMailReminders;
     private AppNotificationManager? notificationManager;
     private (FolderEntry Folder, Guid MessageId)? pendingReminderMessage;
 
@@ -78,12 +80,84 @@ public partial class MailForm
         }
     }
 
+    private async Task<NotificationCheck[]> PreparePendingMailRemindersAsync()
+    {
+        if (pendingMailReminders.Count == 0 || updatingMessageFolders || exportCancellation is not null)
+            return [];
+        preparingMailReminders = true;
+        PauseBackgroundCacheForFolderLoad();
+        try
+        {
+            var ready = new List<NotificationCheck>();
+            foreach (var check in pendingMailReminders.Values.ToArray())
+            {
+                if (!IsCurrent(check.Account, check.Cursor))
+                {
+                    pendingMailReminders.Remove(check.Account);
+                    continue;
+                }
+                if (unfocusedSince is null || recoveringFromSleep || IsDisposed)
+                    break;
+                using var timeout = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
+                timeout.CancelAfter(TimeSpan.FromSeconds(45));
+                try
+                {
+                    string key = check.Account.ConnectionKey();
+                    var prepared = await Task.Run(async () =>
+                    {
+                        if (database is not { } store)
+                            return (NotificationCheck?)null;
+                        string? revision = store.GetFolderCacheRevision(check.Account.Id, "Inbox");
+                        var summaries = await check.Cursor.Mailbox.ListAsync("Inbox", "", timeout.Token,
+                            null, LocalDatabase.FolderCacheLimit);
+                        timeout.Token.ThrowIfCancellationRequested();
+                        if (check.Preview is { } preview && !summaries.Any(mail => mail.Id == preview.MessageId))
+                            return check with { Count = 0 }; // The notified mail has since left the Inbox.
+                        store.SaveFolderCache(check.Account.Id, "Inbox", key, summaries,
+                            onlyIfUnchanged: true, expectedRevision: revision);
+                        if (check.Preview is { } target)
+                        {
+                            if (!store.LoadFolderCache(check.Account.Id, "Inbox", key).Any(mail => mail.Id == target.MessageId))
+                                return null; // A concurrent folder update won; retry against its new revision.
+                            if (!store.GetCachedMessageBodies(check.Account.Id, "Inbox", key).Contains(target.MessageId))
+                            {
+                                var content = await check.Cursor.Mailbox.LoadContentAsync(target.MessageId, timeout.Token);
+                                timeout.Token.ThrowIfCancellationRequested();
+                                if (!content.PreviewTooLarge)
+                                    store.SaveMessageBody(check.Account.Id, "Inbox", key, target.MessageId, content,
+                                        completePreview: true);
+                            }
+                        }
+                        return check;
+                    }, timeout.Token);
+                    if (prepared is not null && !timeout.IsCancellationRequested && IsCurrent(check.Account, check.Cursor) &&
+                        ReferenceEquals(pendingMailReminders.GetValueOrDefault(check.Account), check) &&
+                        unfocusedSince is not null && !recoveringFromSleep)
+                    {
+                        if (prepared.Count > 0)
+                            ready.Add(prepared);
+                        else
+                            pendingMailReminders.Remove(check.Account);
+                    }
+                }
+                catch (Exception error)
+                {
+                    // Retain the reminder and retry after connectivity or the cache recovers.
+                    System.Diagnostics.Debug.WriteLine($"Preparing mail reminder failed ({error.GetType().Name}).");
+                }
+            }
+            return ready.ToArray();
+        }
+        finally
+        {
+            preparingMailReminders = false;
+            ResumeBackgroundCache();
+        }
+    }
+
     private void OnNotificationInvoked(AppNotificationManager _, AppNotificationActivatedEventArgs args)
     {
-        Guid? accountId = args.Arguments.TryGetValue("account", out string? value) && Guid.TryParse(value, out var id)
-            ? id : null;
-        Guid? messageId = args.Arguments.TryGetValue("message", out string? messageValue) && Guid.TryParse(messageValue, out var parsedMessage)
-            ? parsedMessage : null;
+        var (accountId, messageId) = MailReminderArguments.Parse(args.Argument);
         this.PostIfHandleAvailable(async () =>
         {
             if (WindowState == FormWindowState.Minimized)
@@ -210,9 +284,7 @@ public partial class MailForm
 
     private static string CreateMailReminder(string summary, Guid? accountId, Guid? messageId)
     {
-        string arguments = accountId is { } id ? $"action=open&account={id:D}" : "action=open";
-        if (accountId is not null && messageId is { } message)
-            arguments += $"&message={message:D}";
+        string arguments = MailReminderArguments.Create(accountId, messageId);
         var visual = new XElement("binding", new XAttribute("template", "ToastGeneric"),
             summary.Split('\n').Select(line => new XElement("text", line)));
         return new XElement("toast", new XAttribute("scenario", "reminder"), new XAttribute("launch", arguments),
