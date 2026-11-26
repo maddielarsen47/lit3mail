@@ -340,7 +340,7 @@ public partial class MailForm
         catch (Exception error) when (!confirmed)
         {
             ClearPendingIds();
-            if (!IsDisposed)
+            if (!IsDisposed && !backgroundShutdown)
             {
                 bool sourceIsOpen = SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox);
                 if (sourceIsOpen && search.Text == originalQuery)

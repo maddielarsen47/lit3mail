@@ -47,6 +47,8 @@ public partial class MailForm
 
     private async Task RefreshAfterSleepAsync()
     {
+        if (backgroundShutdown)
+            return;
         wakeRefresh?.Cancel();
         using var recovery = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
         wakeRefresh = recovery;
@@ -92,7 +94,7 @@ public partial class MailForm
 
     private async Task RefreshMailAsync(bool fullRefresh, bool manual = false, bool resuming = false)
     {
-        if ((!manual && (recoveringFromSleep && !resuming || refreshingAutomatically || updatingMessageFolders || exportCancellation is not null)) ||
+        if (backgroundShutdown || (!manual && (recoveringFromSleep && !resuming || refreshingAutomatically || updatingMessageFolders || exportCancellation is not null)) ||
             choosingComposeFiles || IsDisposed || Disposing ||
             !accounts.Any(account => account.Mailbox is not null))
             return;

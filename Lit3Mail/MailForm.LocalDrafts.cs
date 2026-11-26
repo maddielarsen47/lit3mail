@@ -11,6 +11,32 @@ public partial class MailForm
         Text = "Local Drafts", Dock = DockStyle.Bottom, Height = 30, FlatStyle = FlatStyle.Flat
     };
 
+    private int localDraftCountRequest;
+
+    private async Task RefreshLocalDraftCountAsync()
+    {
+        if (database is null || IsDisposed || Disposing)
+            return;
+        int request = ++localDraftCountRequest;
+        try
+        {
+            long count = await Task.Run(database.CountLocalDrafts);
+            if (!IsDisposed && !Disposing && request == localDraftCountRequest)
+            {
+                localDrafts.Text = $"Local Drafts ({count:N0})";
+                localDrafts.Font = count > 0 ? unreadFont : Font;
+            }
+        }
+        catch (SqliteException)
+        {
+            if (!IsDisposed && !Disposing && request == localDraftCountRequest)
+            {
+                localDrafts.Text = "Local Drafts";
+                localDrafts.Font = Font;
+            }
+        }
+    }
+
     private async Task<Guid?> ChooseLocalDraftAsync(LocalDatabase store)
     {
         var drafts = await Task.Run(store.ListLocalDrafts, mailboxLifetime.Token);
@@ -62,6 +88,9 @@ public partial class MailForm
                 if (picker.IsDisposed)
                     return;
                 list.Items.RemoveAt(index);
+                await RefreshLocalDraftCountAsync();
+                if (picker.IsDisposed)
+                    return;
                 list.SelectedIndex = Math.Min(index, list.Items.Count - 1);
             }
             catch (SqliteException)

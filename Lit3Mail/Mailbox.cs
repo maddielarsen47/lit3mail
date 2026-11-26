@@ -20,13 +20,15 @@ internal static class MailFolders
 }
 
 internal sealed record MessageMoveResult(bool MarkedRead, IReadOnlyDictionary<Guid, Guid>? DestinationIds = null);
-internal sealed record ResponseOrigin(Guid AccountId, string ConnectionKey, string Folder, Guid MessageId, bool IsReply);
+internal sealed record ResponseOrigin(Guid AccountId, string ConnectionKey, string Folder, Guid MessageId, bool IsReply, ReplyHeaders? Thread = null);
+
+internal sealed record ReplyHeaders(string? InReplyTo, string[] References);
 
 internal sealed record MailSummary(Guid Id, string Folder, bool Read, bool Star, bool Attachments,
     string Subject, string CorrespondentName, DateTime Date,
     string FromAddress, string ToAddresses, string CcAddresses, string ReplyToAddress,
     bool HasPreviewHeaders = true, string BccAddresses = "", string ExplicitReplyToAddresses = "",
-    bool Replied = false, bool Forwarded = false, bool HasStandaloneImages = false)
+    bool Replied = false, bool Forwarded = false, bool HasStandaloneImages = false, ReplyHeaders? ReplyThread = null)
 {
     public string CorrespondentAddresses => GetCorrespondentAddresses();
 
@@ -87,7 +89,7 @@ internal sealed record MailContent(string Body, string? Html = null,
     }
 }
 internal sealed record OutgoingMail(string From, string ReplyTo, string To, string Cc, string Subject, string Body, string? Html = null,
-    IReadOnlyList<InlineMailImage>? InlineImages = null, string Bcc = "", IReadOnlyList<MailFileAttachment>? Files = null);
+    IReadOnlyList<InlineMailImage>? InlineImages = null, string Bcc = "", IReadOnlyList<MailFileAttachment>? Files = null, ReplyHeaders? Thread = null);
 internal sealed record FolderCount(int Unread, int Total, string? LabelName = null, bool HasCounts = true);
 internal sealed record SentMailResult(MailSummary? Summary, string? Warning = null);
 internal sealed record DraftSaveResult(MailSummary? Summary, bool Replaced = false, string? Warning = null);

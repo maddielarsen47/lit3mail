@@ -31,6 +31,7 @@ internal static class ThemedPopup
         form.HandleCreated += (_, _) => MailForm.ApplyWindowTitleBar(form, dark: true);
         MailForm.ApplyWindowTitleBar(form, dark: true);
         ApplyColors(form);
+        EntryBorderTheme.Apply(form, Border);
         ScrollbarTheme.Apply(form, dark: true);
     }
 

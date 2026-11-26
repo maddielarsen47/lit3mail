@@ -45,7 +45,7 @@ public partial class MailForm : Form, IMessageFilter
     private readonly ComboBox sidebarTheme = new()
     {
         DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
-        AccessibleName = "App theme", Dock = DockStyle.Bottom
+        AccessibleName = "App theme", Dock = DockStyle.Bottom, DrawMode = DrawMode.OwnerDrawFixed
     };
     private readonly TextBox search = new()
     {
@@ -302,6 +302,15 @@ public partial class MailForm : Form, IMessageFilter
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
         sidebar.Controls.Add(settings);
         sidebar.Controls.Add(new Panel { Dock = DockStyle.Bottom, Height = 6 });
+        sidebarTheme.DrawItem += (_, e) =>
+        {
+            e.DrawBackground();
+            if (e.Index >= 0)
+                TextRenderer.DrawText(e.Graphics, sidebarTheme.GetItemText(sidebarTheme.Items[e.Index]),
+                    e.Font, Rectangle.Inflate(e.Bounds, -4, 0), e.ForeColor,
+                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.SingleLine);
+            e.DrawFocusRectangle();
+        };
         sidebar.Controls.Add(sidebarTheme);
         sidebar.Controls.Add(updateNoticeSpacing);
         sidebar.Controls.Add(updateNotice);
@@ -686,24 +695,14 @@ public partial class MailForm : Form, IMessageFilter
         {
             if (clearingLocalData)
                 return;
+            if (backgroundShutdown && !shutdownReady)
+            {
+                e.Cancel = true;
+                return;
+            }
             if (!e.Cancel && e.CloseReason == CloseReason.UserClosing)
             {
-                var operations = new List<string>();
-                if (composeSession.OperationPending)
-                    operations.Add("sending mail or saving a draft");
-                if (updatingMessageFolders)
-                    operations.Add("moving or deleting messages");
-                if (exportCancellation is not null)
-                    operations.Add("exporting mail");
-
-                if (operations.Count > 0 && ThemedPopup.Show(this,
-                        $"Lit3Mail is still {string.Join(", ", operations)}. Closing now may interrupt this work. Close anyway?",
-                        Text, MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes)
-                {
-                    e.Cancel = true;
-                    return;
-                }
-                if (settingsPage.Visible && pendingUpdate is null && !restartingForUpdateAsAdministrator)
+                if (!shutdownReady && settingsPage.Visible && pendingUpdate is null && !restartingForUpdateAsAdministrator)
                 {
                     e.Cancel = true;
                     LeaveSettings();
@@ -711,13 +710,13 @@ public partial class MailForm : Form, IMessageFilter
                 }
             }
 
-            if (!e.Cancel && HasUnsavedDrafts() && !ConfirmDiscardDrafts())
+            if (!e.Cancel && !shutdownReady && !composeSession.OperationPending && HasUnsavedDrafts() && !ConfirmDiscardDrafts())
             {
                 e.Cancel = true;
                 return;
             }
 
-            while (!e.Cancel && !SaveAccountSettings(showError: false))
+            while (!e.Cancel && !shutdownReady && !SaveAccountSettings(showError: false))
             {
                 var choice = ThemedPopup.Show(this,
                     "Could not save account settings. Select Yes to retry, No to close without saving, or Cancel to keep Lit3Mail open.",
@@ -725,6 +724,13 @@ public partial class MailForm : Form, IMessageFilter
                 if (choice == DialogResult.No)
                     break;
                 e.Cancel = choice != DialogResult.Yes;
+            }
+
+            if (!e.Cancel && !shutdownReady && e.CloseReason == CloseReason.UserClosing && HasPendingShutdownWork)
+            {
+                e.Cancel = true;
+                backgroundShutdownCompletion = FinishBackgroundShutdownAsync();
+                return;
             }
 
             if (!e.Cancel && restartingForUpdateAsAdministrator)
@@ -764,11 +770,10 @@ public partial class MailForm : Form, IMessageFilter
 
     private static Panel CreateTextField(TextBoxBase input)
     {
-        var frame = new Panel
+        var frame = new EntryFieldPanel
         {
             Dock = DockStyle.Fill,
-            BorderStyle = BorderStyle.FixedSingle,
-            Padding = new Padding(8, 4, 8, 4),
+            Padding = new Padding(9, 5, 9, 5),
             AutoSize = !input.Multiline,
             AutoSizeMode = AutoSizeMode.GrowAndShrink
         };
@@ -906,6 +911,10 @@ public partial class MailForm : Form, IMessageFilter
         StyleButton(dismissComposeStatus, chrome, ink, border, selectedBackground);
         exact.TextAlign = ContentAlignment.MiddleCenter;
         exact.FlatAppearance.CheckedBackColor = selectedBackground;
+        FitRemoteContentToggle();
+        EntryBorderTheme.Apply(this, border);
+        if (composeWindow is not null)
+            EntryBorderTheme.Apply(composeWindow, border);
         ScrollbarTheme.Apply(this, darkTitleBar);
         folders.Invalidate();
     }
@@ -1179,7 +1188,7 @@ public partial class MailForm : Form, IMessageFilter
         bool refreshCounts = false, bool showRefreshStatus = false, bool backgroundRefresh = false,
         bool clearingSearch = false, bool prioritizeCurrentFolder = false)
     {
-        if (SelectedFolder is not { Folder: { } folder } entry || IsDisposed)
+        if (backgroundShutdown || SelectedFolder is not { Folder: { } folder } entry || IsDisposed)
             return;
 
         var reminderMessage = pendingReminderMessage is { } reminder && reminder.Folder == entry
@@ -1831,7 +1840,8 @@ public partial class MailForm : Form, IMessageFilter
                         visibleRow.DefaultCellStyle.Font = restored.Read ? null : unreadFont;
                     }
                 }
-                ThemedPopup.Show(this, MailOperationError(error, "Could not update the message flag."), Text);
+                if (!backgroundShutdown)
+                    ThemedPopup.Show(this, MailOperationError(error, "Could not update the message flag."), Text);
                 if (SelectedFolder == entry && ReferenceEquals(entry.Account.Mailbox, mailbox))
                     await ShowFolder(SelectedMessage, backgroundRefresh: true);
             }
@@ -1979,6 +1989,8 @@ public partial class MailForm : Form, IMessageFilter
 
     private async Task ShowPreview()
     {
+        if (backgroundShutdown)
+            return;
         if (openedEml is not null && SelectedMessage is null)
             return;
         previewLoad?.Cancel();
@@ -2268,9 +2280,17 @@ public partial class MailForm : Form, IMessageFilter
         int textWidth = Math.Max(1, sidebar.DisplayRectangle.Width - 12);
         int textHeight = TextRenderer.MeasureText(automaticRemoteContent.Text, automaticRemoteContent.Font,
             new Size(textWidth, int.MaxValue), TextFormatFlags.WordBreak | TextFormatFlags.NoPrefix).Height;
-        int height = Math.Max(exportMail.Height, textHeight + LogicalToDeviceUnits(10));
-        if (automaticRemoteContent.Height != height)
-            automaticRemoteContent.Height = height;
+        int height = Math.Max(LogicalToDeviceUnits(30), textHeight + LogicalToDeviceUnits(10));
+        foreach (ButtonBase button in new ButtonBase[] { automaticRemoteContent, exportMail, openEml, localDrafts, settings })
+        {
+            button.AutoSize = false;
+            button.Height = height;
+        }
+        // Owner-drawn dropdowns allow their closed selection area to match the button height.
+        int chromeHeight = sidebarTheme.Height - sidebarTheme.ItemHeight;
+        int itemHeight = Math.Max(1, height - chromeHeight);
+        if (sidebarTheme.ItemHeight != itemHeight)
+            sidebarTheme.ItemHeight = itemHeight;
     }
 
     private bool ShouldShowRemoteContent(Guid messageId) =>

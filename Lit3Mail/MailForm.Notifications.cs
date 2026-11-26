@@ -96,7 +96,7 @@ public partial class MailForm
                     pendingMailReminders.Remove(check.Account);
                     continue;
                 }
-                if (unfocusedSince is null || recoveringFromSleep || IsDisposed)
+                if (backgroundShutdown || unfocusedSince is null || recoveringFromSleep || IsDisposed)
                     break;
                 using var timeout = CancellationTokenSource.CreateLinkedTokenSource(mailboxLifetime.Token);
                 timeout.CancelAfter(TimeSpan.FromSeconds(45));
@@ -160,6 +160,8 @@ public partial class MailForm
         var (accountId, messageId) = MailReminderArguments.Parse(args.Argument);
         this.PostIfHandleAvailable(async () =>
         {
+            if (backgroundShutdown)
+                return;
             if (WindowState == FormWindowState.Minimized)
                 WindowState = FormWindowState.Normal;
             Activate();
@@ -222,7 +224,7 @@ public partial class MailForm
 
     private async Task<NotificationCheck[]> CheckDesktopNotificationsAsync()
     {
-        if (notificationManager is null)
+        if (backgroundShutdown || notificationManager is null)
             return [];
 
         foreach (var account in notificationCursors.Keys.ToArray())

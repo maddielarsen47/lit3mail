@@ -40,7 +40,7 @@ internal sealed class LocalDatabase(string path)
         string Subject, string Correspondents, DateTime Date,
         string? From = null, string? To = null, string? Cc = null, string? Bcc = null,
         string? ReplyTarget = null, string? ExplicitReplyTo = null, bool Replied = false, bool Forwarded = false,
-        bool HasStandaloneImages = false)
+        bool HasStandaloneImages = false, ReplyHeaders? ReplyThread = null)
     {
         public static CachedMessage FromSummary(MailSummary summary) =>
             new(summary.Id, summary.Read, summary.Star, summary.Attachments,
@@ -51,19 +51,19 @@ internal sealed class LocalDatabase(string path)
                 summary.HasPreviewHeaders ? summary.BccAddresses : null,
                 summary.HasPreviewHeaders ? summary.ReplyToAddress : null,
                 summary.HasPreviewHeaders ? summary.ExplicitReplyToAddresses : null, summary.Replied, summary.Forwarded,
-                summary.HasStandaloneImages);
+                summary.HasStandaloneImages, summary.ReplyThread);
 
         public MailSummary ToSummary(string folder)
         {
             if (From is not null && To is not null && Cc is not null)
                 return new(Id, folder, Read, Star, Attachments, Subject, "", Date, From, To, Cc, ReplyTarget ?? From,
                     BccAddresses: Bcc ?? "", ExplicitReplyToAddresses: ExplicitReplyTo ?? "",
-                    Replied: Replied, Forwarded: Forwarded, HasStandaloneImages: HasStandaloneImages);
+                    Replied: Replied, Forwarded: Forwarded, HasStandaloneImages: HasStandaloneImages, ReplyThread: ReplyThread);
 
             bool outgoing = folder is "Sent" or "Drafts";
             return new(Id, folder, Read, Star, Attachments, Subject, "", Date,
                 outgoing ? "" : Correspondents, outgoing ? Correspondents : "", "", "", HasPreviewHeaders: false,
-                Replied: Replied, Forwarded: Forwarded, HasStandaloneImages: HasStandaloneImages);
+                Replied: Replied, Forwarded: Forwarded, HasStandaloneImages: HasStandaloneImages, ReplyThread: ReplyThread);
         }
     }
 
@@ -928,6 +928,14 @@ internal sealed class LocalDatabase(string path)
             command.ExecuteNonQuery();
         }
         transaction.Commit();
+    }
+
+    public long CountLocalDrafts()
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM local_drafts";
+        return (long)command.ExecuteScalar()!;
     }
 
     public IReadOnlyList<LocalDraftEntry> ListLocalDrafts()

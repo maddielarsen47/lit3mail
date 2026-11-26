@@ -291,7 +291,7 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
 
         const MessageSummaryItems items = MessageSummaryItems.UniqueId | MessageSummaryItems.Envelope |
             MessageSummaryItems.Flags | MessageSummaryItems.InternalDate | MessageSummaryItems.BodyStructure;
-        var request = new FetchRequest(items, [HeaderId.ReplyTo]);
+        var request = new FetchRequest(items, [HeaderId.ReplyTo, HeaderId.References]);
         if (terms.Length == 0 && publishBatch is not null && prioritizedMessage is { } target)
         {
             UniqueId uid;
@@ -436,7 +436,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
                 BccAddresses: Addresses(envelope.Bcc), ExplicitReplyToAddresses: explicitReplyTo,
                 Replied: item.Flags?.HasFlag(MessageFlags.Answered) == true,
                 Forwarded: item.Keywords?.Contains(ForwardedKeyword, StringComparer.OrdinalIgnoreCase) == true,
-                HasStandaloneImages: standaloneImages);
+                HasStandaloneImages: standaloneImages,
+                ReplyThread: CreateReplyHeaders(envelope.MessageId, item.Headers?[HeaderId.References], envelope.InReplyTo));
         }).ToArray();
     }
 
@@ -1096,7 +1097,8 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         var summary = uid is { } id
             ? new MailSummary(RegisterMessage(drafts, id), "Drafts", true, false, mail.Files is { Count: > 0 }, mail.Subject, mail.To,
                 message.Date.LocalDateTime, mail.From, Addresses(message.To), Addresses(message.Cc), mail.ReplyTo,
-                BccAddresses: Addresses(message.Bcc), ExplicitReplyToAddresses: Addresses(message.ReplyTo))
+                BccAddresses: Addresses(message.Bcc), ExplicitReplyToAddresses: Addresses(message.ReplyTo),
+                ReplyThread: CreateReplyHeaders(message.MessageId, string.Join(" ", message.References.Select(id => $"<{id}>")), message.InReplyTo))
             : null;
         if (summary is null)
             warning ??= "The server accepted the draft, but Lit3Mail could not locate it in Drafts yet.";
@@ -1125,7 +1127,9 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
         }
         return new(Addresses(message.From), message.ReplyTo.Mailboxes.FirstOrDefault()?.Address ?? "",
             Addresses(message.To), Addresses(message.Cc), message.Subject ?? "", content.Body, content.Html,
-            content.InlineImages, Bcc: Addresses(message.Bcc), Files: files);
+            content.InlineImages, Bcc: Addresses(message.Bcc), Files: files,
+            Thread: message.InReplyTo is not null || message.References.Count > 0
+                ? new(message.InReplyTo, message.References.ToArray()) : null);
     }
 
     public async Task RemoveDraftAsync(Guid id, CancellationToken token)
@@ -1176,6 +1180,11 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             Subject = mail.Subject,
             Body = CreateMimeBody(mail)
         };
+        if (mail.Thread is { } thread)
+        {
+            message.InReplyTo = thread.InReplyTo;
+            message.References.AddRange(thread.References);
+        }
         message.From.Add(MailboxAddress.Parse(mail.From));
         if (draft && MailboxAddress.TryParse(mail.ReplyTo, out var replyTo))
             message.ReplyTo.Add(replyTo);
@@ -1234,8 +1243,20 @@ internal sealed class ServerMailbox(MailEndpoint incoming, MailEndpoint outgoing
             ? new(new MailSummary(RegisterMessage(sent, id), "Sent", true, false, mail.Files is { Count: > 0 }, mail.Subject,
                 mail.To, message.Date.LocalDateTime, mail.From, Addresses(message.To), Addresses(message.Cc),
                 string.IsNullOrWhiteSpace(mail.ReplyTo) ? mail.From : mail.ReplyTo,
-                BccAddresses: Addresses(message.Bcc), ExplicitReplyToAddresses: Addresses(message.ReplyTo)))
+                BccAddresses: Addresses(message.Bcc), ExplicitReplyToAddresses: Addresses(message.ReplyTo),
+                ReplyThread: CreateReplyHeaders(message.MessageId, string.Join(" ", message.References.Select(id => $"<{id}>")), message.InReplyTo)))
             : new(null);
+    }
+
+    internal static ReplyHeaders? CreateReplyHeaders(string? messageId, string? references, string? inReplyTo)
+    {
+        if (string.IsNullOrWhiteSpace(messageId))
+            return null;
+        var chain = MimeKit.Utils.MimeUtils.EnumerateReferences(references ?? "").ToList();
+        if (chain.Count == 0 && !string.IsNullOrWhiteSpace(inReplyTo))
+            chain.AddRange(MimeKit.Utils.MimeUtils.EnumerateReferences($"<{inReplyTo.Trim('<', '>')}>"));
+        chain.Add(messageId);
+        return new(messageId, chain.Distinct(StringComparer.Ordinal).ToArray());
     }
 
     internal static MimeEntity CreateMimeBody(OutgoingMail mail)

@@ -488,7 +488,7 @@ public partial class MailForm
 
     private async Task CheckForUpdateAsync(bool automatic = false, bool onStartup = false)
     {
-        if (IsDisposed || Disposing || checkingForUpdate ||
+        if (backgroundShutdown || IsDisposed || Disposing || checkingForUpdate ||
             automatic && !onStartup && DateTimeOffset.UtcNow - lastUpdateCheck < TimeSpan.FromDays(1))
             return;
 
@@ -498,7 +498,7 @@ public partial class MailForm
         try
         {
             var release = await CheckAndRecordUpdateAsync();
-            if (IsDisposed || automatic)
+            if (backgroundShutdown || IsDisposed || automatic)
                 return;
             if (release is null)
             {
@@ -513,6 +513,8 @@ public partial class MailForm
                 {
                     restartingForUpdateAsAdministrator = true;
                     Close();
+                    if (backgroundShutdown)
+                        await backgroundShutdownCompletion;
                 }
                 return;
             }
@@ -522,11 +524,15 @@ public partial class MailForm
                 return;
 
             checkForUpdates.Text = "Downloading update…";
-            staging = await ReleaseUpdate.StageAsync(release, mailboxLifetime.Token);
+            stagingUpdate = true;
+            try { staging = await ReleaseUpdate.StageAsync(release, mailboxLifetime.Token); }
+            finally { stagingUpdate = false; }
             if (IsDisposed)
                 return;
             pendingUpdate = staging;
             Close();
+            if (backgroundShutdown)
+                await backgroundShutdownCompletion;
             if (IsDisposed)
                 staging = null; // The updater owns the staged files after a successful close.
         }
@@ -535,7 +541,7 @@ public partial class MailForm
         {
             if (automatic)
                 Debug.WriteLine($"Automatic update check failed. {error.Message}");
-            else if (!IsDisposed)
+            else if (!IsDisposed && !backgroundShutdown)
                 ThemedPopup.Show(this, $"Could not prepare the update. {error.Message}", "Updates",
                     MessageBoxButtons.OK, MessageBoxIcon.Error);
         }
@@ -925,6 +931,13 @@ public partial class MailForm
         var smtpUser = AddLinkedText("SMTP Username", email, "Same as Email Address", account.OutgoingUsesEmail,
             () => account.OutgoingUser, value => account.OutgoingUser = value, linked => account.OutgoingUsesEmail = linked);
 
+        AddRow("", new Label
+        {
+            Text = "Use an SMTP provider authorized to send as your Email Address, including any alias. "
+                + "For your own domain, configure SPF, DKIM and DMARC with your provider.",
+            AutoSize = true, MaximumSize = new Size(420, 0)
+        });
+
         var smtpPassword = AddText("SMTP Password", account.Mailbox is null ? "" : passwordMask, _ => { }, password: true);
         var samePassword = new CheckBox { Text = "Same as IMAP Password", AutoSize = true, Checked = true };
         AddRow("", samePassword);
@@ -944,6 +957,17 @@ public partial class MailForm
 
         var forget = new Button { Text = "Forget saved sign-in", AutoSize = true, Enabled = account.HasSavedSignIn };
         AddRow("", forget);
+
+        var resetConnection = new Button { Text = "Reset connection settings", AutoSize = true, Enabled = account.Mailbox is not null };
+        AddRow("", resetConnection);
+
+        ConnectionSettingsSnapshot CaptureConnectionSettings() => new(account.Email,
+            account.IncomingHost, account.IncomingPort, account.IncomingUser, account.IncomingUsesEmail, account.IncomingStartTls,
+            account.OutgoingHost, account.OutgoingPort, account.OutgoingUser, account.OutgoingUsesEmail, account.OutgoingStartTls,
+            account.Mailbox);
+        var connectedSettings = account.Mailbox is null ? null : CaptureConnectionSettings();
+        SavedSignIn? resetSignIn = null;
+        bool restoringConnectionSettings = false;
 
         string? activeKey = account.Mailbox is null ? null : account.ConnectionKey();
 
@@ -975,6 +999,8 @@ public partial class MailForm
 
         void ConnectionEdited(object? sender, EventArgs args)
         {
+            if (restoringConnectionSettings)
+                return;
             if (activeKey is not null && activeKey != account.ConnectionKey())
             {
                 ClearConnection();
@@ -992,6 +1018,45 @@ public partial class MailForm
         smtpPort.ValueChanged += ConnectionEdited;
         imapStartTls.CheckedChanged += ConnectionEdited;
         smtpStartTls.CheckedChanged += ConnectionEdited;
+
+        resetConnection.Click += (_, _) =>
+        {
+            if (connectedSettings is not { } saved)
+                return;
+            restoringConnectionSettings = true;
+            try
+            {
+                email.Text = saved.Email;
+                imapServer.Text = saved.IncomingHost;
+                imapPort.Value = saved.IncomingPort;
+                smtpServer.Text = saved.OutgoingHost;
+                smtpPort.Value = saved.OutgoingPort;
+                RestoreUsername(imapUser, saved.IncomingUsesEmail, saved.IncomingUser);
+                RestoreUsername(smtpUser, saved.OutgoingUsesEmail, saved.OutgoingUser);
+                imapStartTls.Checked = saved.IncomingStartTls;
+                smtpStartTls.Checked = saved.OutgoingStartTls;
+                account.Mailbox = saved.Mailbox;
+                account.ConnectionFailed = false;
+                activeKey = account.ConnectionKey();
+                sessionSignIn = resetSignIn;
+                imapPassword.Text = smtpPassword.Text = passwordMask;
+                samePassword.Checked = resetSignIn is null || resetSignIn.IncomingPassword == resetSignIn.OutgoingPassword;
+                UpdateConnectionState();
+                RebuildFolders(account, "Inbox");
+                status.Text = "Connection settings restored to the last sign-in.";
+            }
+            finally { restoringConnectionSettings = false; }
+        };
+
+        void RestoreUsername(TextBox input, bool linked, string username)
+        {
+            int linkRow = fields.GetRow(input.Parent!) + 1;
+            var link = fields.Controls.OfType<CheckBox>().Single(control => fields.GetRow(control) == linkRow);
+            link.Checked = linked;
+            if (ReferenceEquals(input, imapUser)) account.IncomingUser = username;
+            else account.OutgoingUser = username;
+            input.Text = linked ? account.Email : username;
+        }
 
         bool ForgetSignIn()
         {
@@ -1013,6 +1078,9 @@ public partial class MailForm
         {
             if (!ForgetSignIn())
                 return;
+            connectedSettings = null;
+            resetSignIn = null;
+            resetConnection.Enabled = false;
             ClearConnection();
             imapPassword.Clear();
             smtpPassword.Clear();
@@ -1039,6 +1107,9 @@ public partial class MailForm
             account.Mailbox = mailbox;
             account.ConnectionFailed = false;
             sessionSignIn = signIn;
+            resetSignIn = signIn;
+            connectedSettings = CaptureConnectionSettings();
+            resetConnection.Enabled = true;
             imapPassword.Text = smtpPassword.Text = passwordMask;
             UpdateConnectionState();
             account.Counts = new Dictionary<string, FolderCount>();
@@ -1109,7 +1180,7 @@ public partial class MailForm
             }
 
             var signIn = new SavedSignIn(key, incomingPassword, outgoingPassword);
-            connect.Enabled = forget.Enabled = false;
+            connect.Enabled = forget.Enabled = resetConnection.Enabled = false;
             try
             {
                 await ConnectAccountAsync(signIn, mailboxLifetime.Token);
@@ -1125,6 +1196,7 @@ public partial class MailForm
                 {
                     connect.Enabled = true;
                     forget.Enabled = account.HasSavedSignIn;
+                    resetConnection.Enabled = connectedSettings is not null;
                 }
             }
         };
@@ -1167,6 +1239,11 @@ public partial class MailForm
         OperationCanceledException => "The connection check was canceled.",
         _ => "Could not connect to the mail servers. Check the server settings and network connection."
     };
+
+    private sealed record ConnectionSettingsSnapshot(string Email,
+        string IncomingHost, int IncomingPort, string IncomingUser, bool IncomingUsesEmail, bool IncomingStartTls,
+        string OutgoingHost, int OutgoingPort, string OutgoingUser, bool OutgoingUsesEmail, bool OutgoingStartTls,
+        IMailbox? Mailbox);
 
     private void ApplyAccountTheme(Color surface, Color chrome, Color ink, Color muted, Color border, Color hover)
     {

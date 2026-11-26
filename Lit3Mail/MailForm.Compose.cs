@@ -139,6 +139,7 @@ public partial class MailForm
         forward.Click += async (_, _) => await OpenResponseAsync(isReply: false);
         backFromCompose.Click += (_, _) => LeaveCompose();
         localDrafts.Click += async (_, _) => await OpenLocalDraftAsync();
+        Shown += async (_, _) => await RefreshLocalDraftCountAsync();
 
         editDraft.Click += async (_, _) => await OpenServerDraftAsync();
         saveDraft.Click += async (_, _) => await SaveComposeDraftAsync();
@@ -428,7 +429,9 @@ public partial class MailForm
         composeSession.UpdatingBody = true;
         try
         {
-            composeSession.Response = null;
+            // Server drafts retain threading even when the original mailbox location is unknown.
+            composeSession.Response = mail.Thread is { } thread
+                ? new(Guid.Empty, "", "", Guid.Empty, true, thread) : null;
             var body = new MailContent(mail.Body, Html: mail.Html, InlineImages: mail.InlineImages);
             composeSession.HtmlQuote = ComposeHtmlQuote.RestoreDraftQuote(body, out var editableBody);
             string? html = editableBody.HtmlForPreview();
@@ -488,7 +491,7 @@ public partial class MailForm
             includeQuotedImages: ShouldShowRemoteContent(mail.Id));
         composeSession.ShowQuoteImages = imagePermission == mail.Id;
         if (folder.Folder is { } sourceFolder)
-            composeSession.Response = new(folder.Account.Id, folder.Account.ConnectionKey(), sourceFolder, mail.Id, isReply);
+            composeSession.Response = new(folder.Account.Id, folder.Account.ConnectionKey(), sourceFolder, mail.Id, isReply, isReply ? mail.ReplyThread : null);
 
         OpenCompose(isReply ? composeBody : composeTo);
         if ((mail.Attachments || content.AttachmentList is { Count: > 0 }) &&
@@ -526,6 +529,7 @@ public partial class MailForm
         try
         {
             await Task.Run(() => database.SaveLocalDraft(id, snapshot.Sender?.Email.Trim() ?? "", draft));
+            await RefreshLocalDraftCountAsync();
             return true;
         }
         catch (Microsoft.Data.Sqlite.SqliteException)
@@ -541,10 +545,11 @@ public partial class MailForm
         try
         {
             await Task.Run(() => database.DeleteLocalDraft(id));
+            await RefreshLocalDraftCountAsync();
         }
         catch (Microsoft.Data.Sqlite.SqliteException)
         {
-            if (!IsDisposed)
+            if (!IsDisposed && !backgroundShutdown)
                 ThemedPopup.Show(this, "The server operation succeeded. A copy remains in Local Drafts.", Text);
         }
     }
@@ -563,7 +568,7 @@ public partial class MailForm
 
     private void ReopenFailedCompose()
     {
-        if (composeSession.OperationFailure is not { } failure)
+        if (backgroundShutdown || composeSession.OperationFailure is not { } failure)
             return;
         composeSession.OperationFailure = null;
         OpenCompose(composeBody, resetBaseline: false);
@@ -664,11 +669,21 @@ public partial class MailForm
                 (content, _) = await GetComposeMessageContentAsync();
                 sent = await mailbox.SendAsync(new(from, replyTo, recipient, cc,
                     subject.Length == 0 ? "(No subject)" : subject, content.Body, content.Html, content.InlineImages,
-                    Bcc: bcc, Files: composeFiles.ToArray()), mailboxLifetime.Token);
+                    Bcc: bcc, Files: composeFiles.ToArray(), Thread: originalMessage?.Thread), mailboxLifetime.Token);
             }
-            catch (OperationCanceledException) when (mailboxLifetime.IsCancellationRequested) { return; }
+            catch (OperationCanceledException) when (mailboxLifetime.IsCancellationRequested)
+            {
+                if (backgroundShutdown)
+                    await SaveDraftLocallyAsync(CaptureDraft());
+                return;
+            }
             catch (Exception error)
             {
+                if (backgroundShutdown)
+                {
+                    await SaveDraftLocallyAsync(CaptureDraft());
+                    return;
+                }
                 if (!IsDisposed)
                 {
                     composeSession.OperationFailure = $"{MailOperationError(error, "Could not confirm delivery.")} " +
@@ -700,8 +715,8 @@ public partial class MailForm
 
             FinishCompose();
             ShowComposeOperationStatus(sent.Warning ?? "Mail sent.", persistent: sent.Warning is not null);
-            if (originalMessage is not null)
-                _ = MarkOriginalResponseAsync(originalMessage);
+            if (originalMessage is { MessageId: var originalId } && originalId != Guid.Empty)
+                responseFlagCompletion = Task.WhenAll(responseFlagCompletion, MarkOriginalResponseAsync(originalMessage));
             if (SelectedFolder == sentFolder && ReferenceEquals(sender.Mailbox, mailbox))
             {
                 if (sent.Summary is { } sentSummary && loadedUnfilteredFolder == sentFolder &&
@@ -870,9 +885,14 @@ public partial class MailForm
                 quoteResolved = true;
                 saved = await mailbox.SaveDraftAsync(new(sender.Email.Trim(), snapshot.ReplyTo.Trim(),
                     snapshot.To, snapshot.Cc, snapshot.Subject, content.Body, content.Html, content.InlineImages,
-                    Bcc: snapshot.Bcc, Files: snapshot.Files), replacing, mailboxLifetime.Token);
+                    Bcc: snapshot.Bcc, Files: snapshot.Files, Thread: snapshot.Response?.Thread), replacing, mailboxLifetime.Token);
             }
-            catch (OperationCanceledException) when (mailboxLifetime.IsCancellationRequested) { return; }
+            catch (OperationCanceledException) when (mailboxLifetime.IsCancellationRequested)
+            {
+                if (backgroundShutdown)
+                    await SaveDraftLocallyAsync(snapshot);
+                return;
+            }
             catch (Exception error)
             {
                 await SaveLocalFallbackAsync(MailOperationError(error, "Could not confirm a server draft save."));

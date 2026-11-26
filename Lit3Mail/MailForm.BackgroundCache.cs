@@ -13,7 +13,7 @@ public partial class MailForm
 
     private void QueueArrivalCache(MailAccount account, string folder = "Inbox")
     {
-        if (database is null || IsDisposed || account.Mailbox is not ServerMailbox)
+        if (backgroundShutdown || database is null || IsDisposed || account.Mailbox is not ServerMailbox)
             return;
         // New arrivals should not wait for the older folder currently being downloaded.
         PauseBackgroundCacheForFolderLoad();
@@ -33,14 +33,14 @@ public partial class MailForm
 
     private void ResumeBackgroundCache()
     {
-        if (database is not null && !IsDisposed && folderLoad is null && !preparingMailReminders && !recoveringFromSleep &&
+        if (!backgroundShutdown && database is not null && !IsDisposed && folderLoad is null && !preparingMailReminders && !recoveringFromSleep &&
             cacheQueue.Count > 0 && !processingCache)
             _ = ProcessCacheQueueAsync(database);
     }
 
     private void QueueBackgroundCache(FolderEntry? current = null, IReadOnlyList<MailSummary>? summaries = null)
     {
-        if (database is null || IsDisposed)
+        if (backgroundShutdown || database is null || IsDisposed)
             return;
 
         if (current is { Account.Mailbox: ServerMailbox mailbox, Folder: { } folder })
@@ -78,7 +78,7 @@ public partial class MailForm
 
     private void QueueInboxRefresh(MailAccount? refreshingInbox)
     {
-        if (database is null || IsDisposed)
+        if (backgroundShutdown || database is null || IsDisposed)
             return;
         foreach (var account in accounts)
         {
